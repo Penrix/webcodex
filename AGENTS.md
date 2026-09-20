@@ -66,6 +66,9 @@ For release, recovery, or deployment work, follow [`docs/agent/release-process.m
 
 ## 6. Load relevant domain rules
 
+- Penrix fork continuity / Web Chat / DVR direction: [docs/agent/penrix-fork-direction.md](docs/agent/penrix-fork-direction.md). Read this before fork-specific work involving the ChatGPT Web provider, cross-conversation recovery, DVR/retrieval, or deciding whether a change belongs in upstream WebCodex core versus a fork adapter/plugin.
+
+
 - Public runtime and API surfaces: [`docs/agent/openapi-guidelines.md`](docs/agent/openapi-guidelines.md).
 - Model-facing tool contract style and friction policy: [`docs/agent/tool-contract-guidelines.md`](docs/agent/tool-contract-guidelines.md).
 - Workflow Sessions and request identity: [`docs/agent/session-model.md`](docs/agent/session-model.md).
