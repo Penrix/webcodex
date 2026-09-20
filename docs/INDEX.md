@@ -54,6 +54,7 @@ ordinary users should not need to learn.
 - [Testing](TESTING.md) — testing strategy
 - [Release checklist](RELEASE_CHECKLIST.md) — release readiness
 - [Architecture decisions](agent/architecture-decisions.md)
+- [Penrix fork direction](agent/penrix-fork-direction.md) — fork-local design context for ChatGPT Web bridging, cross-conversation continuity, DVR/retrieval, and upstream/fork ownership
 - [Runtime host context](agent/runtime-host-context.md) — Runner-configured planning context and runtime diagnostics
 - [Job reliability and Runner concurrency](agent/job-reliability-and-concurrency.md) — restart recovery, observation semantics, shared Job capacity, and tool-description requirements
 - [Tool request tracing](agent/tool-request-tracing.md) — maintainer forensic payload/correlation contract
