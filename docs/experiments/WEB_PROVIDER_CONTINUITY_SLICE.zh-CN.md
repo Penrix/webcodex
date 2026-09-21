@@ -91,6 +91,8 @@ DEV thread id
 
 本地 correlation 只保存 durable ID、revision、project 和时间，不保存 bearer token，也不复制用户首条 prompt。
 
+另外，在 `create_goal` 成功以后、任何可能产生新 Workflow Session 的调用之前，Provider 会先落一条 **未完成绑定 attempt**。它只记录 Goal、project、revision、当前 phase，以及已经确认拿到时的 Session ID。这样即使进程在 `work_on_project` 调用中崩掉，或者请求已经执行但响应丢失，下一条用户消息也只会看到“这次绑定结果未确认”，不会再自动创建第二个 Session。
+
 ### Compaction
 
 真实浏览器 compaction 完成以后：
@@ -154,7 +156,7 @@ old explicit correlation
 5. 新空 thread 显式 recover 后，拿回原来的 exact Goal + exact Session；
 6. 新模型 turn 能只凭当前用户输入 + Goal + handoff 继续；
 7. correlation 文件无 token、无原 prompt；
-8. effect 的 post-dispatch 断线产生 `outcome_unknown`，不会自动重复执行；
+8. effect 的 post-dispatch 断线产生 `outcome_unknown`，未完成 attempt 会被持久化；后续消息仍不会再次调用 `work_on_project`；
 9. 非空 thread / project 不匹配的恢复直接失败。
 
 只有这九条都成立，才值得把同一个薄 binding 接到生产 Responses path。
