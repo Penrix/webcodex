@@ -41,6 +41,7 @@
 - [Coding 工作流](CODING_WORKFLOW.zh-CN.md) —— 任务启动、指导、验证和收尾
 - [Native Tool Plugins](PLUGINS.zh-CN.md) —— 用任意可执行语言为 Runner 增加本地工具，不需要 MCP SDK
 - [Computer Use roadmap](COMPUTER_USE.md) —— semantic-first desktop automation 方向与验证优先级
+- [Web 模型 × WebCodex 连续性实验](experiments/WEB_PROVIDER_CONTINUITY_SLICE.zh-CN.md) —— 当前 fork 的第一条 thread→Goal/Session 绑定、compaction checkpoint 与跨 thread 恢复认知
 
 ## 我想参与开发或发布
 
