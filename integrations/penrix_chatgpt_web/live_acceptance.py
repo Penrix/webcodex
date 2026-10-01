@@ -459,7 +459,7 @@ def live_run(
 
         token = getpass.getpass(
             "WebCodex 已把临时 token 放进剪贴板。"
-            "按 Ctrl+V 粘贴后回车（输入不会显示）: "
+            "Windows 隐藏输入请用鼠标右键粘贴后回车，不要按 Ctrl+V（输入不会显示）: "
         ).strip()
         if not TOKEN_RE.fullmatch(token):
             raise AcceptanceError(
