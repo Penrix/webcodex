@@ -34,6 +34,11 @@ class AcceptanceError(RuntimeError):
     pass
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def run_checked(args: list[str], cwd: pathlib.Path) -> str:
     completed = subprocess.run(
         args,
@@ -197,7 +202,10 @@ def json_request(
             "authorization": f"Bearer {token}",
         },
     )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirect(),
+    )
     try:
         with opener.open(req, timeout=timeout) as res:
             raw = res.read(4 * 1024 * 1024 + 1)
@@ -275,12 +283,14 @@ def relay_catalog(relay_url: str) -> None:
             "codex-chatgpt-web model catalog was not JSON"
         ) from exc
     data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        raise AcceptanceError(
+            "codex-chatgpt-web model catalog had no data list"
+        )
     ids = {
         item.get("id")
         for item in data
-        if isinstance(data, list)
-        and isinstance(item, dict)
-        and isinstance(item.get("id"), str)
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
     }
     if EXPECTED_WEB_MODEL not in ids:
         raise AcceptanceError(
