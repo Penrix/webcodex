@@ -23,12 +23,15 @@ MAX_BODY = 4 * 1024 * 1024
 # Project coding surface only. Administration stays out of this experiment.
 ALLOWED_TOOLS = {
     "read_files", "search_project_texts", "search_and_read", "edit_project_files",
-    "show_changes", "git_status", "project_validate", "project_build", "run_process",
+    "show_changes", "review_changes", "git_status", "project_validate", "project_build", "run_process",
     "observe_jobs", "wait_for_job_readiness", "wait_for_job_terminal", "list_jobs",
     "job_write_input", "finish_coding_task", "session_handoff_summary",
     "post_session_message", "workspace_hygiene",
 }
-PRELOAD = ("read_files", "search_and_read", "edit_project_files", "project_validate", "finish_coding_task")
+PRELOAD = (
+    "read_files", "search_and_read", "edit_project_files", "project_validate",
+    "review_changes", "finish_coding_task",
+)
 MAY_CHANGE_WORKSPACE = {"edit_project_files", "run_process", "job_write_input"}
 REPLAY_SAFE = {"desired_state", "keyed", "fenced_replay"}
 
@@ -290,6 +293,8 @@ class Driver:
             raise DriverError(f"discover tool contract before call: {tool}")
         schema, effect, idem = contract_parts(manifest)
         fixed = dict(params)
+        if tool == "finish_coding_task" and "summary_only" not in fixed:
+            fixed["summary_only"] = True
         if fixed.get("project") not in (None, "", self.project):
             raise DriverError("attempted Project retarget")
         if fixed.get("session_id") not in (None, "", session):
