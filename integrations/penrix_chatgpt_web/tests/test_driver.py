@@ -219,6 +219,11 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(len(state.relay_requests), 5)
         self.assertEqual(state.relay_requests[0]["text"]["format"]["type"], "json_schema")
         self.assertIs(state.relay_requests[0]["text"]["format"]["strict"], False)
+        first_input = state.relay_requests[0]["input"]
+        self.assertEqual(first_input[0]["role"], "user")
+        self.assertEqual(first_input[0]["content"][0]["text"], "change one thing")
+        self.assertNotIn("change one thing", first_input[-1]["content"][0]["text"])
+        self.assertIn("inert external-controller JSON action", first_input[-1]["content"][0]["text"])
         first_meta = json.loads(
             state.relay_requests[0]["client_metadata"]["x-codex-turn-metadata"]
         )
@@ -269,8 +274,10 @@ class DriverTests(unittest.TestCase):
             }],
         }
         with fake_servers(state) as (relay_url, wc_url):
-            with self.assertRaisesRegex(driver.DriverError, "Web response was not JSON"):
+            with self.assertRaisesRegex(driver.DriverError, "Web action response was not JSON") as raised:
                 self.make_driver(relay_url, wc_url).run("inspect")
+        self.assertIn("chars=8", str(raised.exception))
+        self.assertIn("not-json", str(raised.exception))
         self.assertEqual(len(state.relay_requests), 1)
         self.assertIs(state.relay_requests[0]["text"]["format"]["strict"], False)
         self.assertFalse(any(
