@@ -197,7 +197,11 @@ def response_text(body: Any) -> str:
     chunks: list[str] = []
     if isinstance(body, dict):
         for item in body.get("output", []) if isinstance(body.get("output"), list) else []:
-            if not isinstance(item, dict) or item.get("type") != "message":
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "message"
+                or item.get("phase") == "commentary"
+            ):
                 continue
             for part in item.get("content", []) if isinstance(item.get("content"), list) else []:
                 if isinstance(part, dict) and part.get("type") in {"output_text", "text"} and isinstance(part.get("text"), str):
