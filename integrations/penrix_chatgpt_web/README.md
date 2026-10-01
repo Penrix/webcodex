@@ -136,20 +136,47 @@ Run locally on Windows:
 python -m unittest discover -s integrations/penrix_chatgpt_web/tests -v
 ```
 
-The fork also carries `.github/workflows/penrix-chatgpt-web-driver.yml`, a Windows-only five-minute contract lane that compiles the two Python sources and runs exactly this test suite when the integration changes.
+The fork also carries `.github/workflows/penrix-chatgpt-web-driver.yml`, a Windows-only five-minute contract lane that compiles the driver/test sources and runs exactly this suite when the integration changes.
 
 These tests prove driver logic only. They do **not** prove the current Windows WebCodex build, the local `codex-chatgpt-web` launcher/login, a real ChatGPT Web strict-output turn, or a real edit/Job round-trip. Those remain **LIVE UNVERIFIED** until exercised on the target Windows machine.
 
+## Windows live carrier
+
+Upstream 0.4.4 source is the reviewed baseline, but the latest published WebCodex release is still v0.4.3. The fork therefore does not use the published v0.4.3 Windows installer as acceptance evidence for this path.
+
+`.github/workflows/penrix-windows-live-candidate.yml` builds the exact PR source on a real `windows-latest` runner, then runs:
+
+```text
+python integrations/penrix_chatgpt_web/live_acceptance.py --share-probe-only --webcodex-bin-dir target/dogfood
+```
+
+That probe creates a disposable Git repository, starts the real `webcodex share --tunnel none --json --stop-on-stdin-eof` path, requires `local_ready`, closes stdin, and requires clean Server/Runner cleanup. Only after that does the workflow upload the exact three Windows runtime binaries together with the driver and live carrier.
+
+For the target-machine acceptance, extract that candidate on Windows, start the current `codex-chatgpt-web` relay with an authenticated ChatGPT Web session, then run from the candidate root:
+
+```powershell
+python integrations\penrix_chatgpt_web\live_acceptance.py --webcodex-bin-dir .
+```
+
+The carrier:
+
+- refuses WebCodex versions other than 0.4.4;
+- checks that the relay currently exposes `chatgpt-web/gpt-5.6-sol`;
+- creates a disposable temporary Git project instead of touching a real repository;
+- starts local WebCodex Server + Runner + Project through upstream `share`;
+- never reads WebCodex secret files or prints the temporary credential;
+- relies on upstream's normal clipboard handoff, then asks the owner to paste that temporary Bearer once into hidden console input;
+- resolves the exact canonical Project through `list_projects` instead of trusting a display name;
+- makes ChatGPT Web repair one intentionally failing one-line Python fixture through the driver;
+- requires Runner-side `python -m unittest -v`, change review, and `finish_coding_task` evidence;
+- independently rechecks the resulting file/test locally;
+- starts a fresh driver process with the returned `~s...` ref and requires exact Session handoff recovery without another mutation;
+- stops `share` through its documented stdin-EOF contract and deletes the disposable repository only after a clean pass.
+
+A failure stops at the first blocker and retains the temporary repository for diagnosis. It does not retry effects, repair login state, disable Defender, broaden Project authority, or silently switch to v0.4.3.
+
 ## First live acceptance
 
-Keep the first live test deliberately small:
-
-1. start current WebCodex Server/Runner on one disposable Git project;
-2. start current `codex-chatgpt-web` and confirm its browser-only model can answer one strict JSON request;
-3. run this driver on a read-only task and prove `read_files`/`search_and_read` evidence returns through the Web round;
-4. perform one tiny structured edit;
-5. run one focused validation;
-6. prove the read-only `finish_coding_task` evidence snapshot succeeds and the final answer arrives;
-7. stop the driver, start a new process with the returned Session ref, and prove the saved handoff is enough to continue.
+Use the Windows live carrier above. Its target-machine flow exercises the same acceptance sequence in one disposable project: real Server/Runner bootstrap, real ChatGPT Web browser-only reasoning, read/edit/process validation, `finish_coding_task` evidence, local result recheck, and fresh-process exact Session resume.
 
 Only after that should this path be promoted beyond **CODE VERIFIED, LIVE UNVERIFIED**.
