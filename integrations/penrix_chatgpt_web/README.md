@@ -46,7 +46,7 @@ The Web model must return exactly one strict JSON object per round:
 
 - `discover` asks WebCodex for the current exact `tool_manifest` contract. A tool cannot be called until its contract has been discovered or preloaded.
 - `call` sends one admitted tool to the canonical `/api/tools/call` endpoint. The driver binds Project and Workflow Session fields mechanically when the current schema exposes them.
-- `final` is accepted only when no required local work remains. Once a potentially state-changing call has crossed the driver boundary, the read-only `finish_coding_task` evidence snapshot must succeed before finalization. This is closeout evidence; it does not itself close the Workflow Session.
+- `final` is accepted only when no required local work remains. Once a call that may change the Project workspace has crossed the driver boundary, the read-only `finish_coding_task` evidence snapshot must succeed **after the latest such change** before finalization. Session/attention-only mutations do not create this source-closeout requirement. The snapshot is evidence; it does not itself close the Workflow Session.
 
 The default allowlist is coding-oriented, not administrative. `run_shell` is intentionally **not** enabled by default; an operator can add an exact extra tool with `--allow-tool` when the task really needs it and the WebCodex credential independently authorizes it.
 
@@ -59,6 +59,8 @@ The driver intentionally has no automatic retry loop.
 - A WebCodex transport disconnect also stops instead of replaying a possibly accepted effect.
 - A non-idempotent/unknown mutating tool call with the same normalized arguments cannot be dispatched twice in one driver run. WebCodex tools whose current manifest explicitly says `desired_state`, `keyed`, or `fenced_replay` may use their canonical replay/reconciliation contract.
 - The model cannot retarget another Project or Workflow Session. The driver pins the selectors established by `work_on_project` and rejects conflicting proposals before calling WebCodex.
+- Project-less Job observation/wait calls accept only opaque Job IDs / observation refs already observed in this fixed Project/Session's bootstrap, handoff, current-Project `list_jobs`, or current-Project tool results. Unknown Job identities are rejected before the request crosses to WebCodex.
+- WebCodex HTTP 5xx after dispatch and canonical `output.execution_state="outcome_unknown"` both stop the current driver run. Canonical uncertainty may retain returned Job identity for later explicit recovery, but it never authorizes another effect in the same run.
 - WebCodex remains the authority for authentication, scopes, schema validation, Runner capability, filesystem boundaries, Job identity and effect truth. The driver never treats its own transcript as execution proof.
 - Redirects and ambient HTTP proxies are disabled for the two local/service calls, credentials cannot be embedded in configured URLs, and plain HTTP is accepted only on loopback.
 
@@ -123,6 +125,10 @@ Deterministic stdlib fake-server tests cover:
 - current relay post-Send uncertainty codes stop as `outcome_unknown` for both HTTP-error and HTTP-200 failed-envelope forms, without a second Web request;
 - HTTP 200 with an incomplete/non-terminal Responses envelope cannot drive a WebCodex effect;
 - a WebCodex mutation whose response transport drops stops immediately with `outcome_unknown` and does not ask the model for another action.
+- a later workspace mutation invalidates an older `finish_coding_task` snapshot;
+- Session-only mutation does not force a false source closeout;
+- an opaque Job from outside current-task evidence is rejected while a Job returned by the fixed Project can be observed;
+- WebCodex HTTP 500 and canonical `execution_state=outcome_unknown` stop without a follow-on effect, while the canonical uncertain Job identity is retained for explicit recovery;
 
 Run locally on Windows:
 
