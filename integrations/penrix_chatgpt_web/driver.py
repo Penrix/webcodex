@@ -155,6 +155,51 @@ class WebCodex:
         return result
 
 
+def response_terminal_summary(body: dict[str, Any]) -> dict[str, Any]:
+    """Return terminal protocol evidence without model text or credentials."""
+    output_items: list[dict[str, Any]] = []
+    output = body.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            safe_item: dict[str, Any] = {}
+            for key in ("type", "phase", "status", "role"):
+                value = item.get(key)
+                if isinstance(value, str):
+                    safe_item[key] = value
+            if safe_item:
+                output_items.append(safe_item)
+
+    incomplete = body.get("incomplete_details")
+    safe_incomplete: dict[str, Any] | None = None
+    if isinstance(incomplete, dict):
+        safe_incomplete = {}
+        reason = incomplete.get("reason")
+        retryable = incomplete.get("retryable")
+        if isinstance(reason, str):
+            safe_incomplete["reason"] = reason
+        if isinstance(retryable, bool):
+            safe_incomplete["retryable"] = retryable
+
+    error = body.get("error")
+    safe_error: dict[str, Any] | None = None
+    if isinstance(error, dict):
+        safe_error = {}
+        for key in ("type", "code"):
+            value = error.get(key)
+            if isinstance(value, str):
+                safe_error[key] = value
+
+    return {
+        "status": body.get("status"),
+        "end_turn": body.get("end_turn"),
+        "incomplete_details": safe_incomplete,
+        "error": safe_error,
+        "output_items": output_items,
+    }
+
+
 class WebModel:
     def __init__(self, url: str, model: str, effort: str, timeout: float):
         self.url = base_url(url, "codex-chatgpt-web")
@@ -202,9 +247,10 @@ class WebModel:
         if status != 200:
             raise DriverError(f"ChatGPT Web failed HTTP {status}: {detail}")
         if body.get("status") != "completed" or body.get("end_turn") is not True:
-            detail = body.get("incomplete_details")
-            suffix = f": {dump(detail)}" if isinstance(detail, dict) else ""
-            raise DriverError("ChatGPT Web did not provide completed end_turn evidence" + suffix)
+            raise DriverError(
+                "ChatGPT Web did not provide completed end_turn evidence: "
+                + dump(response_terminal_summary(body))
+            )
         text = response_text(body)
         try:
             action = json.loads(text)
