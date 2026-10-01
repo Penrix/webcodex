@@ -90,14 +90,19 @@ def make_repo() -> pathlib.Path:
         raise
 
 
-def pump(stream, out: queue.Queue[str], capture: list[str]) -> None:
+def pump(
+    stream,
+    out: queue.Queue[str] | None,
+    capture: list[str],
+) -> None:
     try:
         for line in iter(stream.readline, ""):
             line = line.rstrip("\r\n")
             capture.append(line)
             if len(capture) > 200:
                 del capture[:-200]
-            out.put(line)
+            if out is not None:
+                out.put(line)
     finally:
         stream.close()
 
@@ -136,7 +141,7 @@ def start_share(
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     threading.Thread(target=pump, args=(proc.stdout, stdout_q, stdout_lines), daemon=True).start()
-    threading.Thread(target=pump, args=(proc.stderr, queue.Queue(), stderr_lines), daemon=True).start()
+    threading.Thread(target=pump, args=(proc.stderr, None, stderr_lines), daemon=True).start()
 
     deadline = time.monotonic() + READY_TIMEOUT
     while time.monotonic() < deadline:
@@ -340,6 +345,12 @@ def verify_local_repo(repo: pathlib.Path) -> None:
         raise AcceptanceError(
             "expected edit is not present in disposable repository"
         )
+    status = run_checked(["git", "status", "--porcelain"], repo).splitlines()
+    if status != [" M acceptance.py"]:
+        raise AcceptanceError(
+            "live task changed unexpected paths: " + json.dumps(status)
+        )
+    run_checked(["git", "diff", "--check"], repo)
     run_checked([sys.executable, "-m", "unittest", "-v"], repo)
 
 
