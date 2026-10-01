@@ -25,7 +25,68 @@ READY = {
 }
 
 
+class FakeHttpResponse:
+    def __init__(self, body, status=200):
+        self.status = status
+        self._raw = live.json.dumps(body).encode()
+
+    def read(self, _limit):
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class FakeOpener:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def open(self, req, timeout):
+        self.requests.append((req, timeout))
+        return self.response
+
+
 class LiveAcceptanceTests(unittest.TestCase):
+    def test_relay_health_requires_exact_6_1_3_browser_only_contract(self):
+        opener = FakeOpener(
+            FakeHttpResponse(
+                {
+                    "status": "ok",
+                    "service": "codex-chatgpt-web",
+                    "version": "6.1.3",
+                    "mode": "browser-only",
+                    "accepting_turns": True,
+                }
+            )
+        )
+        with mock.patch.object(live.urllib.request, "build_opener", return_value=opener):
+            result = live.relay_health("http://127.0.0.1:17841/v1")
+        self.assertEqual(result["version"], "6.1.3")
+        self.assertEqual(opener.requests[0][0].full_url, "http://127.0.0.1:17841/healthz")
+
+    def test_relay_health_rejects_stale_relay_before_effects(self):
+        opener = FakeOpener(
+            FakeHttpResponse(
+                {
+                    "status": "ok",
+                    "service": "codex-chatgpt-web",
+                    "version": "5.0.8",
+                    "mode": "browser-only",
+                    "accepting_turns": True,
+                }
+            )
+        )
+        with mock.patch.object(live.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(
+                live.AcceptanceError,
+                "requires codex-chatgpt-web 6.1.3; got: 5.0.8",
+            ):
+                live.relay_health("http://127.0.0.1:17841/v1")
+
     def test_driver_timeout_is_explicit_unknown_blocker(self):
         with mock.patch.object(
             live.subprocess,
