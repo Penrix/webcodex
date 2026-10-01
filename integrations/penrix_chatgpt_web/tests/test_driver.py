@@ -484,10 +484,39 @@ class DriverTests(unittest.TestCase):
             }],
         }
         with fake_servers(state) as (relay_url, wc_url):
-            with self.assertRaisesRegex(driver.DriverError, "completed end_turn evidence"):
+            with self.assertRaisesRegex(driver.DriverError, "completed end_turn evidence") as raised:
                 self.make_driver(relay_url, wc_url).run("edit")
+        detail = str(raised.exception)
+        self.assertIn('"end_turn":false', detail)
+        self.assertIn('"reason":"max_output_tokens"', detail)
+        self.assertNotIn('"kind":"call"', detail)
         self.assertEqual(len(state.relay_requests), 1)
         self.assertFalse(any(req["tool"] == "edit_project_files" for req in state.webcodex_requests))
+
+    def test_http_200_completed_without_end_turn_reports_safe_terminal_summary(self):
+        state = FakeState()
+        state.relay_response_override = {
+            "id": "resp_missing_end_turn",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "SECRET_MODEL_BODY",
+                }],
+            }],
+        }
+        with fake_servers(state) as (relay_url, wc_url):
+            with self.assertRaisesRegex(driver.DriverError, "completed end_turn evidence") as raised:
+                self.make_driver(relay_url, wc_url).run("inspect")
+        detail = str(raised.exception)
+        self.assertIn('"status":"completed"', detail)
+        self.assertIn('"end_turn":null', detail)
+        self.assertIn('"type":"message"', detail)
+        self.assertNotIn("SECRET_MODEL_BODY", detail)
+        self.assertEqual(len(state.relay_requests), 1)
 
     def test_relay_post_send_failure_codes_are_outcome_unknown(self):
         for status in (200, 502):
