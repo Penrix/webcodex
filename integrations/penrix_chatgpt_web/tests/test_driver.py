@@ -50,6 +50,7 @@ class FakeState:
         self.drop_relay = False
         self.drop_webcodex_tool = None
         self.relay_response_override = None
+        self.relay_status = 200
 
 
 @contextlib.contextmanager
@@ -72,7 +73,7 @@ def fake_servers(state: FakeState):
                 action = state.relay_actions.pop(0)
                 envelope = response_body(action)
             payload = json.dumps(envelope).encode()
-            self.send_response(200)
+            self.send_response(state.relay_status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
@@ -323,6 +324,7 @@ class DriverTests(unittest.TestCase):
         for code in ("chatgpt_submission_ambiguous", "chatgpt_submitted_turn_failed"):
             with self.subTest(code=code):
                 state = FakeState()
+                state.relay_status = 502
                 state.relay_response_override = {
                     "error": {
                         "type": "server_error",
@@ -331,29 +333,8 @@ class DriverTests(unittest.TestCase):
                     }
                 }
                 with fake_servers(state) as (relay_url, wc_url):
-                    original_post = driver.JsonClient.post
-
-                    def status_502(client, url, body, bearer=None):
-                        if url.endswith("/responses"):
-                            state.relay_requests.append(body)
-                            return 502, state.relay_response_override
-                        return original_post(client, url, body, bearer)
-
-                    model = driver.WebModel(
-                        relay_url, "chatgpt-web/gpt-5.6-sol", "high", 3
-                    )
-                    model.http.post = lambda url, body, bearer=None: status_502(
-                        model.http, url, body, bearer
-                    )
-                    d = driver.Driver(
-                        driver.WebCodex(wc_url, "secret-test-token", 3),
-                        model,
-                        project="agent:runner:repo",
-                        allowed=driver.ALLOWED_TOOLS,
-                        log=io.StringIO(),
-                    )
                     with self.assertRaises(driver.OutcomeUnknown):
-                        d.run("inspect")
+                        self.make_driver(relay_url, wc_url).run("inspect")
                 self.assertEqual(len(state.relay_requests), 1)
 
 
