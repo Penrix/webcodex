@@ -201,6 +201,13 @@ class DriverTests(unittest.TestCase):
             self.assertEqual(req["params"]["project"], "agent:runner:repo")
             self.assertEqual(req["params"]["session_id"], "wc_sess_test")
             self.assertEqual(req["recording_session_id"], "wc_sess_test")
+        self.assertIs(finish["params"]["summary_only"], True)
+        manifests = {
+            req["params"].get("tool_name")
+            for req in state.webcodex_requests
+            if req["tool"] == "tool_manifest"
+        }
+        self.assertIn("review_changes", manifests)
 
     def test_project_retarget_is_rejected_before_effect(self):
         state = FakeState()
