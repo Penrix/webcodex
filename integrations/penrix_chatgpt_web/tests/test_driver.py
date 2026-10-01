@@ -218,6 +218,7 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(result["session_id"], "wc_sess_test")
         self.assertEqual(len(state.relay_requests), 5)
         self.assertEqual(state.relay_requests[0]["text"]["format"]["type"], "json_schema")
+        self.assertIs(state.relay_requests[0]["text"]["format"]["strict"], False)
         first_meta = json.loads(
             state.relay_requests[0]["client_metadata"]["x-codex-turn-metadata"]
         )
@@ -253,6 +254,29 @@ class DriverTests(unittest.TestCase):
             if req["tool"] == "tool_manifest"
         }
         self.assertIn("review_changes", manifests)
+
+    def test_non_strict_provider_output_is_still_strictly_rejected_by_driver(self):
+        state = FakeState()
+        state.relay_response_override = {
+            "id": "resp_bad_action",
+            "status": "completed",
+            "end_turn": True,
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "not-json"}],
+            }],
+        }
+        with fake_servers(state) as (relay_url, wc_url):
+            with self.assertRaisesRegex(driver.DriverError, "Web response was not JSON"):
+                self.make_driver(relay_url, wc_url).run("inspect")
+        self.assertEqual(len(state.relay_requests), 1)
+        self.assertIs(state.relay_requests[0]["text"]["format"]["strict"], False)
+        self.assertFalse(any(
+            req["tool"] not in {"work_on_project", "tool_manifest"}
+            for req in state.webcodex_requests
+        ))
 
     def test_project_retarget_is_rejected_before_effect(self):
         state = FakeState()
