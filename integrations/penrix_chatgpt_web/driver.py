@@ -158,6 +158,12 @@ class WebModel:
         if status != 200:
             error = body.get("error", {}) if isinstance(body, dict) else {}
             raise DriverError(f"ChatGPT Web failed HTTP {status}: {error.get('code') or error.get('message') or 'unknown'}")
+        if not isinstance(body, dict):
+            raise DriverError("ChatGPT Web returned an invalid Responses envelope")
+        if body.get("status") != "completed" or body.get("end_turn") is not True:
+            detail = body.get("incomplete_details")
+            suffix = f": {dump(detail)}" if isinstance(detail, dict) else ""
+            raise DriverError("ChatGPT Web did not provide completed end_turn evidence" + suffix)
         text = response_text(body)
         try:
             action = json.loads(text)
