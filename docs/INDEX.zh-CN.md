@@ -56,6 +56,7 @@ protocol field、兼容名称和实现 invariant；普通用户不需要为了�
 - [测试策略](TESTING.md)
 - [发布清单](RELEASE_CHECKLIST.md)
 - [架构决策](agent/architecture-decisions.md)
+- [Penrix fork 当前方向](agent/penrix-fork-direction.md) —— ChatGPT Web Provider、跨 conversation 恢复证据、DVR/检索，以及 upstream/fork 职责边界
 - [Runtime host context](agent/runtime-host-context.md) —— Runner 配置的 planning context 与 runtime diagnostics
 - [Job 可靠性与 Runner 并发](agent/job-reliability-and-concurrency.md)
 - [Tool request tracing](agent/tool-request-tracing.md) —— maintainer forensic payload/correlation contract
