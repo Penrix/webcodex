@@ -65,7 +65,7 @@ jobs:
           Copy-Item integrations\penrix_chatgpt_web\live_acceptance.py (Join-Path $stage "integrations\penrix_chatgpt_web")
           Copy-Item integrations\penrix_chatgpt_web\README.md (Join-Path $stage "integrations\penrix_chatgpt_web")
           @(
-            "source_sha=$env:GITHUB_SHA"
+            "source_sha=$((git rev-parse HEAD).Trim())"
             "source_short=$((git rev-parse --short=12 HEAD).Trim())"
             "built_at=$((git show -s --format=%ct HEAD).Trim())"
             "platform=windows-latest-x64"
