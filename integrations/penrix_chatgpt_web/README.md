@@ -120,7 +120,7 @@ Deterministic stdlib fake-server tests cover:
 - non-idempotent mutation with identical normalized arguments is sent only once;
 - exact Session resume reads the saved handoff;
 - relay disconnect is not automatically retried;
-- current relay post-Send uncertainty codes stop as `outcome_unknown` without a second Web request;
+- current relay post-Send uncertainty codes stop as `outcome_unknown` for both HTTP-error and HTTP-200 failed-envelope forms, without a second Web request;
 - HTTP 200 with an incomplete/non-terminal Responses envelope cannot drive a WebCodex effect;
 - a WebCodex mutation whose response transport drops stops immediately with `outcome_unknown` and does not ask the model for another action.
 
