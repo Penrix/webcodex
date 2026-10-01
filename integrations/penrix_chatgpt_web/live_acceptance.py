@@ -339,7 +339,7 @@ def run_driver(
     return result
 
 
-def verify_local_repo(repo: pathlib.Path) -> None:
+def verify_local_repo(repo: pathlib.Path) -> str:
     source = (repo / "acceptance.py").read_text(encoding="utf-8")
     if 'return "WEBCODEX_LIVE_OK"' not in source:
         raise AcceptanceError(
@@ -352,6 +352,7 @@ def verify_local_repo(repo: pathlib.Path) -> None:
         )
     run_checked(["git", "diff", "--check"], repo)
     run_checked([sys.executable, "-m", "unittest", "-v"], repo)
+    return run_checked(["git", "diff", "--binary", "--", "acceptance.py"], repo)
 
 
 def live_run(
@@ -423,7 +424,7 @@ def live_run(
                 ),
             ],
         )
-        verify_local_repo(repo)
+        first_diff = verify_local_repo(repo)
         session_ref = first.get("session_ref")
         if not isinstance(session_ref, str) or not session_ref.startswith("~s"):
             raise AcceptanceError(
@@ -445,6 +446,11 @@ def live_run(
                 ),
             ],
         )
+        second_diff = verify_local_repo(repo)
+        if second_diff != first_diff:
+            raise AcceptanceError(
+                "fresh-process Session recovery changed the disposable workspace"
+            )
         success = True
         return {
             "status": "passed",
