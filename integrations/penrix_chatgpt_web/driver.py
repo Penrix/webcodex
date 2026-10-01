@@ -234,7 +234,7 @@ class WebModel:
             "reasoning": {"effort": self.effort},
             "text": {
                 "verbosity": "low",
-                "format": {"type": "json_schema", "name": "webcodex_action", "strict": True, "schema": ACTION_SCHEMA},
+                "format": {"type": "json_schema", "name": "webcodex_action", "strict": False, "schema": ACTION_SCHEMA},
             },
         })
         if not isinstance(body, dict):
