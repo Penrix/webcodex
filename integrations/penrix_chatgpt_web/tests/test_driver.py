@@ -49,6 +49,8 @@ class FakeState:
         self.webcodex_requests = []
         self.drop_relay = False
         self.drop_webcodex_tool = None
+        self.webcodex_status_tool = None
+        self.outcome_unknown_tool = None
         self.relay_response_override = None
         self.relay_status = 200
 
@@ -146,10 +148,24 @@ def fake_servers(state: FakeState):
                 }
             elif tool == "finish_coding_task":
                 out = {"success": True, "output": {"closed": True}}
+            elif state.outcome_unknown_tool == tool:
+                out = {
+                    "success": False,
+                    "error": "effect outcome is unknown",
+                    "output": {
+                        "execution_state": "outcome_unknown",
+                        "error_kind": "test_outcome_unknown",
+                        "job_id": "wc_job_uncertain",
+                    },
+                }
             else:
                 out = {"success": True, "output": {"tool": tool, "params": params}}
             payload = json.dumps(out).encode()
-            self.send_response(200 if out["success"] else 400)
+            status = (
+                500 if state.webcodex_status_tool == tool
+                else (200 if out["success"] else 400)
+            )
+            self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
@@ -371,6 +387,40 @@ class DriverTests(unittest.TestCase):
     def test_webcodex_mutation_disconnect_is_not_retried(self):
         state = FakeState()
         state.drop_webcodex_tool = "edit_project_files"
+        state.relay_actions = [
+            {"kind": "call", "tool": "edit_project_files", "params": {"edits": []}, "text": None},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            with self.assertRaises(driver.OutcomeUnknown):
+                self.make_driver(relay_url, wc_url).run("edit once")
+        edits = [req for req in state.webcodex_requests if req["tool"] == "edit_project_files"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(len(state.relay_requests), 1)
+
+    def test_canonical_outcome_unknown_stops_and_retains_job_identity(self):
+        state = FakeState()
+        state.outcome_unknown_tool = "run_process"
+        state.relay_actions = [
+            {"kind": "discover", "tool": "run_process", "params": None, "text": None},
+            {
+                "kind": "call",
+                "tool": "run_process",
+                "params": {"executable": "echo", "args": ["x"]},
+                "text": None,
+            },
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            d = self.make_driver(relay_url, wc_url)
+            with self.assertRaises(driver.OutcomeUnknown):
+                d.run("run once")
+        calls = [req for req in state.webcodex_requests if req["tool"] == "run_process"]
+        self.assertEqual(len(calls), 1)
+        self.assertIn("wc_job_uncertain", d.known_job_ids)
+        self.assertEqual(len(state.relay_requests), 2)
+
+    def test_webcodex_500_after_mutation_dispatch_is_outcome_unknown(self):
+        state = FakeState()
+        state.webcodex_status_tool = "edit_project_files"
         state.relay_actions = [
             {"kind": "call", "tool": "edit_project_files", "params": {"edits": []}, "text": None},
         ]
