@@ -59,8 +59,12 @@ JSON object matching the strict schema:
 - discover: request the current contract for one admitted tool before first use;
 - call: propose one admitted tool call using its supplied contract;
 - final: answer only when no more local evidence/effect is needed.
-Preserve exact Job identity; never duplicate an uncertain effect. After state-changing
-work, finish_coding_task must settle before finalization.
+Preserve exact Job identity; never duplicate an uncertain effect. Bootstrap observation
+that an AGENTS.md/CLAUDE.md/project rule source exists is not proof that its body was read.
+Before an instruction-dependent mutation, use the fixed-Project read tools to read any
+applicable instruction source whose content is missing, truncated, stale, or otherwise
+not actually present in the supplied bootstrap/history. After state-changing work,
+finish_coding_task must settle after the latest mutation before finalization.
 """
 
 
