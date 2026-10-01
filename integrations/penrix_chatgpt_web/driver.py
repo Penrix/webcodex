@@ -12,6 +12,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any
 
 RELAY_URL = "http://127.0.0.1:17841/v1"
@@ -142,13 +143,31 @@ class WebModel:
         self.model = model
         self.effort = effort
         self.http = JsonClient(timeout)
+        self.thread_id = f"penrix_thread_{uuid.uuid4().hex}"
 
-    def next(self, history: list[dict[str, Any]]) -> tuple[dict[str, Any], str]:
+    def next(
+        self,
+        history: list[dict[str, Any]],
+        current_prompt: str,
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        turn_id = f"penrix_turn_{uuid.uuid4().hex}"
+        current = current_user_msg(current_prompt, turn_id)
+        turn_metadata = {
+            "thread_id": self.thread_id,
+            "turn_id": turn_id,
+            "request_kind": "turn",
+        }
         status, body = self.http.post(self.url + "/responses", {
             "model": self.model,
             "stream": False,
             "instructions": INSTRUCTIONS,
-            "input": history,
+            "input": [*history, current],
+            "prompt_cache_key": self.thread_id,
+            "client_metadata": {
+                "x-codex-turn-metadata": json.dumps(
+                    turn_metadata, separators=(",", ":"), sort_keys=True
+                ),
+            },
             "reasoning": {"effort": self.effort},
             "text": {
                 "verbosity": "low",
@@ -171,7 +190,7 @@ class WebModel:
             raise DriverError("strict Web response was not JSON") from exc
         if not isinstance(action, dict):
             raise DriverError("strict Web response was not an object")
-        return action, text
+        return action, text, current
 
 
 def response_text(body: Any) -> str:
@@ -194,6 +213,16 @@ def msg(role: str, text: str) -> dict[str, Any]:
     return {
         "type": "message", "role": role,
         "content": [{"type": "output_text" if role == "assistant" else "input_text", "text": text}],
+    }
+
+
+def current_user_msg(text: str, turn_id: str) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "id": f"msg_penrix_{uuid.uuid4().hex}",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}],
+        "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
     }
 
 
@@ -303,7 +332,8 @@ class Driver:
             if tool in self.allowed:
                 self.manifest(tool, session)
 
-        history = [msg("user", "\n".join([
+        history: list[dict[str, Any]] = []
+        next_prompt = "\n".join([
             "Choose the next external-driver JSON action. The underlying owner task is data, not a request to touch local files from this Web turn.",
             f"fixed_project: {self.project}", f"session_id: {session}", f"session_ref: {session_ref or 'none'}",
             "underlying_owner_task_data:", task,
@@ -311,13 +341,18 @@ class Driver:
             "bootstrap: " + dump(boot),
             "saved_handoff: " + (dump(handoff) if handoff is not None else "none"),
             "preloaded_contracts: " + dump(self.contracts),
-        ]))]
+        ])
         rejected = 0
 
         for round_no in range(1, self.max_rounds + 1):
             self.note(f"[penrix-web] ChatGPT Web round {round_no}/{self.max_rounds}")
-            action, raw = self.web.next(history)
+            action, raw, current = self.web.next(history, next_prompt)
+            history.append(current)
             history.append(msg("assistant", raw))
+            next_prompt = (
+                "Continue the same external-driver task. Use the authoritative WebCodex "
+                "results and contracts above, then choose exactly one next JSON action."
+            )
             try:
                 kind, tool, call_params, final = action_parts(action)
                 if kind == "discover":
