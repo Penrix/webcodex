@@ -68,7 +68,7 @@ The driver intentionally has no automatic retry loop.
 
 - Python 3.10+
 - current WebCodex Server + Runner, with a credential scoped for the tools you intend to use
-- current `codex-chatgpt-web` relay reachable through its Responses endpoint (default `http://127.0.0.1:17841/v1`) and configured for the browser-only path used by this experiment
+- current `codex-chatgpt-web` relay reachable through its Responses endpoint (default `http://127.0.0.1:17841/v1`) and configured for the browser-only path used by this experiment; no native Codex model-catalog credential is part of this path
 - an authenticated ChatGPT Web browser owned by that relay
 
 The driver reads the WebCodex bearer credential only from `WEBCODEX_TOKEN`; do not put it in command-line arguments or repository files.
@@ -161,7 +161,7 @@ python integrations\penrix_chatgpt_web\live_acceptance.py --webcodex-bin-dir .
 The carrier:
 
 - refuses WebCodex versions other than 0.4.4;
-- checks that the relay currently exposes `chatgpt-web/gpt-5.6-sol`;
+- proves the configured `chatgpt-web/gpt-5.6-sol` route by completing real browser-only Responses turns; it does not call `/v1/models`, because that catalog endpoint is a native-Codex passthrough requiring Codex Bearer auth;
 - creates a disposable temporary Git project instead of touching a real repository;
 - starts local WebCodex Server + Runner + Project through upstream `share`;
 - never reads WebCodex secret files or prints the temporary credential;
