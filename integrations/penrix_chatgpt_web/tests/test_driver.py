@@ -101,9 +101,15 @@ def fake_servers(state: FakeState):
                 name = params["tool_name"]
                 effect = "mutate" if name in {"edit_project_files", "run_shell"} else "observe"
                 properties = {}
-                if name not in {"list_jobs"}:
+                if name not in {
+                    "observe_jobs", "wait_for_job_readiness", "wait_for_job_terminal"
+                }:
                     properties["project"] = {"type": "string"}
-                if name in {"read_files", "edit_project_files", "finish_coding_task", "run_shell"}:
+                if name in {
+                    "read_files", "edit_project_files", "finish_coding_task",
+                    "run_shell", "list_jobs", "review_changes", "project_validate",
+                    "project_build", "workspace_hygiene"
+                }:
                     properties["session_id"] = {"type": "string"}
                 out = {
                     "success": True,
@@ -118,6 +124,26 @@ def fake_servers(state: FakeState):
                 out = {"success": True, "output": {"text": "hello"}}
             elif tool == "edit_project_files":
                 out = {"success": True, "output": {"state_changed": True}}
+            elif tool == "project_validate":
+                out = {
+                    "success": True,
+                    "output": {
+                        "execution_state": "running",
+                        "terminal": False,
+                        "job_id": "wc_job_current",
+                    },
+                }
+            elif tool == "observe_jobs":
+                out = {
+                    "success": True,
+                    "output": {
+                        "items": [{
+                            "job_id": params["items"][0].get("job_id", "wc_job_current"),
+                            "status": "completed",
+                            "observation_ref": "~j1",
+                        }]
+                    },
+                }
             elif tool == "finish_coding_task":
                 out = {"success": True, "output": {"closed": True}}
             else:
@@ -297,6 +323,50 @@ class DriverTests(unittest.TestCase):
         calls = [req for req in state.webcodex_requests if req["tool"] == "show_changes"]
         self.assertEqual(len(calls), 1)
         self.assertEqual(result["final"], "done")
+
+    def test_unknown_job_identity_is_rejected_before_webcodex(self):
+        state = FakeState()
+        state.relay_actions = [
+            {"kind": "discover", "tool": "observe_jobs", "params": None, "text": None},
+            {
+                "kind": "call",
+                "tool": "observe_jobs",
+                "params": {"items": [{"job_id": "wc_job_other"}]},
+                "text": None,
+            },
+            {"kind": "final", "tool": None, "params": None, "text": "blocked"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("observe only this task")
+        self.assertEqual(result["final"], "blocked")
+        self.assertFalse(any(req["tool"] == "observe_jobs" for req in state.webcodex_requests))
+
+    def test_current_project_job_identity_can_be_observed(self):
+        state = FakeState()
+        state.relay_actions = [
+            {
+                "kind": "call",
+                "tool": "project_validate",
+                "params": {"action": "check"},
+                "text": None,
+            },
+            {"kind": "discover", "tool": "observe_jobs", "params": None, "text": None},
+            {
+                "kind": "call",
+                "tool": "observe_jobs",
+                "params": {"items": [{"job_id": "wc_job_current"}]},
+                "text": None,
+            },
+            {"kind": "final", "tool": None, "params": None, "text": "observed"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("validate and observe")
+        observations = [
+            req for req in state.webcodex_requests if req["tool"] == "observe_jobs"
+        ]
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(result["final"], "observed")
+
 
     def test_webcodex_mutation_disconnect_is_not_retried(self):
         state = FakeState()
