@@ -163,6 +163,27 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(result["session_id"], "wc_sess_test")
         self.assertEqual(len(state.relay_requests), 5)
         self.assertEqual(state.relay_requests[0]["text"]["format"]["type"], "json_schema")
+        first_meta = json.loads(
+            state.relay_requests[0]["client_metadata"]["x-codex-turn-metadata"]
+        )
+        second_meta = json.loads(
+            state.relay_requests[1]["client_metadata"]["x-codex-turn-metadata"]
+        )
+        self.assertEqual(
+            state.relay_requests[0]["prompt_cache_key"], first_meta["thread_id"]
+        )
+        self.assertEqual(first_meta["thread_id"], second_meta["thread_id"])
+        self.assertNotEqual(first_meta["turn_id"], second_meta["turn_id"])
+        first_user = state.relay_requests[0]["input"][-1]
+        second_user = state.relay_requests[1]["input"][-1]
+        self.assertEqual(
+            first_user["internal_chat_message_metadata_passthrough"]["turn_id"],
+            first_meta["turn_id"],
+        )
+        self.assertEqual(
+            second_user["internal_chat_message_metadata_passthrough"]["turn_id"],
+            second_meta["turn_id"],
+        )
         read = next(req for req in state.webcodex_requests if req["tool"] == "read_files")
         edit = next(req for req in state.webcodex_requests if req["tool"] == "edit_project_files")
         finish = next(req for req in state.webcodex_requests if req["tool"] == "finish_coding_task")
