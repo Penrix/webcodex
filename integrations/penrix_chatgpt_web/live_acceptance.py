@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any
@@ -27,6 +28,8 @@ DRIVER_TIMEOUT = 900
 CLEANUP_TIMEOUT = 20
 TOKEN_RE = re.compile(r"^webcodex_[0-9a-f]{64}$")
 EXPECTED_WEBCODEX_VERSION = "0.4.4"
+EXPECTED_RELAY_VERSION = "6.1.3"
+EXPECTED_RELAY_MODE = "browser-only"
 EXPECTED_WEB_MODEL = "chatgpt-web/gpt-5.6-sol"
 
 
@@ -211,6 +214,87 @@ def stop_share(proc: subprocess.Popen[str]) -> None:
         raise AcceptanceError(f"webcodex share cleanup exited with {code}")
 
 
+def relay_health(relay_url: str) -> dict[str, Any]:
+    parsed = urllib.parse.urlsplit(relay_url)
+    host = parsed.hostname
+    loopback = host == "localhost"
+    if host and not loopback:
+        try:
+            import ipaddress
+
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            pass
+    if (
+        not host
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.scheme not in {"http", "https"}
+        or (parsed.scheme == "http" and not loopback)
+        or parsed.path.rstrip("/") != "/v1"
+    ):
+        raise AcceptanceError(
+            "relay URL must be an HTTPS origin or loopback HTTP ending in /v1, "
+            "without embedded credentials/query/fragment"
+        )
+    health_url = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, "/healthz", "", "")
+    )
+    req = urllib.request.Request(
+        health_url,
+        method="GET",
+        headers={"accept": "application/json"},
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirect(),
+    )
+    try:
+        with opener.open(req, timeout=15) as res:
+            raw = res.read(1024 * 1024 + 1)
+            status = res.status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        raw = exc.read(1024 * 1024 + 1)
+    except OSError as exc:
+        raise AcceptanceError(
+            f"codex-chatgpt-web health probe failed at {health_url}: {exc}"
+        ) from exc
+    if status != 200 or len(raw) > 1024 * 1024:
+        raise AcceptanceError(
+            f"codex-chatgpt-web health probe failed HTTP {status}"
+        )
+    try:
+        body = json.loads(raw.decode())
+    except (UnicodeError, ValueError) as exc:
+        raise AcceptanceError(
+            "codex-chatgpt-web health probe returned non-JSON"
+        ) from exc
+    if not isinstance(body, dict) or body.get("service") != "codex-chatgpt-web":
+        raise AcceptanceError(
+            "relay health endpoint is not codex-chatgpt-web"
+        )
+    version = body.get("version")
+    mode = body.get("mode")
+    if version != EXPECTED_RELAY_VERSION:
+        raise AcceptanceError(
+            f"live acceptance requires codex-chatgpt-web "
+            f"{EXPECTED_RELAY_VERSION}; got: {version or 'unknown'}"
+        )
+    if mode != EXPECTED_RELAY_MODE:
+        raise AcceptanceError(
+            f"live acceptance requires relay mode {EXPECTED_RELAY_MODE}; "
+            f"got: {mode or 'unknown'}"
+        )
+    if body.get("accepting_turns") is not True:
+        raise AcceptanceError(
+            "codex-chatgpt-web is not currently accepting turns"
+        )
+    return body
+
+
 def json_request(
     url: str,
     token: str,
@@ -356,6 +440,7 @@ def live_run(
                 f"live acceptance requires WebCodex {EXPECTED_WEBCODEX_VERSION}; "
                 f"got: {version}"
             )
+        relay = relay_health(relay_url)
 
         share, ready, _stderr = start_share(webcodex, repo, probe_only=False)
         connection = ready.get("connection")
@@ -444,6 +529,8 @@ def live_run(
             "windows": platform.platform(),
             "webcodex_version": version,
             "driver_sha256": hashlib.sha256(driver.read_bytes()).hexdigest(),
+            "relay_version": relay.get("version"),
+            "relay_mode": relay.get("mode"),
             "relay_model": EXPECTED_WEB_MODEL,
             "relay_route_evidence": "real completed browser-only Responses turns",
             "first_session_ref": session_ref,
