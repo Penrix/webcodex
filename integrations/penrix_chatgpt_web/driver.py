@@ -176,7 +176,11 @@ class WebModel:
         })
         if status != 200:
             error = body.get("error", {}) if isinstance(body, dict) else {}
-            raise DriverError(f"ChatGPT Web failed HTTP {status}: {error.get('code') or error.get('message') or 'unknown'}")
+            code = error.get("code") if isinstance(error, dict) else None
+            detail = code or (error.get("message") if isinstance(error, dict) else None) or "unknown"
+            if code in {"chatgpt_submission_ambiguous", "chatgpt_submitted_turn_failed"}:
+                raise OutcomeUnknown(f"ChatGPT Web delivery outcome requires reconciliation: {detail}")
+            raise DriverError(f"ChatGPT Web failed HTTP {status}: {detail}")
         if not isinstance(body, dict):
             raise DriverError("ChatGPT Web returned an invalid Responses envelope")
         if body.get("status") != "completed" or body.get("end_turn") is not True:
