@@ -328,21 +328,26 @@ class DriverTests(unittest.TestCase):
         self.assertFalse(any(req["tool"] == "edit_project_files" for req in state.webcodex_requests))
 
     def test_relay_post_send_failure_codes_are_outcome_unknown(self):
-        for code in ("chatgpt_submission_ambiguous", "chatgpt_submitted_turn_failed"):
-            with self.subTest(code=code):
-                state = FakeState()
-                state.relay_status = 502
-                state.relay_response_override = {
-                    "error": {
-                        "type": "server_error",
-                        "code": code,
-                        "message": "delivery state is not safe to replay",
+        for status in (200, 502):
+            for code in ("chatgpt_submission_ambiguous", "chatgpt_submitted_turn_failed"):
+                with self.subTest(status=status, code=code):
+                    state = FakeState()
+                    state.relay_status = status
+                    state.relay_response_override = {
+                        "id": "resp_failed",
+                        "status": "failed",
+                        "end_turn": False,
+                        "error": {
+                            "type": "server_error",
+                            "code": code,
+                            "message": "delivery state is not safe to replay",
+                        },
+                        "output": [],
                     }
-                }
-                with fake_servers(state) as (relay_url, wc_url):
-                    with self.assertRaises(driver.OutcomeUnknown):
-                        self.make_driver(relay_url, wc_url).run("inspect")
-                self.assertEqual(len(state.relay_requests), 1)
+                    with fake_servers(state) as (relay_url, wc_url):
+                        with self.assertRaises(driver.OutcomeUnknown):
+                            self.make_driver(relay_url, wc_url).run("inspect")
+                    self.assertEqual(len(state.relay_requests), 1)
 
 
 if __name__ == "__main__":
