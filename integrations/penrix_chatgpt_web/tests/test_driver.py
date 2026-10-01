@@ -99,7 +99,7 @@ def fake_servers(state: FakeState):
                 out = {"success": True, "output": {"session_id": "wc_sess_test", "brief": "saved"}}
             elif tool == "tool_manifest":
                 name = params["tool_name"]
-                effect = "mutate" if name in {"edit_project_files", "finish_coding_task", "run_shell"} else "observe"
+                effect = "mutate" if name in {"edit_project_files", "run_shell"} else "observe"
                 properties = {}
                 if name not in {"list_jobs"}:
                     properties["project"] = {"type": "string"}
@@ -263,6 +263,25 @@ class DriverTests(unittest.TestCase):
         edits = [req for req in state.webcodex_requests if req["tool"] == "edit_project_files"]
         self.assertEqual(len(edits), 1)
         self.assertEqual(result["final"], "done")
+
+
+    def test_later_mutation_invalidates_earlier_closeout_evidence(self):
+        state = FakeState()
+        state.relay_actions = [
+            {"kind": "call", "tool": "finish_coding_task", "params": {}, "text": None},
+            {"kind": "call", "tool": "edit_project_files", "params": {"edits": []}, "text": None},
+            {"kind": "final", "tool": None, "params": None, "text": "stale closeout"},
+            {"kind": "call", "tool": "finish_coding_task", "params": {}, "text": None},
+            {"kind": "final", "tool": None, "params": None, "text": "fresh closeout"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("edit after an early review")
+        finishes = [
+            req for req in state.webcodex_requests
+            if req["tool"] == "finish_coding_task"
+        ]
+        self.assertEqual(len(finishes), 2)
+        self.assertEqual(result["final"], "fresh closeout")
 
 
     def test_allowed_but_undiscovered_tool_is_rejected_until_manifest(self):
