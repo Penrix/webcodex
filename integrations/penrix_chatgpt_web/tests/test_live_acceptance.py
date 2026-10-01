@@ -111,6 +111,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                     "run_checked",
                     return_value="webcodex 0.4.4 (commit test, dirty=false, built_at=0)",
                 ),
+                mock.patch.object(live, "relay_health", return_value={"version": "6.1.3", "mode": "browser-only"}),
                 mock.patch.object(live, "start_share", return_value=(fake_share, READY, [])),
                 mock.patch.object(live.getpass, "getpass", return_value=VALID_TOKEN),
                 mock.patch.object(live, "exact_project", return_value="agent:runner:repo"),
