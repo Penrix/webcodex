@@ -6,6 +6,10 @@ on:
       - "integrations/penrix_chatgpt_web/**"
       - ".github/workflows/penrix-windows-live-candidate.yml"
 
+concurrency:
+  group: penrix-live-candidate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
