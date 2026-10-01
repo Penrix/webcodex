@@ -177,15 +177,15 @@ class WebModel:
                 "format": {"type": "json_schema", "name": "webcodex_action", "strict": True, "schema": ACTION_SCHEMA},
             },
         })
-        if status != 200:
-            error = body.get("error", {}) if isinstance(body, dict) else {}
-            code = error.get("code") if isinstance(error, dict) else None
-            detail = code or (error.get("message") if isinstance(error, dict) else None) or "unknown"
-            if code in {"chatgpt_submission_ambiguous", "chatgpt_submitted_turn_failed"}:
-                raise OutcomeUnknown(f"ChatGPT Web delivery outcome requires reconciliation: {detail}")
-            raise DriverError(f"ChatGPT Web failed HTTP {status}: {detail}")
         if not isinstance(body, dict):
-            raise DriverError("ChatGPT Web returned an invalid Responses envelope")
+            raise DriverError(f"ChatGPT Web returned an invalid Responses envelope (HTTP {status})")
+        error = body.get("error", {})
+        code = error.get("code") if isinstance(error, dict) else None
+        detail = code or (error.get("message") if isinstance(error, dict) else None) or "unknown"
+        if code in {"chatgpt_submission_ambiguous", "chatgpt_submitted_turn_failed"}:
+            raise OutcomeUnknown(f"ChatGPT Web delivery outcome requires reconciliation: {detail}")
+        if status != 200:
+            raise DriverError(f"ChatGPT Web failed HTTP {status}: {detail}")
         if body.get("status") != "completed" or body.get("end_turn") is not True:
             detail = body.get("incomplete_details")
             suffix = f": {dump(detail)}" if isinstance(detail, dict) else ""
