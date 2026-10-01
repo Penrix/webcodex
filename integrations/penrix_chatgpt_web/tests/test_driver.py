@@ -25,11 +25,20 @@ def response_body(action):
         "id": "resp_test",
         "status": "completed",
         "end_turn": True,
-        "output": [{
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text}],
-        }],
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "browser-only local bridge unavailable"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        ],
     }
 
 
