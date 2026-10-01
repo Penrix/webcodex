@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import hashlib
 import json
 import os
@@ -40,6 +39,49 @@ class AcceptanceError(RuntimeError):
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def windows_clipboard_text() -> str:
+    """Read Windows CF_UNICODETEXT without echoing clipboard contents."""
+    if os.name != "nt":
+        raise AcceptanceError("Windows clipboard handoff is only supported on Windows")
+    import ctypes
+
+    cf_unicode_text = 13
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_bool
+    user32.GetClipboardData.argtypes = [ctypes.c_uint]
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = ctypes.c_bool
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = ctypes.c_bool
+
+    if not user32.OpenClipboard(None):
+        raise AcceptanceError(
+            "WebCodex reported a copied credential, but the Windows clipboard could not be opened"
+        )
+    try:
+        handle = user32.GetClipboardData(cf_unicode_text)
+        if not handle:
+            raise AcceptanceError(
+                "WebCodex reported a copied credential, but the Windows clipboard has no Unicode text"
+            )
+        pointer = kernel32.GlobalLock(handle)
+        if not pointer:
+            raise AcceptanceError(
+                "WebCodex reported a copied credential, but the clipboard text could not be read"
+            )
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
 
 
 def run_checked(args: list[str], cwd: pathlib.Path) -> str:
@@ -457,14 +499,15 @@ def live_run(
                 "to the Windows clipboard"
             )
 
-        token = getpass.getpass(
-            "WebCodex 已把临时 token 放进剪贴板。"
-            "Windows 隐藏输入请用鼠标右键粘贴后回车，不要按 Ctrl+V（输入不会显示）: "
-        ).strip()
+        token = windows_clipboard_text().strip()
         if not TOKEN_RE.fullmatch(token):
             raise AcceptanceError(
-                "pasted value is not the temporary WebCodex project credential"
+                "Windows clipboard does not contain the temporary WebCodex project credential"
             )
+        print(
+            "WebCodex 临时 credential 已从 Windows 剪贴板安全接入（不会显示或落盘）。",
+            file=sys.stderr,
+        )
 
         server_url = ready["server"]["url"]
         project = exact_project(server_url, token)
