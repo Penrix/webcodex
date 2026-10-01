@@ -197,7 +197,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                     return_value={"version": "6.1.3", "mode": "browser-only"},
                 ),
                 mock.patch.object(live, "start_share", return_value=(fake_share, READY, [])),
-                mock.patch.object(live.getpass, "getpass", return_value=VALID_TOKEN),
+                mock.patch.object(live, "windows_clipboard_text", return_value=VALID_TOKEN),
                 mock.patch.object(live, "exact_project", return_value="agent:runner:repo"),
                 mock.patch.object(live, "run_driver", side_effect=[first, second]),
                 mock.patch.object(live, "verify_local_repo", side_effect=["same", "same"]),
