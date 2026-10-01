@@ -66,6 +66,7 @@ For release, recovery, or deployment work, follow [`docs/agent/release-process.m
 
 ## 6. Load relevant domain rules
 
+- Penrix fork continuity / ChatGPT Web Provider / DVR direction: [`docs/agent/penrix-fork-direction.md`](docs/agent/penrix-fork-direction.md). Read this before fork-specific work involving ChatGPT Web bridging, cross-conversation recovery, DVR/retrieval, or deciding whether a change belongs in upstream core versus a fork adapter/plugin.
 - Public runtime and API surfaces: [`docs/agent/openapi-guidelines.md`](docs/agent/openapi-guidelines.md).
 - Model-facing tool contract style and friction policy: [`docs/agent/tool-contract-guidelines.md`](docs/agent/tool-contract-guidelines.md).
 - Workflow Sessions and request identity: [`docs/agent/session-model.md`](docs/agent/session-model.md).
@@ -76,3 +77,9 @@ For release, recovery, or deployment work, follow [`docs/agent/release-process.m
 - Architecture decisions: [`docs/agent/architecture-decisions.md`](docs/agent/architecture-decisions.md).
 
 Use these as domain sources of truth rather than duplicating their detailed contracts here.
+
+## Penrix AI coding overlay
+
+For Penrix-owned work in this fork, also read [`PENRIX-CODING.md`](PENRIX-CODING.md) before making production-code changes.
+
+That overlay adds the non-programmer Owner / Coding Agent authority split, Reality Reconnaissance before and after production changes, evidence-backed complexity admission, and honest runtime evidence classes. It supplements the repository rules above and does not replace more specific architecture, build, security, testing, contribution, or release requirements.
