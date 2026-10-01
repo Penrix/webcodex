@@ -101,7 +101,10 @@ def fake_servers(state: FakeState):
                 out = {"success": True, "output": {"session_id": "wc_sess_test", "brief": "saved"}}
             elif tool == "tool_manifest":
                 name = params["tool_name"]
-                effect = "mutate" if name in {"edit_project_files", "run_shell"} else "observe"
+                effect = "mutate" if name in {
+                    "edit_project_files", "run_shell", "post_session_message",
+                    "wait_for_job_terminal"
+                } else "observe"
                 properties = {}
                 if name not in {
                     "observe_jobs", "wait_for_job_readiness", "wait_for_job_terminal"
@@ -110,7 +113,7 @@ def fake_servers(state: FakeState):
                 if name in {
                     "read_files", "edit_project_files", "finish_coding_task",
                     "run_shell", "list_jobs", "review_changes", "project_validate",
-                    "project_build", "workspace_hygiene"
+                    "project_build", "workspace_hygiene", "post_session_message"
                 }:
                     properties["session_id"] = {"type": "string"}
                 out = {
@@ -339,6 +342,26 @@ class DriverTests(unittest.TestCase):
         calls = [req for req in state.webcodex_requests if req["tool"] == "show_changes"]
         self.assertEqual(len(calls), 1)
         self.assertEqual(result["final"], "done")
+
+    def test_session_mutation_does_not_invalidate_workspace_closeout(self):
+        state = FakeState()
+        state.relay_actions = [
+            {"kind": "discover", "tool": "post_session_message", "params": None, "text": None},
+            {
+                "kind": "call",
+                "tool": "post_session_message",
+                "params": {"kind": "progress", "message": "still working"},
+                "text": None,
+            },
+            {"kind": "final", "tool": None, "params": None, "text": "recorded"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("record progress only")
+        self.assertEqual(result["final"], "recorded")
+        self.assertFalse(
+            any(req["tool"] == "finish_coding_task" for req in state.webcodex_requests)
+        )
+
 
     def test_unknown_job_identity_is_rejected_before_webcodex(self):
         state = FakeState()
