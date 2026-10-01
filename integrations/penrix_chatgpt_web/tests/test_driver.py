@@ -24,6 +24,7 @@ def response_body(action):
     return {
         "id": "resp_test",
         "status": "completed",
+        "end_turn": True,
         "output": [{
             "type": "message",
             "role": "assistant",
@@ -39,6 +40,7 @@ class FakeState:
         self.webcodex_requests = []
         self.drop_relay = False
         self.drop_webcodex_tool = None
+        self.relay_response_override = None
 
 
 @contextlib.contextmanager
@@ -55,8 +57,12 @@ def fake_servers(state: FakeState):
                 self.connection.shutdown(socket.SHUT_RDWR)
                 self.connection.close()
                 return
-            action = state.relay_actions.pop(0)
-            payload = json.dumps(response_body(action)).encode()
+            if state.relay_response_override is not None:
+                envelope = state.relay_response_override
+            else:
+                action = state.relay_actions.pop(0)
+                envelope = response_body(action)
+            payload = json.dumps(envelope).encode()
             self.send_response(200)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(payload)))
@@ -255,6 +261,33 @@ class DriverTests(unittest.TestCase):
             with self.assertRaises(driver.OutcomeUnknown):
                 self.make_driver(relay_url, wc_url).run("inspect")
         self.assertEqual(len(state.relay_requests), 1)
+
+    def test_http_200_incomplete_response_cannot_drive_an_effect(self):
+        state = FakeState()
+        state.relay_response_override = {
+            "id": "resp_incomplete",
+            "status": "incomplete",
+            "end_turn": False,
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": json.dumps({
+                        "kind": "call",
+                        "tool": "edit_project_files",
+                        "params": {"edits": []},
+                        "text": None,
+                    }, separators=(",", ":")),
+                }],
+            }],
+        }
+        with fake_servers(state) as (relay_url, wc_url):
+            with self.assertRaisesRegex(driver.DriverError, "completed end_turn evidence"):
+                self.make_driver(relay_url, wc_url).run("edit")
+        self.assertEqual(len(state.relay_requests), 1)
+        self.assertFalse(any(req["tool"] == "edit_project_files" for req in state.webcodex_requests))
 
 
 if __name__ == "__main__":
