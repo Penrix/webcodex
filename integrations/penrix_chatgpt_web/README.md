@@ -55,6 +55,7 @@ The default allowlist is coding-oriented, not administrative. `run_shell` is int
 The driver intentionally has no automatic retry loop.
 
 - A ChatGPT Web transport disconnect stops with `outcome_unknown`; it does not send the same prompt again.
+- Relay errors `chatgpt_submission_ambiguous` and `chatgpt_submitted_turn_failed` are also classified as `outcome_unknown`, because current `codex-chatgpt-web` says Send may have occurred / the task already started. They are never treated as a clean pre-send failure.
 - A WebCodex transport disconnect also stops instead of replaying a possibly accepted effect.
 - A non-idempotent/unknown mutating tool call with the same normalized arguments cannot be dispatched twice in one driver run. WebCodex tools whose current manifest explicitly says `desired_state`, `keyed`, or `fenced_replay` may use their canonical replay/reconciliation contract.
 - The model cannot retarget another Project or Workflow Session. The driver pins the selectors established by `work_on_project` and rejects conflicting proposals before calling WebCodex.
@@ -114,10 +115,12 @@ Deterministic stdlib fake-server tests cover:
 - fixed Project + exact Workflow Session injection;
 - Project retarget rejection before an effect;
 - contract discovery before non-preloaded tools;
-- source-changing work cannot finalize before `finish_coding_task`;
+- current ordinary `review_changes` discovery is preloaded alongside the edit/validation/closeout path;
+- source-changing work cannot finalize before `finish_coding_task`; omitted `summary_only` is pinned to the current upstream normal-closeout default (`true`) while an explicit caller choice is preserved;
 - non-idempotent mutation with identical normalized arguments is sent only once;
 - exact Session resume reads the saved handoff;
 - relay disconnect is not automatically retried;
+- current relay post-Send uncertainty codes stop as `outcome_unknown` without a second Web request;
 - HTTP 200 with an incomplete/non-terminal Responses envelope cannot drive a WebCodex effect;
 - a WebCodex mutation whose response transport drops stops immediately with `outcome_unknown` and does not ask the model for another action.
 
