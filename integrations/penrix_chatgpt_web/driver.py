@@ -273,11 +273,55 @@ class Driver:
         self.max_rounds, self.log = max_rounds, log
         self.contracts: dict[str, dict[str, Any]] = {}
         self.dispatched_mutations: set[str] = set()
+        self.known_job_ids: set[str] = set()
+        self.known_observation_refs: set[str] = set()
         self.needs_closeout = False
         self.closeout_ok = False
 
     def note(self, text: str) -> None:
         print(text, file=self.log, flush=True)
+
+    def remember_job_identities(self, value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key == "job_id" and isinstance(item, str) and item.startswith("wc_job_"):
+                    self.known_job_ids.add(item)
+                elif key == "observation_ref" and isinstance(item, str) and item.startswith("~j"):
+                    self.known_observation_refs.add(item)
+                self.remember_job_identities(item)
+        elif isinstance(value, list):
+            for item in value:
+                self.remember_job_identities(item)
+
+    def fence_job_identities(self, tool: str, params: dict[str, Any]) -> None:
+        if tool == "observe_jobs":
+            items = params.get("items")
+            if not isinstance(items, list):
+                return
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                job_id = item.get("job_id")
+                observation_ref = item.get("observation_ref")
+                if isinstance(job_id, str) and job_id not in self.known_job_ids:
+                    raise DriverError(f"unknown Job identity for fixed Project: {job_id}")
+                if (
+                    isinstance(observation_ref, str)
+                    and observation_ref not in self.known_observation_refs
+                ):
+                    raise DriverError(
+                        f"unknown Job observation ref for fixed Project: {observation_ref}"
+                    )
+        elif tool == "wait_for_job_readiness":
+            job_ids = params.get("job_ids")
+            if isinstance(job_ids, list):
+                for job_id in job_ids:
+                    if isinstance(job_id, str) and job_id not in self.known_job_ids:
+                        raise DriverError(f"unknown Job identity for fixed Project: {job_id}")
+        elif tool in {"wait_for_job_terminal", "job_write_input"}:
+            job_id = params.get("job_id")
+            if isinstance(job_id, str) and job_id not in self.known_job_ids:
+                raise DriverError(f"unknown Job identity for fixed Project: {job_id}")
 
     def manifest(self, tool: str, session: str) -> dict[str, Any]:
         if tool not in self.allowed:
@@ -310,6 +354,7 @@ class Driver:
         if tool not in self.allowed:
             raise DriverError(f"tool not admitted by driver: {tool}")
         fixed, effect, idem = self.fixed_params(tool, params, session)
+        self.fence_job_identities(tool, fixed)
         fingerprint = dump({"tool": tool, "params": fixed})
         mutation = effect == "mutate" or tool in MAY_CHANGE_WORKSPACE
         if mutation and fingerprint in self.dispatched_mutations and idem not in REPLAY_SAFE:
@@ -321,6 +366,7 @@ class Driver:
                 self.closeout_ok = False
         self.note(f"[penrix-web] WebCodex tool: {tool}")
         result = self.wc.call(tool, fixed, session)
+        self.remember_job_identities(result)
         if tool == "finish_coding_task" and result.get("success") is True:
             self.closeout_ok = True
         return result
@@ -338,9 +384,11 @@ class Driver:
         if not isinstance(session, str) or not session.startswith("wc_sess_"):
             raise DriverError("work_on_project returned no canonical Session id")
         session_ref = out.get("session_ref") if isinstance(out.get("session_ref"), str) else None
+        self.remember_job_identities(boot)
         handoff = None
         if resume:
             handoff = self.wc.call("session_handoff_summary", {"project": self.project, "session_id": session}, session)
+            self.remember_job_identities(handoff)
 
         for tool in PRELOAD:
             if tool in self.allowed:
