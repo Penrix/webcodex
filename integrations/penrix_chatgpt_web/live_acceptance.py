@@ -288,17 +288,24 @@ def run_driver(
     env: dict[str, str],
     args: list[str],
 ) -> dict[str, Any]:
-    proc = subprocess.run(
-        [sys.executable, str(driver), *args],
-        env=env,
-        check=False,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=DRIVER_TIMEOUT,
-    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(driver), *args],
+            env=env,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=DRIVER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AcceptanceError(
+            "driver timed out; external outcome may be unknown. "
+            "Do not rerun automatically; inspect the retained disposable repository "
+            "and ChatGPT/WebCodex state first."
+        ) from exc
     if proc.stderr.strip():
         print(proc.stderr.rstrip(), file=sys.stderr)
     if proc.returncode != 0:
@@ -452,6 +459,7 @@ def live_run(
             ],
         }
     finally:
+        primary_error_active = sys.exc_info()[0] is not None
         cleanup_error: Exception | None = None
         if share is not None:
             try:
@@ -467,7 +475,13 @@ def live_run(
                 file=sys.stderr,
             )
         if cleanup_error is not None:
-            raise cleanup_error
+            if primary_error_active:
+                print(
+                    f"Cleanup also failed after the primary blocker: {cleanup_error}",
+                    file=sys.stderr,
+                )
+            else:
+                raise cleanup_error
 
 
 def share_probe(webcodex: pathlib.Path) -> dict[str, Any]:
@@ -496,6 +510,7 @@ def share_probe(webcodex: pathlib.Path) -> dict[str, Any]:
             "exposure_state": ready.get("exposure", {}).get("state"),
         }
     finally:
+        primary_error_active = sys.exc_info()[0] is not None
         cleanup_error: Exception | None = None
         if share is not None:
             try:
@@ -511,7 +526,13 @@ def share_probe(webcodex: pathlib.Path) -> dict[str, Any]:
                 file=sys.stderr,
             )
         if cleanup_error is not None:
-            raise cleanup_error
+            if primary_error_active:
+                print(
+                    f"Cleanup also failed after the primary blocker: {cleanup_error}",
+                    file=sys.stderr,
+                )
+            else:
+                raise cleanup_error
 
 
 def find_webcodex(bin_dir: str | None) -> pathlib.Path:
