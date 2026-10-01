@@ -22,6 +22,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile driver sources
-        run: python -m py_compile integrations/penrix_chatgpt_web/driver.py integrations/penrix_chatgpt_web/live_acceptance.py integrations/penrix_chatgpt_web/tests/test_driver.py
+        run: python -m py_compile integrations/penrix_chatgpt_web/driver.py integrations/penrix_chatgpt_web/live_acceptance.py integrations/penrix_chatgpt_web/provider_probe.py integrations/penrix_chatgpt_web/tests/test_driver.py integrations/penrix_chatgpt_web/tests/test_live_acceptance.py integrations/penrix_chatgpt_web/tests/test_provider_probe.py
       - name: Run driver contract tests
         run: python -m unittest discover -s integrations/penrix_chatgpt_web/tests -p "test_*.py" -v
