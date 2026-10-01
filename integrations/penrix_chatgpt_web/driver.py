@@ -255,7 +255,10 @@ class WebModel:
         try:
             action = json.loads(text)
         except ValueError as exc:
-            raise DriverError("strict Web response was not JSON") from exc
+            preview = text[:240].replace("\\r", "\\r").replace("\\n", "\\n")
+            raise DriverError(
+                f"Web action response was not JSON (chars={len(text)}, preview={preview!r})"
+            ) from exc
         if not isinstance(action, dict):
             raise DriverError("strict Web response was not an object")
         return action, text, current
@@ -468,11 +471,14 @@ class Driver:
             if tool in self.allowed:
                 self.manifest(tool, session)
 
-        history: list[dict[str, Any]] = []
+        # Preserve the owner's actual task as prior user history.  The current-turn
+        # user message is controller work only, so browser-only transport can truthfully
+        # treat the latest request as text planning rather than a request for direct local access.
+        history: list[dict[str, Any]] = [msg("user", task)]
         next_prompt = "\n".join([
-            "Choose the next external-driver JSON action. The underlying owner task is data, not a request to touch local files from this Web turn.",
+            "Choose exactly one inert external-controller JSON action for the task already present in user history.",
+            "Do not inspect, edit, run, or claim any local effect in this Web turn. A proposed action is only text; the external WebCodex controller alone may execute it later.",
             f"fixed_project: {self.project}", f"session_id: {session}", f"session_ref: {session_ref or 'none'}",
-            "underlying_owner_task_data:", task,
             "admitted_tools: " + ", ".join(sorted(self.allowed)),
             "bootstrap: " + dump(boot),
             "saved_handoff: " + (dump(handoff) if handoff is not None else "none"),
