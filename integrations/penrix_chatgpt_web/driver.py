@@ -117,11 +117,17 @@ class JsonClient:
             # Once bytes may have left this process, replay is unsafe by default.
             raise OutcomeUnknown(f"transport outcome unknown for {url}") from exc
         if len(raw) > MAX_BODY:
-            raise DriverError("HTTP response exceeded driver bound")
+            if status >= 500 or status < 400:
+                raise OutcomeUnknown(f"response exceeded driver bound after request dispatch: {url}")
+            raise DriverError(f"HTTP error response exceeded driver bound: {url} (HTTP {status})")
         try:
             return status, json.loads(raw.decode()) if raw else None
         except (UnicodeError, ValueError) as exc:
-            raise DriverError(f"non-JSON response from {url} (HTTP {status})") from exc
+            if status >= 500 or status < 400:
+                raise OutcomeUnknown(
+                    f"non-JSON response after request dispatch: {url} (HTTP {status})"
+                ) from exc
+            raise DriverError(f"non-JSON HTTP error response from {url} (HTTP {status})") from exc
 
 
 class WebCodex:
@@ -134,9 +140,13 @@ class WebCodex:
         body: dict[str, Any] = {"tool": tool, "params": params}
         if session:
             body["recording_session_id"] = session
-        _status, result = self.http.post(self.url + "/api/tools/call", body, self.token)
+        status, result = self.http.post(self.url + "/api/tools/call", body, self.token)
+        if status >= 500:
+            raise OutcomeUnknown(
+                f"WebCodex HTTP {status} after request dispatch for {tool}; reconcile exact state"
+            )
         if not isinstance(result, dict):
-            raise DriverError(f"invalid WebCodex result for {tool}")
+            raise DriverError(f"invalid WebCodex result for {tool} (HTTP {status})")
         return result
 
 
@@ -367,6 +377,16 @@ class Driver:
         self.note(f"[penrix-web] WebCodex tool: {tool}")
         result = self.wc.call(tool, fixed, session)
         self.remember_job_identities(result)
+        output = result.get("output") if isinstance(result.get("output"), dict) else {}
+        if output.get("execution_state") == "outcome_unknown":
+            error_kind = output.get("error_kind")
+            job_id = output.get("job_id")
+            detail = ", ".join(
+                str(value) for value in (error_kind, job_id) if isinstance(value, str) and value
+            ) or tool
+            raise OutcomeUnknown(
+                f"WebCodex reported outcome_unknown for {tool}: {detail}; reconcile before retry"
+            )
         if tool == "finish_coding_task" and result.get("success") is True:
             self.closeout_ok = True
         return result
