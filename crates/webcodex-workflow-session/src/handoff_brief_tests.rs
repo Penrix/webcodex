@@ -32,6 +32,102 @@ fn handoff_brief_size_matches_buffered_json_bytes() {
     }
 }
 
+#[test]
+fn handoff_brief_restores_recorded_decisions_and_progress_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = dir.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger, 16, 200);
+    let session_id = start_session(&store, "continue the authorized project");
+    for (kind, message) in [
+        (
+            SessionMessageKind::Decision,
+            "保留当前数据库，先完成迁移测试",
+        ),
+        (
+            SessionMessageKind::Progress,
+            "Migration tests passed; UI review remains",
+        ),
+    ] {
+        store
+            .post_message(PostSessionMessageInput {
+                session_id: session_id.clone(),
+                kind,
+                message: message.to_string(),
+                tags: Vec::new(),
+                reply_to: None,
+                priority: SessionMessagePriority::Normal,
+            })
+            .unwrap();
+    }
+    store.flush_persistence();
+    let restored = SessionStore::with_persistence(&ledger, 16, 200);
+    let brief = brief_for(&restored, &session_id, false, None, false, None, None, true);
+    assert_eq!(brief["task"]["decisions"]["total"], 1);
+    assert_eq!(
+        brief["task"]["decisions"]["items"][0]["excerpt"],
+        "保留当前数据库，先完成迁移测试"
+    );
+    assert_eq!(
+        brief["task"]["recent_progress"]["items"][0]["excerpt"],
+        "Migration tests passed; UI review remains"
+    );
+    assert_eq!(
+        restored
+            .discussion_summary(&session_id, Some(20))
+            .unwrap()
+            .counts
+            .total,
+        2
+    );
+}
+
+#[test]
+fn handoff_brief_notes_redact_secrets_bound_unicode_and_report_missing_history() {
+    let store = store_with_limit(200);
+    let session_id = start_session(&store, "bounded recovery");
+    for index in 0..8 {
+        let message = if index % 2 == 0 {
+            format!("decision {index}: API_KEY=never-disclose-this-secret")
+        } else {
+            format!("decision {index}: {}", "界".repeat(800))
+        };
+        store
+            .post_message(PostSessionMessageInput {
+                session_id: session_id.clone(),
+                kind: SessionMessageKind::Decision,
+                message,
+                tags: Vec::new(),
+                reply_to: None,
+                priority: SessionMessagePriority::Normal,
+            })
+            .unwrap();
+    }
+    let brief = brief_for(&store, &session_id, false, None, false, None, None, true);
+    assert!(handoff_brief_size(&brief) < HANDOFF_BRIEF_HARD_MAX_BYTES);
+    assert!(!brief.to_string().contains("never-disclose-this-secret"));
+    let notes = &brief["task"]["decisions"];
+    assert_eq!(notes["total"], 8);
+    assert_eq!(notes["truncated"], true);
+    assert!(notes["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|note| note["excerpt"].as_str().unwrap().chars().count()
+            <= HANDOFF_INSTRUCTION_MAX_CHARS));
+    assert!(notes["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|note| note["excerpt"].as_str().unwrap().contains('界') && note["truncated"] == true));
+    let unavailable = brief_for(&store, &session_id, false, None, false, None, None, false);
+    assert!(unavailable["task"]["decisions"]["total"].is_null());
+    assert_eq!(unavailable["basis"]["complete"], false);
+    assert!(unavailable["basis"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("discussion_unavailable")));
+}
+
 fn store_with_limit(max_events: usize) -> SessionStore {
     SessionStore::new(16, max_events)
 }
@@ -238,6 +334,31 @@ fn brief_for(
     jobs: Option<&Value>,
     guidance_available: bool,
 ) -> Value {
+    brief_for_with_external(
+        store,
+        session_id,
+        workspace_requested,
+        workspace,
+        validation_requested,
+        validation_override,
+        jobs,
+        guidance_available,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn brief_for_with_external(
+    store: &SessionStore,
+    session_id: &str,
+    workspace_requested: bool,
+    workspace: Option<&Value>,
+    validation_requested: bool,
+    validation_override: Option<&Value>,
+    jobs: Option<&Value>,
+    guidance_available: bool,
+    external_observations: Option<&Value>,
+) -> Value {
     let summary = store.summary(session_id, Some(200)).unwrap();
     let validation = validation_override
         .cloned()
@@ -274,15 +395,18 @@ fn brief_for(
     });
     build_handoff_brief(HandoffBriefInput {
         session_summary: &summary,
+        discussion: guidance_available.then_some(&discussion),
         continuation_feedback: &continuation,
         workspace_requested,
         workspace,
         validation_requested,
         validation: Some(&validation),
         jobs,
+        external_observations,
         guidance_available,
         existing_suggested_actions: None,
         session_changed_during_snapshot: false,
+        external_observations_changed_during_snapshot: false,
     })
 }
 
@@ -659,6 +783,33 @@ fn handoff_brief_not_requested_and_unavailable_statuses_use_fixed_reasons() {
 }
 
 #[test]
+fn handoff_brief_non_git_workspace_is_available_with_git_not_applicable() {
+    let store = store_with_limit(200);
+    let session_id = start_session(&store, "non-git workspace");
+    let jobs = empty_jobs();
+    let workspace = json!({
+        "git_available": false,
+        "non_git_project": true,
+        "clean": null,
+        "counts": {},
+    });
+    let brief = brief_for(
+        &store,
+        &session_id,
+        true,
+        Some(&workspace),
+        false,
+        None,
+        Some(&jobs),
+        true,
+    );
+    assert_eq!(brief["workspace"]["status"], "available");
+    assert_eq!(brief["workspace"]["reason_code"], "non_git_project");
+    assert!(brief["workspace"]["dirty"].is_null());
+    assert!(brief["workspace"]["conflicted"].is_null());
+}
+
+#[test]
 fn handoff_brief_attempt_boundary_eviction_marks_basis_incomplete() {
     let store = store_with_limit(6);
     let session_id = start_session(&store, "evicted attempt");
@@ -868,15 +1019,18 @@ fn handoff_brief_hard_limit_uses_actual_escaped_json_bytes() {
     workspace["branch"] = json!(format!("feature/{}", "🦀".repeat(256)));
     let brief = build_handoff_brief(HandoffBriefInput {
         session_summary: &summary,
+        discussion: Some(&discussion),
         continuation_feedback: &feedback,
         workspace_requested: true,
         workspace: Some(&workspace),
         validation_requested: true,
         validation: Some(&validation),
         jobs: Some(&jobs),
+        external_observations: None,
         guidance_available: true,
         existing_suggested_actions: None,
         session_changed_during_snapshot: false,
+        external_observations_changed_during_snapshot: false,
     });
     let bytes = handoff_brief_size(&brief);
     assert_eq!(bytes, serde_json::to_vec(&brief).unwrap().len());
@@ -898,6 +1052,99 @@ fn handoff_brief_hard_limit_uses_actual_escaped_json_bytes() {
         root_chars < HANDOFF_INSTRUCTION_MAX_CHARS || latest_chars < HANDOFF_INSTRUCTION_MAX_CHARS,
         "fixture must reach hard-limit instruction reduction: root={root_chars} latest={latest_chars}"
     );
+}
+
+#[test]
+fn handoff_brief_byte_budget_drops_old_external_claims_before_native_context() {
+    let reports = (0..5)
+        .map(|n| {
+            json!({
+                "adapter_id": "a".repeat(64),
+                "event_id": format!("{n:064x}"),
+                "tool": "Bash",
+                "exit_code": null,
+                "recorded_at": n + 1,
+                "status": "unknown",
+            })
+        })
+        .collect::<Vec<_>>();
+    let make_external = |items: Vec<Value>| {
+        json!({
+            "status": "available",
+            "reason_code": null,
+            "provenance": "external_report",
+            "coverage": {"complete": false, "reason": "source_sequence_unavailable", "ordering": "server_recorded_at_then_identity"},
+            "total": 5,
+            "returned": items.len(),
+            "truncated": items.len() < 5,
+            "unknown_count": 5,
+            "observations": items,
+        })
+    };
+    let empty = make_external(Vec::new());
+    let full = make_external(reports);
+    let workspace = clean_workspace();
+    let jobs = empty_jobs();
+    let validation = passed_validation();
+    for path_length in [250, 300, 350, 400, 450, 500] {
+        let store = store_with_limit(200);
+        let session_id = start_session(&store, &"r".repeat(500));
+        add_instruction(&store, &session_id, &"l".repeat(500));
+        for n in 0..12 {
+            let path = format!("{n}/{}", "p".repeat(path_length));
+            record_write(&store, &session_id, &path);
+            record_read(&store, &session_id, &path);
+            let baseline = brief_for_with_external(
+                &store,
+                &session_id,
+                true,
+                Some(&workspace),
+                true,
+                Some(&validation),
+                Some(&jobs),
+                true,
+                Some(&empty),
+            );
+            let projected = brief_for_with_external(
+                &store,
+                &session_id,
+                true,
+                Some(&workspace),
+                true,
+                Some(&validation),
+                Some(&jobs),
+                true,
+                Some(&full),
+            );
+            let returned = projected["external_observations"]["returned"]
+                .as_u64()
+                .unwrap();
+            if returned == 0 || returned == 5 || baseline["progress"]["changes"]["returned"] == 0 {
+                continue;
+            }
+            assert!(handoff_brief_size(&projected) < HANDOFF_BRIEF_HARD_MAX_BYTES);
+            assert_eq!(projected["progress"], baseline["progress"]);
+            assert_eq!(projected["validation"], baseline["validation"]);
+            assert_eq!(projected["task"], baseline["task"]);
+            assert_eq!(projected["external_observations"]["total"], 5);
+            assert_eq!(projected["external_observations"]["unknown_count"], 5);
+            assert_eq!(projected["external_observations"]["truncated"], true);
+            assert_eq!(
+                projected["external_observations"]["observations"]
+                    .as_array()
+                    .unwrap()
+                    .len() as u64,
+                returned,
+            );
+            assert_eq!(
+                projected["external_observations"]["observations"][returned as usize - 1]
+                    ["event_id"],
+                format!("{:064x}", 4),
+            );
+            return;
+        }
+    }
+    panic!("fixture did not reach a byte budget where external claims must shrink first");
 }
 
 #[test]

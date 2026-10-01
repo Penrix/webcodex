@@ -1077,7 +1077,7 @@ async fn conversation_import_durable_session_events_do_not_store_host_file_refs(
         .error
         .as_deref()
         .unwrap_or_default()
-        .contains("authenticated MCP OAuth host-file provenance"));
+        .contains("trusted MCP host-file provenance"));
 
     let summary = runtime
         .sessions
@@ -1493,7 +1493,7 @@ fn search_project_text_command_excludes_sensitive_dirs_and_bounds_output() {
     assert!(cmd.contains("\"$head_cmd\" -n 26") || cmd.contains("$head_cmd -n 26"));
     assert!(cmd.contains("trap 'cleanup_search_status' EXIT"));
     assert!(cmd.contains("trap 'cleanup_search_status; exit 143' HUP INT TERM"));
-    assert!(cmd.contains("grep -rnI"));
+    assert!(cmd.contains("grep -rHnI --null"));
     assert!(cmd.contains("command -v head"));
     assert!(cmd.contains("/usr/bin/head") || cmd.contains("/bin/head"));
     // No global path sort: matches must stream in traversal order so a small
@@ -1588,7 +1588,7 @@ fn logical_search_matches(result: &ToolResult) -> Vec<(u64, String)> {
 #[cfg(unix)]
 #[test]
 fn search_project_text_command_prefers_rg_backend_when_available() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -1631,7 +1631,7 @@ fn search_project_text_command_prefers_rg_backend_when_available() {
 #[cfg(unix)]
 #[test]
 fn search_project_text_command_falls_back_to_grep_without_rg() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -1669,6 +1669,344 @@ fn search_project_text_command_falls_back_to_grep_without_rg() {
     assert_eq!(result.output["matches"][0]["path"], "src/lib.rs");
     assert_eq!(result.output["matches"][0]["line"], 3);
     assert_eq!(result.output["matches"][0]["preview"], "needle from grep");
+}
+
+#[cfg(unix)]
+#[test]
+fn search_project_text_grep_single_file_matches_and_no_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("one.txt"), "alpha\nneedle\nomega\n").unwrap();
+    for command in ["grep", "head"] {
+        symlink_host_command(command, &bin);
+    }
+
+    for (pattern, expected_exit) in [("needle", 0), ("definitely_missing", 1)] {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: pattern.to_string(),
+                path: Some("one.txt".to_string()),
+                ..raw_search_request()
+            },
+            Some(SearchPatternMode::Literal),
+        )
+        .unwrap();
+        let command = format!(
+            "PATH={}; export PATH\n{}",
+            shell_escape_simple(&bin.to_string_lossy()),
+            search_project_text_command(&options)
+        );
+        let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+        assert_eq!(exit_code, expected_exit, "{stderr}");
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["backend"], "grep");
+        assert_eq!(result.output["exit_code"], expected_exit);
+        if expected_exit == 0 {
+            assert_eq!(result.output["count"], 1);
+            assert_eq!(result.output["matches"][0]["path"], "one.txt");
+            assert_eq!(result.output["matches"][0]["line"], 2);
+            assert_eq!(result.output["matches"][0]["preview"], "needle");
+        } else {
+            assert_eq!(result.output["matches"], json!([]));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn search_project_text_grep_directory_matches_multiple_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.txt"), "needle\nneedle\n").unwrap();
+    std::fs::write(root.join("src/b.txt"), "needle\n").unwrap();
+    for command in ["grep", "head"] {
+        symlink_host_command(command, &bin);
+    }
+    let options = SearchOptions::normalize(SearchRequest {
+        path: Some("src".to_string()),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let result = run_search_with_path(&bin, &root, &options);
+    assert_eq!(result.output["backend"], "grep");
+    assert_eq!(result.output["count"], 3);
+    let mut paths = result.output["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(paths, vec!["src/a.txt", "src/a.txt", "src/b.txt"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn search_project_text_grep_files_with_matches_scopes_and_bounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.txt"), "needle\nneedle\n").unwrap();
+    std::fs::write(root.join("src/b.txt"), "needle\n").unwrap();
+    std::fs::write(root.join("src/c.txt"), "quiet\n").unwrap();
+    for command in ["grep", "head"] {
+        symlink_host_command(command, &bin);
+    }
+
+    for (path, pattern, limit, expected_exit, expected_files, truncated) in [
+        ("src/a.txt", "needle", 10, 0, vec!["src/a.txt"], false),
+        ("src/c.txt", "needle", 10, 1, vec![], false),
+        (
+            "src",
+            "needle",
+            10,
+            0,
+            vec!["src/a.txt", "src/b.txt"],
+            false,
+        ),
+        ("src", "missing", 10, 1, vec![], false),
+        ("src", "needle", 1, 0, vec!["src/a.txt", "src/b.txt"], true),
+    ] {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: pattern.to_string(),
+                path: Some(path.to_string()),
+                limit: Some(limit),
+                result_mode: Some(SearchResultMode::FilesWithMatches),
+                ..raw_search_request()
+            },
+            Some(SearchPatternMode::Literal),
+        )
+        .unwrap();
+        assert!(!options.requires_ripgrep());
+        let command = format!(
+            "PATH={}; export PATH\n{}",
+            shell_escape_simple(&bin.to_string_lossy()),
+            search_project_text_command(&options)
+        );
+        assert!(command.contains("grep -rlI -F"), "{command}");
+        let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+        assert_eq!(exit_code, expected_exit, "{stderr}");
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["backend"], "grep");
+        assert_eq!(result.output["exit_code"], expected_exit);
+        let files = result.output["files"].as_array().unwrap();
+        assert_eq!(files.len(), expected_files.len().min(limit));
+        assert!(files
+            .iter()
+            .all(|item| expected_files.contains(&item["path"].as_str().unwrap())));
+        assert_eq!(result.output["returned_file_count"], files.len());
+        assert_eq!(result.output["truncated"], truncated);
+        if truncated {
+            assert_eq!(result.output["truncation_reason"], "limit");
+        }
+    }
+
+    for (pattern_mode, expected_exit) in [
+        (SearchPatternMode::Regex, 0),
+        (SearchPatternMode::Literal, 1),
+    ] {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: "need.e".to_string(),
+                path: Some("src".to_string()),
+                result_mode: Some(SearchResultMode::FilesWithMatches),
+                ..raw_search_request()
+            },
+            Some(pattern_mode),
+        )
+        .unwrap();
+        let command = format!(
+            "PATH={}; export PATH\n{}",
+            shell_escape_simple(&bin.to_string_lossy()),
+            search_project_text_command(&options)
+        );
+        let (exit_code, stdout, stderr, _) = run_command_sync(&command, &root, 10);
+        assert_eq!(exit_code, expected_exit, "{stderr}");
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+        assert!(result.success, "{result:?}");
+        assert_eq!(
+            result.output["returned_file_count"],
+            if expected_exit == 0 { 2 } else { 0 }
+        );
+    }
+}
+
+#[test]
+fn search_project_text_grep_output_contract_handles_crlf_and_multiple_records() {
+    let marker = "{\"webcodex_search\":{\"backend\":\"grep\",\"feature_unavailable\":false}}\r\n";
+    let raw_path = if cfg!(windows) {
+        "src\\foo.rs"
+    } else {
+        "src/foo.rs"
+    };
+    let expected_path = "src/foo.rs";
+    let matches_options = SearchOptions::normalize(raw_search_request()).unwrap();
+    let matches_stdout = format!("{marker}{raw_path}\01:needle\r\n{raw_path}\02:needle again\r\n");
+    let matches =
+        search_project_text_output("demo", &matches_options, &matches_stdout, Some(0), "");
+    assert!(matches.success, "{matches:?}");
+    assert_eq!(matches.output["backend"], "grep");
+    assert_eq!(matches.output["count"], 2);
+    assert_eq!(matches.output["matches"][0]["path"], expected_path);
+    assert_eq!(matches.output["matches"][0]["line"], 1);
+    assert_eq!(matches.output["matches"][0]["preview"], "needle");
+    assert_eq!(matches.output["matches"][1]["line"], 2);
+
+    let files_options = SearchOptions::normalize(SearchRequest {
+        result_mode: Some(SearchResultMode::FilesWithMatches),
+        ..raw_search_request()
+    })
+    .unwrap();
+    let files_stdout = format!("{marker}{raw_path}\r\nsrc/bar.rs\r\n");
+    let files = search_project_text_output("demo", &files_options, &files_stdout, Some(0), "");
+    assert!(files.success, "{files:?}");
+    assert_eq!(files.output["returned_file_count"], 2);
+    assert_eq!(files.output["files"][0]["path"], expected_path);
+    assert_eq!(files.output["files"][1]["path"], "src/bar.rs");
+    assert_eq!(files.output["truncated"], false);
+
+    for options in [&matches_options, &files_options] {
+        let empty = search_project_text_output("demo", options, marker, Some(1), "");
+        assert!(empty.success, "{empty:?}");
+        assert_eq!(empty.output["exit_code"], 1);
+        let field = if options.result_mode == SearchResultMode::Matches {
+            "matches"
+        } else {
+            "files"
+        };
+        assert_eq!(empty.output[field], json!([]));
+
+        let inconsistent = search_project_text_output("demo", options, marker, Some(0), "");
+        assert!(!inconsistent.success);
+        assert_eq!(
+            inconsistent.output["reason_code"],
+            "backend_output_inconsistent"
+        );
+        let missing_marker =
+            search_project_text_output("demo", options, "src/foo.rs:1:needle\n", Some(0), "");
+        assert!(!missing_marker.success);
+        assert_eq!(
+            missing_marker.output["reason_code"],
+            "backend_identity_missing"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn search_project_text_grep_windows_backend_smoke() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("one.txt"), "alpha\nneedle\nomega\n").unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/a.txt"), "needle\n").unwrap();
+    std::fs::write(tmp.path().join("src/b.txt"), "needle\n").unwrap();
+    for (mode, path, pattern, expected_exit, expected_paths) in [
+        (
+            SearchResultMode::Matches,
+            "one.txt",
+            "needle",
+            0,
+            vec!["one.txt"],
+        ),
+        (
+            SearchResultMode::FilesWithMatches,
+            "one.txt",
+            "needle",
+            0,
+            vec!["one.txt"],
+        ),
+        (SearchResultMode::Matches, "one.txt", "missing", 1, vec![]),
+        (
+            SearchResultMode::FilesWithMatches,
+            "one.txt",
+            "missing",
+            1,
+            vec![],
+        ),
+        (
+            SearchResultMode::Matches,
+            "src",
+            "needle",
+            0,
+            vec!["src/a.txt", "src/b.txt"],
+        ),
+        (
+            SearchResultMode::FilesWithMatches,
+            "src",
+            "needle",
+            0,
+            vec!["src/a.txt", "src/b.txt"],
+        ),
+    ] {
+        let options = SearchOptions::normalize_with_pattern_mode(
+            SearchRequest {
+                pattern: pattern.to_string(),
+                path: Some(path.to_string()),
+                result_mode: Some(mode),
+                ..raw_search_request()
+            },
+            Some(SearchPatternMode::Literal),
+        )
+        .unwrap();
+        // Git for Windows provides grep and head together in usr/bin. Scope
+        // PATH to that directory so an unrelated installed rg cannot mask the
+        // fallback branch being tested.
+        let command = format!(
+            "grep_bin=$(command -v grep)\nPATH=${{grep_bin%/*}}; export PATH\n{}",
+            search_project_text_command(&options)
+        );
+        let (exit_code, stdout, stderr, _) = run_command_sync(&command, tmp.path(), 10);
+        assert_eq!(exit_code, expected_exit, "{stderr}");
+        let result =
+            search_project_text_output("demo", &options, &stdout, Some(exit_code), &stderr);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output["backend"], "grep");
+        assert_eq!(result.output["exit_code"], expected_exit);
+        assert_eq!(result.output["truncated"], false);
+        match mode {
+            SearchResultMode::Matches => {
+                let mut paths = result.output["matches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["path"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                assert_eq!(paths, expected_paths);
+                assert_eq!(result.output["count"], paths.len());
+                if path == "one.txt" && expected_exit == 0 {
+                    assert_eq!(result.output["matches"][0]["line"], 2);
+                    assert_eq!(result.output["matches"][0]["preview"], "needle");
+                }
+            }
+            SearchResultMode::FilesWithMatches => {
+                let mut paths = result.output["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["path"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                paths.sort();
+                assert_eq!(paths, expected_paths);
+                assert_eq!(result.output["returned_file_count"], paths.len());
+            }
+            SearchResultMode::Count => unreachable!(),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1729,8 +2067,8 @@ fn search_project_text_basic_regex_semantics_match_rg_and_grep_fallback() {
         )
         .unwrap();
         let command = search_project_text_command(&options);
-        assert!(command.contains("grep -rnI --null -E"), "{command}");
-        assert!(!command.contains("grep -rnI --null -F"), "{command}");
+        assert!(command.contains("-A 0 -E"), "{command}");
+        assert!(!command.contains("-A 0 -F"), "{command}");
 
         let rg = run_search_with_path(&rg_bin, &root, &options);
         let grep = run_search_with_path(&grep_bin, &root, &options);
@@ -1783,8 +2121,8 @@ fn search_project_text_grep_fallback_keeps_literal_patterns_literal() {
         )
         .unwrap();
         let command = search_project_text_command(&options);
-        assert!(command.contains("grep -rnI --null -F"), "{command}");
-        assert!(!command.contains("grep -rnI --null -E"), "{command}");
+        assert!(command.contains("-A 0 -F"), "{command}");
+        assert!(!command.contains("-A 0 -E"), "{command}");
 
         let result = run_search_with_path(&bin, &root, &options);
         assert_eq!(result.output["backend"], "grep", "pattern {pattern}");
@@ -1903,7 +2241,7 @@ fn raw_search_request() -> SearchRequest {
 
 fn search_call(project: String, request: SearchRequest) -> ToolCall {
     ToolCall::SearchProjectTexts {
-        project: project,
+        project,
         queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
             pattern: request.pattern,
             pattern_mode: None,
@@ -1931,9 +2269,13 @@ fn extract_single_search_batch_result(batch: ToolResult) -> ToolResult {
     assert_eq!(items.len(), 1, "one-query search batch: {}", batch.output);
     let item = &items[0];
     ToolResult {
-        success: item["success"]
-            .as_bool()
-            .expect("one-query search item success"),
+        success: if batch.output.get("requested_count").is_none() {
+            assert!(item.get("success").is_none());
+            assert!(item.get("error").is_none());
+            true // The complete sparse batch branch proves every item succeeded.
+        } else {
+            item["success"].as_bool().expect("full search item success")
+        },
         output: item.get("output").cloned().unwrap_or(Value::Null),
         error: item
             .get("error")
@@ -2347,7 +2689,7 @@ fn search_count_uses_backend_evidence_without_claiming_filtered_absence() {
 #[cfg(unix)]
 #[test]
 fn search_command_preserves_rg_exit_2_despite_head() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2377,7 +2719,7 @@ fn search_command_preserves_rg_exit_2_despite_head() {
 #[cfg(unix)]
 #[test]
 fn search_command_preserves_rg_exit_1_as_success_empty() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2406,7 +2748,7 @@ fn search_command_preserves_rg_exit_1_as_success_empty() {
 #[cfg(unix)]
 #[test]
 fn search_command_preserves_grep_exit_2_despite_head() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2491,7 +2833,7 @@ fn count_webcodex_search_status_files(dir: &std::path::Path) -> usize {
 #[cfg(unix)]
 #[test]
 fn search_status_tmpdir_relative_does_not_use_worktree() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     let rel_tmp = root.join("rel-status-tmp");
@@ -2525,7 +2867,7 @@ fn search_status_tmpdir_relative_does_not_use_worktree() {
 #[cfg(unix)]
 #[test]
 fn search_status_tmpdir_project_root_does_not_use_worktree() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     let safe_tmp = tmp.path().join("safe-tmp");
@@ -2560,7 +2902,7 @@ fn search_status_tmpdir_project_root_does_not_use_worktree() {
 #[test]
 fn search_status_tmpdir_symlink_into_worktree_is_rejected() {
     // Outside symlink → inside worktree dir must not bypass physical-path checks.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     let inside = root.join("inner-tmp");
@@ -2600,7 +2942,7 @@ fn search_status_tmpdir_symlink_into_worktree_is_rejected() {
 #[cfg(unix)]
 #[test]
 fn search_status_file_is_removed_after_successful_run() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     let safe_tmp = tmp.path().join("safe-tmp");
@@ -2640,7 +2982,7 @@ fn search_early_stop_reaps_process_group_and_status_files() {
     // wrapper process group (rg + the two head stages + the wrapper shell)
     // must be reaped and the status file removed — nothing is left behind to
     // be cleaned up by a later request.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     let safe_tmp = tmp.path().join("safe-tmp");
@@ -2709,7 +3051,7 @@ exit 1
 
 #[test]
 fn resolve_search_head_command_prefers_path_then_absolute() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     #[cfg(unix)]
@@ -2738,7 +3080,7 @@ fn resolve_search_head_command_prefers_path_then_absolute() {
 #[cfg(unix)]
 #[test]
 fn search_command_fails_when_head_unavailable() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2768,7 +3110,7 @@ fn search_command_fails_when_head_unavailable() {
 #[cfg(unix)]
 #[test]
 fn search_command_fails_when_head_exits_nonzero_even_if_backend_succeeds() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2799,7 +3141,7 @@ fn search_command_fails_when_head_exits_nonzero_even_if_backend_succeeds() {
 #[cfg(unix)]
 #[test]
 fn search_command_keeps_success_when_head_is_available() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2867,7 +3209,7 @@ fn search_small_limit_stops_unbounded_backend_early() {
     // command timeout. Deterministic: no reliance on machine speed — the fake
     // either keeps streaming (and the truncating head closes it) or the test
     // times out.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2917,7 +3259,7 @@ fn search_overlong_match_line_does_not_overflow_byte_budget() {
     // with truncation_reason = "output_bytes" instead of surfacing a half
     // record. The fake `head` delegates to the real system head so the byte
     // boundary cut is byte-accurate and deterministic.
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -2986,12 +3328,26 @@ fn search_requires_ripgrep_based_on_effective_features_not_field_presence() {
     .unwrap();
     assert!(!timeout_only.requires_ripgrep());
 
+    let files_mode = SearchOptions::normalize(SearchRequest {
+        result_mode: Some(SearchResultMode::FilesWithMatches),
+        ..raw_search_request()
+    })
+    .unwrap();
+    assert!(!files_mode.requires_ripgrep());
+
     let with_include = SearchOptions::normalize(SearchRequest {
         include_globs: Some(vec!["**/*.rs".to_string()]),
         ..raw_search_request()
     })
     .unwrap();
     assert!(with_include.requires_ripgrep());
+
+    let with_exclude = SearchOptions::normalize(SearchRequest {
+        exclude_globs: Some(vec!["**/vendor/**".to_string()]),
+        ..raw_search_request()
+    })
+    .unwrap();
+    assert!(with_exclude.requires_ripgrep());
 
     let count_mode = SearchOptions::normalize(SearchRequest {
         result_mode: Some(SearchResultMode::Count),
@@ -3441,7 +3797,7 @@ async fn search_agent_request_dropped_returns_structured_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn search_timeout_only_without_rg_still_allows_grep_fallback() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let root = tmp.path().join("project");
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&root).unwrap();
@@ -3608,7 +3964,7 @@ fn search_audit_arguments_record_bounded_feature_summary_without_pattern_or_glob
 #[cfg(unix)]
 #[test]
 fn search_command_passes_shell_metacharacter_globs_as_one_literal_argument() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     let bin = tmp.path().join("bin");
     let root = tmp.path().join("project");
     std::fs::create_dir_all(&bin).unwrap();
@@ -3773,9 +4129,6 @@ async fn search_project_text_include_and_exclude_globs_are_additive() {
 
 #[tokio::test]
 async fn search_project_text_files_with_matches_is_unique_stable_and_bounded() {
-    // files_with_matches is ripgrep-only; without host rg this is a capability
-    // error, not a product regression (see
-    // advanced_search_without_rg_returns_structured_capability_error).
     if !host_ripgrep_available() {
         eprintln!("skipping real-ripgrep integration test: rg is unavailable");
         return;
@@ -4052,7 +4405,7 @@ async fn search_project_text_no_matches_returns_empty_matches() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::SearchProjectTexts {
-                        project: project,
+                        project,
                         queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
                             pattern: "absent_needle".to_string(),
                             pattern_mode: None,
@@ -4112,7 +4465,7 @@ async fn search_project_text_excludes_sensitive_and_build_dirs() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::SearchProjectTexts {
-                        project: project,
+                        project,
                         queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
                             pattern: "KEEP_SEARCH_NEEDLE".to_string(),
                             pattern_mode: None,
@@ -4485,7 +4838,7 @@ async fn search_project_text_context_does_not_enqueue_python_helper() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::SearchProjectTexts {
-                        project: project,
+                        project,
                         queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
                             pattern: "needle".to_string(),
                             pattern_mode: None,
@@ -4515,7 +4868,7 @@ async fn search_project_text_context_does_not_enqueue_python_helper() {
     );
     assert!(req.command.contains("command -v rg"));
     assert!(req.command.contains("rg --with-filename --null"));
-    assert!(req.command.contains("grep -rnI --null"));
+    assert!(req.command.contains("grep -rHnI --null"));
     complete_agent_request_by_running_locally(&runtime, "search-native", req).await;
     let result = extract_single_search_batch_result(task.await.unwrap());
 
@@ -4612,6 +4965,8 @@ fn validate_edit_file_path_rejects_unsafe_and_sensitive_paths() {
     assert!(validate_edit_file_path("README.md").is_ok());
     assert!(validate_edit_file_path("src/main.rs").is_ok());
     assert!(validate_edit_file_path("a/b/c.txt").is_ok());
+    assert!(validate_edit_file_path(".env.example").is_ok());
+    assert!(validate_edit_file_path(".ENV.SAMPLE").is_ok());
     // Empty / NUL / absolute / traversal rejected.
     assert!(validate_edit_file_path("").is_err());
     assert!(validate_edit_file_path("src\0main.rs").is_err());
@@ -4656,6 +5011,9 @@ fn is_sensitive_edit_path_is_component_wise_not_substring() {
     assert!(is_sensitive_edit_path(".git/HEAD"));
     assert!(is_sensitive_edit_path("node_modules/x"));
     assert!(is_sensitive_edit_path("a/b/.env"));
+    assert!(!is_sensitive_edit_path(".env.example"));
+    assert!(!is_sensitive_edit_path(".ENV.TEMPLATE"));
+    assert!(is_sensitive_edit_path(".env.example.local"));
 }
 
 #[test]
@@ -5156,6 +5514,11 @@ async fn read_file_routes_safe_and_bulk_skipped_explicit_paths_to_agent() {
             "node_modules/foo/package.json",
             "{}\n",
         ),
+        (
+            "dotenv-template-read",
+            ".env.example",
+            "EXAMPLE_ONLY=fake\n",
+        ),
     ] {
         let runtime = runtime_with_agent_project(client_id);
         register_agent(
@@ -5203,6 +5566,9 @@ async fn read_file_refuses_secret_paths_before_reaching_agent() {
         ".env",
         ".env.production",
         "app/.env.local",
+        ".env.example.local",
+        ".env.example.bak",
+        ".env.production.example",
         ".ENV",
         "certs/server.pem",
         "certs/server.key",

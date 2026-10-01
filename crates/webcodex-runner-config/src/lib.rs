@@ -215,6 +215,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Structured explicit-shell selection is advertised only by the
             // running binary that implements the selector.
             explicit_shell_selection: false,
+            bash_login_shell: false,
             file_read: true,
             file_write: true,
             // The running binary advertises the internal optimized export read
@@ -235,6 +236,11 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Scoped exact matching is likewise runtime-only and must not be
             // inferred from generated config or occurrence support.
             apply_text_edit_line_scope: false,
+            // Deterministic range replacement is advertised only by the
+            // running binary that implements it.
+            apply_text_edit_range: false,
+            // Bulk cardinality is implemented by the running binary, never inferred.
+            apply_text_edit_expected_match_count: false,
             // Codex Patch is a running-binary request kind and must not be
             // inferred from generated config or generic file-write support.
             apply_patch: false,
@@ -266,9 +272,16 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Cargo test --lib argv is accepted only by the running binary that
             // advertises the additive structured Cargo selector capability.
             structured_cargo_test_lib: false,
+            // Multi-package Cargo check argv is also an additive running-binary
+            // capability and is never inferred from generic validation argv.
+            structured_cargo_check_packages: false,
             // The running binary advertises this process-lifetime protocol
             // capability after installing its exact Go argv boundary.
             structured_go_test_json: false,
+            project_validation_v1: false,
+            project_build_v1: false,
+            project_validation_package_scope_v1: false,
+            project_validation_test_options_v1: false,
             // Like JSON parsing, first-class durable go_test support is
             // advertised by the running binary, never by generated static config.
             structured_go_test_tool: false,
@@ -284,10 +297,12 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // TypeScript is another additive running-binary semantic. Generated
             // static config must not claim that older Runners understand it.
             structured_script_typescript: false,
+            structured_script_python: false,
             // Internal generated-program execution is a running-binary
             // capability and must fail closed across mixed-version rollout.
             internal_posix_script: false,
             structured_execution_jobs: true,
+            job_process_input: false, // Advertised only by an implementing binary.
             // Detached process authority is advertised only by a running binary
             // after its durable ownership-transfer backend is installed.
             detached_process_jobs: false,
@@ -307,6 +322,8 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // Generated config must not claim Browser capabilities.
             browser_observe: false,
             browser_control: false,
+            browser_element_action_admission: false,
+            browser_batch: false,
             browser_launch: false,
             // Desktop observation is a runtime/platform capability and is never
             // claimed by generated static config.

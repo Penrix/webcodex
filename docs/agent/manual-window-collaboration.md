@@ -2,6 +2,54 @@
 
 This guide defines two bounded multi-window collaboration layers: lightweight **Window Peer** awareness/messages and authoritative **Workflow Session** handoff/assignment. Neither layer is a scheduler, worker pool, claim service, shared transcript, or filesystem lock. The peer layer routes conversation; the Session layer keeps task evidence and fenced todo completion. Both remain separate from the durable Agent/Conversation domain.
 
+## Operator messages and Window transcripts
+
+Runtime WebUI and Work Result App v8 use the exact Window as the collaboration
+target. A Project is optional work-location context; an optional exact Workflow
+Session identifies related work and must be visible and explicitly linked to
+that Window. Neither context changes the recipient or creates a Session.
+
+Operator messages use the independent durable `window_operator_messages` store,
+with exact recipient-principal isolation, 512 retained messages per principal, and a
+principal-scoped delivery key. Within retention, exact retries return the same
+message ID; changing recipient, context, or content with the same key conflicts.
+An uncertain write must retain the complete payload and key when retried.
+
+`POST /api/runtime-console/window-collaboration` accepts `client_window_key` and
+optional `limit` (1–100). The read-only transcript merges inbound Operator,
+inbound peer, and outbound peer messages, oldest first within the latest bounded
+slice. `POST /api/runtime-console/window-collaboration-post` accepts that exact
+Window key, `message`, `delivery_key`, and optional `context_session_id`. Both
+require `runtime:read`, `session:collaborate`, and an exact Window currently
+visible through the caller's Runtime Console Project authority. The Console resolves
+the Window's latest actual recipient principal and stores/reads the transcript in
+that recipient namespace, so rotating the operator WebUI token does not disconnect
+collaboration. A newer Window activity that is not visible to the caller fails closed
+instead of falling back to older visible history. Project-scoped model credentials
+remain exact-principal bounded. The card uses its Host-derived current ClientWindow
+and independently authorizes its Project.
+
+Transcript reads never consume attention. Only model-visible tool activity
+projects pending Operator messages and updates projection timestamps;
+`present_work_result`, `work_result_state`, `work_result_send_message`, and
+`changes_file_diff` do not. The existing exact-ID ACK transport carries Session,
+Peer, and Operator message IDs without changing the historical wrapper field name.
+The WebUI and Work Result card label these states Saved, Included in tool result,
+and Acknowledged;
+internally they mean retained, projected into model-visible context, and later ACK
+evidence observed. They are not transport/read receipts or proof that work was
+accepted or executed.
+
+The WebUI follows new messages while the reader is near the end of the thread.
+Reading earlier messages keeps the scroll position and offers **View new messages**.
+Ctrl/Command + Enter does not submit while an input method is composing. The card
+keeps unchanged message nodes across activity refreshes and respects reduced-motion
+preferences. Missing or malformed send receipts preserve the exact retry payload
+and draft, just like a timeout; they do not prove that the message was rejected.
+Operator identity is never synthesized as a peer Window, and peer self-target
+rejection remains intact. Legacy Session message APIs/UI remain available, but
+new Window UI and card messages no longer write the Session message store.
+
 ## Core model
 
 Assume coordinator Session `C` and worker Session `W`.
@@ -23,11 +71,14 @@ Peer messages reuse the Session message vocabulary (`note`, `proposal`, `questio
 Delivery is model-facing and intentionally lightweight:
 
 - `requires_ack=false`: WebCodex durably records the message and attempts to piggyback it once in `peer_messages` on the recipient window's next normal model-facing tool result. The persisted first/last projection timestamps and projection count describe a Server projection attempt, not a delivery/read receipt. There is no retry obligation if the model or transport never acts on it.
-- `requires_ack=true`: the message is eligible for the same bounded piggyback on later calls whenever the current request omits its id. Echoing the id in `ack_session_message_ids` suppresses it for that one request/response and records the first observed ACK time. ACK proves neither acceptance nor execution, never resolves the message, and never requires a reply.
+- `requires_ack=true`: the message is eligible for the same bounded piggyback on later calls whenever the current request omits its id. Echoing the id in `ack_session_message_ids` suppresses it for that one request/response and records the first observed ACK time. Compact Session `ack_ref` does not apply to Peer messages. ACK proves neither acceptance nor execution, never resolves the message, and never requires a reply.
 
 Peer transport is deliberately bounded rather than a permanent task queue. Old retained Peer messages and discovery edges may be pruned; `requires_ack` therefore means repeat while retained, not indefinite durable work. ActionAudit activity is discovery input only and never establishes a communication route by itself: a peer route exists only while retained Peer discovery/message state can still resolve it. Use Workflow Session todos and assignment fencing for durable work commitments.
 
 The sender's current Workflow Session and Project may be persisted as analysis context when they are already trusted runtime facts, but they are not part of the recipient projection and never become routing authority. Peer ids are resolved only inside the same authenticated principal; knowing another principal's `wc_peer_*` value does not cross that boundary.
+
+The Window transcript retains this context for the sender's own outbound history.
+Inbound peer transcript rows omit it, just as model-facing peer delivery does.
 
 ## Canonical coordinator -> worker flow
 
@@ -35,7 +86,7 @@ The sender's current Workflow Session and Project may be persisted as analysis c
 2. **Worker starts its own Session `W`.** Do not resume `C` just to accept the assignment.
 3. **Worker atomically reads the executable assignment.** Call `get_session_assignment(session_id=C, message_id=<todo_id>)` once before work. That exact store snapshot contains the open todo, all retained direct replies within the bound, and the opaque `assignment_fence`. `session_handoff_summary` may provide broader background, while `list_session_messages` remains generic browsing; neither substitutes for this executable assignment read.
 4. **Worker performs the task under `W`.** Reads, edits, shell/process calls, validation, review evidence, Jobs, checkpoints, and other authoritative activity stay attached to `W`.
-5. **Worker completes the exact todo atomically.** Use `complete_session_message(session_id=C, message_id=<todo_id>, answer=<bounded answer>, completion_key=<caller key>, expected_assignment_fence=<exact assignment_fence>)`. On stateless MCP 2026, wrapper metadata `recording_session_id=W` remains separate provenance and is stripped before concrete parsing. One Session-store mutation creates exactly one `kind=answer` reply, resolves the todo, and records the todo -> answer correlation.
+5. **Worker completes the exact todo atomically.** Use `complete_session_message(session_id=C, message_id=<todo_id>, answer=<bounded answer>, completion_key=<caller key>, expected_assignment_fence=<exact assignment_fence>)`. On Stateless MCP 2026, `_wc.record=W` remains separate recorder provenance and is stripped before concrete parsing. One Session-store mutation creates exactly one `kind=answer` reply, resolves the todo, and records the todo -> answer correlation.
 6. **Stale or incomplete assignment state is not a blind retry.** `assignment_stale` returns `state_changed=false` plus the current assignment and a durable `fresh_assignment_fence` only when the exact current state is provable. Re-evaluate that returned assignment before using its fresh fence. `assignment_history_lost` and `assignment_too_large` are non-completable from the stale context.
 7. **Coordinator reads and validates the result from `C`.** Use exact todo/reply browsing, `session_discussion_summary`, or `session_handoff_summary`, then explicitly re-observe any authoritative Project/Git/Job/artifact state referenced by the answer before consequential follow-up.
 
@@ -68,7 +119,7 @@ A successful completion records:
 - a persisted fingerprint of the exact accepted assignment fence for replay correlation;
 - `author_session_id` only from an already-authorized explicit recording Session when the tool call is recorded under one.
 
-Without an explicit trusted recorder, `author_session_id` is `null`; callers cannot supply a trusted author identity themselves. Stateless MCP 2026 never derives a Workflow Session identity from transport/window continuity, so callers that want worker provenance pass explicit `recording_session_id` wrapper metadata. WebCodex does not infer Workflow Session provenance from `mcp-session-id`, HTTP connection state, credentials, project identity, a client window, or a recent Workflow Session.
+Without an explicit trusted recorder, `author_session_id` is `null`; callers cannot supply a trusted author identity themselves. Stateless MCP 2026 never derives a Workflow Session identity from transport/window continuity, so callers that want worker provenance pass explicit `_wc.record` metadata. WebCodex does not infer Workflow Session provenance from `mcp-session-id`, HTTP connection state, credentials, project identity, a client window, or a recent Workflow Session.
 
 When a collaboration call has both a recording Session and a target Session, WebCodex authorizes both independently and then requires their stored project scopes to match exactly. `project/project` is allowed only for the same project, `project/project` with different projects is denied, both `project/project-less` directions are denied, and `project-less/project-less` is allowed only after both owner authorities have independently matched. The generic cross-project escape flag never widens this collaboration relationship.
 
@@ -95,7 +146,7 @@ All supplied filters use deterministic AND semantics. `message_id` therefore giv
 
 The token is bounded, opaque, bound to the exact Workflow Session, and backed by a durable Session-local monotonic message-observation revision. It is observation state only: it is not authority, an idempotency key, execution identity, an implicit Workflow Session selector, or message-delivery receipt. The same recorder/target authorization fence used by the other collaboration tools applies before any observation result is returned. Token issuance fences the ledger generation containing its revision so a valid token remains usable after Server restart when that Workflow Session can be restored.
 
-Assignment and continuity identities are intentionally separate domains: `assignment_fence` is a semantic todo snapshot, `completion_key` is caller replay identity, `ack_session_message_ids` is request-scoped retained-message proof, an observation token is a generic Session message-state cursor, business `session_id` names the authorized target, `recording_session_id` is Session provenance only, and `wc_peer_*` names a principal-scoped communication endpoint. None substitutes for another or grants Project/Session authority by possession.
+Assignment and continuity identities are intentionally separate domains: `assignment_fence` is a semantic todo snapshot, `completion_key` is caller replay identity, Stateless MCP `_wc.ack` carries exact-ID request-scoped ACK evidence, `_wc.ack_ref` carries compact Session ACK evidence, an observation token is a generic Session message-state cursor, business `session_id` names the authorized target, `_wc.record` is Stateless MCP recorder provenance only, and `wc_peer_*` names a principal-scoped communication endpoint. None substitutes for another or grants Project/Session authority by possession.
 
 Observation tracks real message-state mutation, not deque length. Posts advance it; a resolve advances it only when status/resolution really changes; a new atomic completion advances for the todo resolution and answer creation; exact completion replay and no-op resolve do not advance it. If one retained message changes multiple times between observations, the observer may receive only its latest current state because this primitive is not an event/audit log.
 
@@ -111,7 +162,7 @@ The collaboration panel establishes an observation baseline before reading the r
 
 ## Provenance is metadata, not authority
 
-A completed answer can identify the independent worker with `author_session_id` only when the completion carries an already-authorized explicit `recording_session_id`; without that recorder, no author Session is inferred from caller auth, client window, or other ambient state. It is not a caller-authored claim. In stateless MCP 2026, `recording_session_id` is explicit wrapper provenance metadata, not a transport Session and not an authority grant; the legacy `mcp-session-id` header remains irrelevant.
+A completed answer can identify the independent worker with `author_session_id` only when the completion carries an already-authorized explicit recorder; without that recorder, no author Session is inferred from caller auth, client window, or other ambient state. It is not a caller-authored claim. In Stateless MCP 2026, that recorder is `_wc.record`: explicit invocation provenance metadata, not a transport Session and not an authority grant; the legacy `mcp-session-id` header remains irrelevant.
 
 The coordinator may then explicitly inspect `session_handoff_summary(worker_session_id)` if it has authority to that Session. WebCodex does not copy the worker's transcript, validation, diff review, Job logs, or workspace evidence into the coordinator Session merely because the answer references `W`.
 
@@ -149,9 +200,9 @@ When multiple workers operate on the same source, use normal Git/WebCodex Projec
 
 ## Human join and acknowledgement ergonomics
 
-The hosted Runtime Console may post `note`, `guidance`, `question`, and `todo` messages into an exact authorized Workflow Session through the same `post_session_message` kernel path. This is a browser affordance, not a Participant entity, membership record, presence signal, or identity-spoofing surface. The browser route keeps the current collaboration metadata authority policy (`runtime:read`) and still applies the stored Session/project authority fence.
+The hosted Runtime Console's primary human-join path now posts durable Operator messages to an exact authorized ClientWindow. An optional exact Workflow Session is context only and never changes the Window recipient. The legacy Session collaboration routes remain available for compatibility and still use the canonical Session message store. Neither browser affordance creates a Participant entity, membership record, presence signal, or identity-spoofing surface; each route keeps its normal visibility, collaboration-scope, and target-authority checks.
 
-Any Session message may opt into `requires_ack`, independently of kind and priority. A Stateless MCP 2026 caller can echo the visible `wc_msg_*` id in `ack_session_message_ids` on an otherwise ordinary tool call; the same bounded wrapper is also reused for ACK-required Peer messages addressed to the current window. The original tool executes normally whether the ACK is present, missing, unknown, foreign, or stale. A valid ACK suppresses that message body only for the same request/response. If a later request omits the ACK while a Session message remains open, or while a Peer ACK message remains retained, the Server may piggyback it again. The first observed ACK timestamp is observability only; it must never be described as delivered, read, accepted, or currently remembered. Session durable completion still requires normal message resolution.
+Any retained collaboration message may require ACK. A Stateless MCP 2026 caller may echo visible Session, Peer, or Operator `wc_msg_*` ids in `_wc.ack`. Session messages may alternatively reuse the compact `session_attention.ack_ref` by sending it back as `_wc.ack_ref`; that compact form remains Session-only. Each returned ref represents the exact Session ACK set explicitly retained across the current exchange: ACK evidence accepted on this request plus ACK-required messages newly projected in this response. As further bounded messages are projected, the next ref carries that retained set forward in one bounded value. The compact ref is Session-only: it is checked against the exact authorized attention Session and its full current open ACK-required membership, so a changed, stale, malformed, foreign-Session, or foreign-principal ref acknowledges nothing and cannot absorb later messages. The exact-ID `_wc.ack` form remains available and is still the ACK form for Window Peer and Operator messages. Operator ACKs persistently stop redelivery; the following request-scoped behavior applies to the legacy Session/Peer channels. The original tool executes normally whether ACK evidence is present, missing, unknown, foreign, or stale. A valid ACK suppresses the represented Session/Peer body only for that request/response. Later omission makes unresolved Session messages or retained Peer ACK messages eligible for bounded re-projection. The first observed ACK timestamp is observability only; it must never be described as delivered, read, accepted, or currently remembered. Session durable completion still requires normal message resolution.
 
 ## Bounded payload guidance
 

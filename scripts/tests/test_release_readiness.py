@@ -11,6 +11,7 @@ from scripts import release_readiness as readiness
 
 SOURCE = "a" * 40
 REQUEST = "rr_" + "b" * 24
+SOURCE_REF = "release/v0.4.3"
 
 
 def _state() -> dict:
@@ -18,6 +19,7 @@ def _state() -> dict:
         "schema_version": readiness.STATE_SCHEMA_VERSION,
         "kind": "release-readiness",
         "repo": collector.DEFAULT_REPO,
+        "source_ref": SOURCE_REF,
         "source_sha": SOURCE,
         "workflow_file": readiness.READINESS_WORKFLOW_FILE,
         "workflow_path": readiness.READINESS_WORKFLOW_PATH,
@@ -45,7 +47,7 @@ def _run(run_id: int = 123) -> dict:
         "id": run_id,
         "path": readiness.READINESS_WORKFLOW_PATH,
         "event": "workflow_dispatch",
-        "head_branch": "main",
+        "head_branch": SOURCE_REF,
         "head_sha": SOURCE,
         "display_title": readiness._run_name(REQUEST, SOURCE),
         "html_url": f"https://github.com/yyjeqhc/webcodex/actions/runs/{run_id}",
@@ -54,13 +56,20 @@ def _run(run_id: int = 123) -> dict:
     }
 
 
-def _ci_run(run_id: int = 777, *, attempt: int = 2, source: str = SOURCE, conclusion: str = "success") -> dict:
+def _ci_run(
+    run_id: int = 777,
+    *,
+    attempt: int = 2,
+    source: str = SOURCE,
+    source_ref: str = SOURCE_REF,
+    conclusion: str = "success",
+) -> dict:
     return {
         "id": run_id,
         "run_attempt": attempt,
         "path": readiness.CI_WORKFLOW_PATH,
         "event": "push",
-        "head_branch": "main",
+        "head_branch": source_ref,
         "head_sha": source,
         "html_url": f"https://github.com/yyjeqhc/webcodex/actions/runs/{run_id}",
         "status": "completed",
@@ -92,19 +101,31 @@ class ReadinessSelectionTests(unittest.TestCase):
         self.assertEqual(state["run_head_sha"], "c" * 40)
 
 
-class MainCiProofTests(unittest.TestCase):
-    def test_selects_exact_successful_main_push_ci(self) -> None:
-        selected = readiness.select_successful_main_ci_run({"workflow_runs": [_ci_run()]}, SOURCE)
+class SourceCiProofTests(unittest.TestCase):
+    def test_selects_exact_successful_source_push_ci(self) -> None:
+        selected = readiness.select_successful_source_ci_run(
+            {"workflow_runs": [_ci_run()]}, SOURCE, SOURCE_REF
+        )
         self.assertEqual(selected["id"], 777)
         self.assertEqual(selected["run_attempt"], 2)
 
-    def test_main_ci_proof_fails_closed_on_failure_wrong_source_or_duplicate(self) -> None:
+    def test_source_ci_proof_fails_closed_on_failure_wrong_source_ref_or_duplicate(self) -> None:
         with self.assertRaises(readiness.ReadinessError):
-            readiness.select_successful_main_ci_run({"workflow_runs": [_ci_run(conclusion="failure")]}, SOURCE)
+            readiness.select_successful_source_ci_run(
+                {"workflow_runs": [_ci_run(conclusion="failure")]}, SOURCE, SOURCE_REF
+            )
         with self.assertRaises(readiness.ReadinessError):
-            readiness.select_successful_main_ci_run({"workflow_runs": [_ci_run(source="c" * 40)]}, SOURCE)
+            readiness.select_successful_source_ci_run(
+                {"workflow_runs": [_ci_run(source="c" * 40)]}, SOURCE, SOURCE_REF
+            )
         with self.assertRaises(readiness.ReadinessError):
-            readiness.select_successful_main_ci_run({"workflow_runs": [_ci_run(1), _ci_run(2)]}, SOURCE)
+            readiness.select_successful_source_ci_run(
+                {"workflow_runs": [_ci_run(source_ref="main")]}, SOURCE, SOURCE_REF
+            )
+        with self.assertRaises(readiness.ReadinessError):
+            readiness.select_successful_source_ci_run(
+                {"workflow_runs": [_ci_run(1), _ci_run(2)]}, SOURCE, SOURCE_REF
+            )
 
 
 class SnapshotFenceTests(unittest.TestCase):
@@ -147,13 +168,30 @@ class ReadinessStateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             state = _state()
             state["schema_version"] = readiness.LEGACY_STATE_SCHEMA_VERSION
-            for field in ("ci_run_id", "ci_run_attempt", "ci_run_url", "ci_run_head_sha", "ci_run_conclusion"):
+            for field in (
+                "source_ref",
+                "ci_run_id",
+                "ci_run_attempt",
+                "ci_run_url",
+                "ci_run_head_sha",
+                "ci_run_conclusion",
+            ):
                 state.pop(field)
             path = Path(temp) / "legacy.json"
             readiness._write_state(path, state)
             loaded = readiness._load_state(path)
             self.assertEqual(loaded["schema_version"], readiness.LEGACY_STATE_SCHEMA_VERSION)
             self.assertNotIn("ci_run_id", loaded)
+
+    def test_ci_proof_v2_state_defaults_to_main_source_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            state = _state()
+            state["schema_version"] = readiness.CI_PROOF_STATE_SCHEMA_VERSION
+            state.pop("source_ref")
+            path = Path(temp) / "v2.json"
+            readiness._write_state(path, state)
+            loaded = readiness._load_state(path)
+            self.assertEqual(readiness._state_source_ref(loaded), "main")
 
 
 class _Response:
@@ -194,33 +232,37 @@ class DispatchClassificationTests(unittest.TestCase):
     def test_204_is_accepted(self) -> None:
         client = self._client()
         client.opener = _Opener(_Response())
-        readiness._post_dispatch(client, SOURCE, REQUEST, 777, 2)
+        readiness._post_dispatch(client, SOURCE_REF, SOURCE, REQUEST, 777, 2)
 
     def test_4xx_is_definite_rejection(self) -> None:
         client = self._client()
         error = urllib.error.HTTPError("https://api.github.test", 422, "bad", {}, None)
         client.opener = _Opener(error)
         with self.assertRaises(readiness.DispatchRejected):
-            readiness._post_dispatch(client, SOURCE, REQUEST, 777, 2)
+            readiness._post_dispatch(client, SOURCE_REF, SOURCE, REQUEST, 777, 2)
 
     def test_transport_failure_is_outcome_unknown(self) -> None:
         client = self._client()
         client.opener = _Opener(urllib.error.URLError("lost"))
         with self.assertRaises(readiness.DispatchOutcomeUnknown):
-            readiness._post_dispatch(client, SOURCE, REQUEST, 777, 2)
+            readiness._post_dispatch(client, SOURCE_REF, SOURCE, REQUEST, 777, 2)
 
 
 class WorkflowContractTests(unittest.TestCase):
-    def test_pre_tag_gate_combines_exact_main_ci_with_extended_native(self) -> None:
+    def test_pre_tag_gate_combines_exact_source_ci_with_extended_native(self) -> None:
         workflow = Path(".github/workflows/release-readiness.yml").read_text(encoding="utf-8")
         extended = Path(".github/workflows/extended-native.yml").read_text(encoding="utf-8")
         self.assertIn("  ci-proof:\n", workflow)
         self.assertIn("actions: read", workflow)
         self.assertIn("ci_run_id:", workflow)
         self.assertIn("ci_run_attempt:", workflow)
+        self.assertIn("source_ref:", workflow)
+        self.assertIn("      - 'release/**'", Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
         self.assertIn("/actions/runs/{run_id}/attempts/{attempt}", workflow)
         self.assertIn('"path": ".github/workflows/ci.yml"', workflow)
         self.assertIn('"event": "push"', workflow)
+        self.assertIn('"head_branch": source_ref', workflow)
+        self.assertIn('test "$GITHUB_REF" = "refs/heads/$INPUT_SOURCE_REF"', workflow)
         self.assertIn('"conclusion": "success"', workflow)
         self.assertIn("extended-native:\n    needs: ci-proof\n    uses: ./.github/workflows/extended-native.yml", workflow)
         self.assertIn("source_sha: ${{ inputs.source_sha }}", workflow)
@@ -249,6 +291,41 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("packages: write", workflow)
         self.assertNotIn("push: true", workflow)
 
+    def test_local_desktop_builders_match_native_ci_contracts(self) -> None:
+        macos = Path("scripts/build_desktop_macos_local.sh").read_text(encoding="utf-8")
+        windows = Path("scripts/build_desktop_windows_local.ps1").read_text(encoding="utf-8")
+        windows_stage = Path("scripts/prepare_desktop_bundle.ps1").read_text(encoding="utf-8")
+        windows_smoke = Path("scripts/desktop_install_windows_smoke.ps1").read_text(encoding="utf-8")
+        windows_npm_smoke = Path("scripts/npm_install_windows_smoke.ps1").read_text(encoding="utf-8")
+        windows_package = Path("scripts/package_release_artifact.ps1").read_text(encoding="utf-8")
+
+        for local in (macos, windows):
+            self.assertIn("npm ci --prefix frontend", local)
+            self.assertIn("npm ci --prefix apps/desktop", local)
+
+        self.assertIn('export CI="true"', macos)
+        self.assertIn('export APPLE_SIGNING_IDENTITY="-"', macos)
+        self.assertIn("--bundles dmg", macos)
+
+        self.assertIn("target\\desktop-local-tauri", windows)
+        self.assertIn("prepare_desktop_bundle.ps1", windows)
+        self.assertIn("--bundles nsis", windows)
+        self.assertIn("node node_modules/@tauri-apps/cli/tauri.js build", windows)
+        self.assertIn("--no-sign -- --locked", windows)
+        self.assertIn("if ($Smoke)", windows)
+        self.assertIn("desktop_install_windows_smoke.ps1", windows)
+        self.assertIn("target\\desktop-local-dist", windows)
+        self.assertIn("[switch]$AllowDirty", windows)
+        self.assertIn("-GitDirty $GitDirty", windows)
+        self.assertIn('"dirty-$ShortSource"', windows)
+        for helper in (windows_stage, windows_smoke):
+            self.assertIn("[bool]$GitDirty = $false", helper)
+            self.assertIn("dirty=$dirtyText", helper)
+        self.assertIn("function Remove-FileEventually", windows_smoke)
+        self.assertIn('Remove-FileEventually $uninstaller 30 "Desktop uninstaller remained locked after silent uninstall', windows_smoke)
+        for helper in (windows_stage, windows_smoke, windows_npm_smoke, windows_package):
+            self.assertIn("GetUnresolvedProviderPathFromPSPath", helper)
+
     def test_daily_ci_avoids_rare_native_runners_and_keeps_path_aware_gates(self) -> None:
         workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
         extended = Path(".github/workflows/extended-native.yml").read_text(encoding="utf-8")
@@ -274,7 +351,10 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("contains(github.event.pull_request.labels.*.name, 'run-ci')", linux_tooling)
         self.assertIn("needs.changes.outputs.needs_docker == 'true'", docker)
         self.assertIn("platforms: linux/amd64", docker)
-        self.assertIn("docker/build-push-action@v6", docker)
+        self.assertIn(
+            "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8",
+            docker,
+        )
         self.assertIn("test ! -e /usr/local/bin/webcodex-runner", docker)
 
         self.assertIn("needs: changes", contract)
@@ -282,12 +362,16 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("if: needs.changes.outputs.needs_desktop_frontend == 'true'", contract)
         self.assertIn("needs.changes.outputs.needs_plugin_sdk == 'true'", contract)
         self.assertIn("npm/plugin-sdk/package-lock.json", contract)
+        self.assertIn("plugins/agent-browser/package-lock.json", contract)
         for command in (
             "npm ci --prefix npm/plugin-sdk",
             "npm --prefix npm/plugin-sdk run typecheck",
             "npm --prefix npm/plugin-sdk run build",
             "npm --prefix npm/plugin-sdk test",
             "npm --prefix npm/plugin-sdk run pack:dry-run",
+            "npm ci --prefix plugins/agent-browser",
+            "npm --prefix plugins/agent-browser run typecheck",
+            "npm --prefix plugins/agent-browser test",
         ):
             self.assertIn(command, contract)
         self.assertIn("github.event.before", changes)

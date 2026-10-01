@@ -2,6 +2,7 @@ use super::kernel::ToolTransport;
 use super::orchestration_host::{
     CanonicalOrchestrationHost, OrchestrationPolicy, OrchestrationToolResponse,
 };
+use super::return_timing::ToolReturnTimingPolicy;
 use super::{ResolvedProject, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use serde_json::{json, Value};
@@ -73,6 +74,7 @@ pub(crate) const E2A_NESTED_TOOLS: &[&str] = &[
     "git_diff_hunks",
     "git_review_summary",
     "show_changes",
+    "project_validate",
     "cargo_check",
     "cargo_test",
 ];
@@ -87,7 +89,8 @@ pub(crate) const E2C_NESTED_TOOLS: &[&str] = &[
     "git_diff_hunks",
     "git_review_summary",
     "show_changes",
-    "apply_text_edits",
+    "edit_project_files",
+    "project_validate",
     "cargo_check",
     "cargo_test",
 ];
@@ -98,13 +101,15 @@ const RECURSIVE_CODE_MODE_TOOLS: &[&str] = &[
     "code_mode_exec_mutating",
 ];
 
+const CONSEQUENTIAL_CHILD_HANDOFF_MAX_SECS: u64 = 5;
+
 const CODE_MODE_E1_POLICY: OrchestrationPolicy = OrchestrationPolicy {
     frontend: "code_mode_v8",
     policy_name: "Code Mode E1",
     admitted_tools: READ_ONLY_NESTED_TOOLS,
     denied_tools: RECURSIVE_CODE_MODE_TOOLS,
     additional_forbidden_argument_fields: &[],
-    nested_sync_wait_max_secs: None,
+    child_return_timing: ToolReturnTimingPolicy::unconstrained(),
     max_mutation_calls: None,
     validation_after_mutation: false,
 };
@@ -115,7 +120,9 @@ const CODE_MODE_E2A_POLICY: OrchestrationPolicy = OrchestrationPolicy {
     admitted_tools: E2A_NESTED_TOOLS,
     denied_tools: RECURSIVE_CODE_MODE_TOOLS,
     additional_forbidden_argument_fields: &[],
-    nested_sync_wait_max_secs: Some(5),
+    child_return_timing: ToolReturnTimingPolicy::handoff_max_secs(
+        CONSEQUENTIAL_CHILD_HANDOFF_MAX_SECS,
+    ),
     max_mutation_calls: None,
     validation_after_mutation: false,
 };
@@ -126,7 +133,9 @@ const CODE_MODE_E2C_POLICY: OrchestrationPolicy = OrchestrationPolicy {
     admitted_tools: E2C_NESTED_TOOLS,
     denied_tools: RECURSIVE_CODE_MODE_TOOLS,
     additional_forbidden_argument_fields: &[],
-    nested_sync_wait_max_secs: Some(5),
+    child_return_timing: ToolReturnTimingPolicy::handoff_max_secs(
+        CONSEQUENTIAL_CHILD_HANDOFF_MAX_SECS,
+    ),
     max_mutation_calls: Some(1),
     validation_after_mutation: true,
 };
@@ -633,7 +642,7 @@ mod tests {
         );
         assert_eq!(
             &E2A_NESTED_TOOLS[READ_ONLY_NESTED_TOOLS.len()..],
-            ["cargo_check", "cargo_test"]
+            ["project_validate", "cargo_check", "cargo_test"]
         );
         assert_eq!(
             &E2C_NESTED_TOOLS[..READ_ONLY_NESTED_TOOLS.len()],
@@ -641,7 +650,12 @@ mod tests {
         );
         assert_eq!(
             &E2C_NESTED_TOOLS[READ_ONLY_NESTED_TOOLS.len()..],
-            ["apply_text_edits", "cargo_check", "cargo_test"]
+            [
+                "edit_project_files",
+                "project_validate",
+                "cargo_check",
+                "cargo_test"
+            ]
         );
         for stage in [
             CodeModeCallableStage::ReadOnly,
@@ -667,8 +681,10 @@ mod tests {
             "session_id",
             "recording_session_id",
             "ack_session_message_ids",
+            "ack_ref",
             "context_request",
             "session_message_resolution",
+            "_control",
             "expected_failure",
             "expected_failure_kind",
             "result_expectation",

@@ -23,6 +23,33 @@ For everyday development, follow the [Full Setup guide](PERSONAL_SETUP.md) and u
 
 ## Command map
 
+### Environment configuration
+
+For a new personal machine: `webcodex environment configure --create --runner --scope user`,
+then `webcodex environment configure-tunnel default` and `webcodex environment status`.
+Local user/Runner credentials are created internally; no pairing input is needed.
+Linux user services depend on linger for post-logout persistence; macOS LaunchAgents
+and Windows interactive tasks require a signed-in owner. Scope changes do not adopt
+existing services. [Lifecycle and compatibility details](implementation/personal-environment-lifecycle.md).
+
+`webcodex environment` and Desktop call the same setup core. This namespace configures the machine's persistent environment; the existing project-level `webcodex setup` command keeps its original meaning. Installer availability and native acceptance are tracked in [Unified installation](unified-installation.md) and [Deployment validation](unified-deployment-validation.md).
+
+| Command | Purpose |
+| --- | --- |
+| `webcodex environment configure [--scope user\|system]` | Choose create/join and local Runner/viewer. New environments default to the owner's user service; existing environments keep their saved manager. System scope explicitly requests machine-service authorization. |
+| `configure --create --project PATH` / `configure --create --no-project` | Create or resume local Server + Runner / Server-only setup. |
+| `configure --join URL --project PATH --code-stdin` | Join with a project; read one Runner pairing code from stdin, then save credentials, register the project, install services, and verify readiness. |
+| `configure --join URL --no-project --token-file PATH` | Join as a viewer with a protected user API credential; creates no local Runner identity or service. Omit the file option for hidden terminal input. |
+| `resume` | Reconcile saved progress and complete missing steps without silently rebinding the environment. |
+| `invite` | Create a short-lived Runner invitation on the environment's local Server; the displayed code is sensitive. |
+| `add-project PATH` | Reuse the existing Runner identity; a viewer must complete Runner enrollment first. |
+| `status --json` / `doctor --json` | Inspect saved configuration, Server reachability, Runner/project readiness, and structured diagnostics. |
+| `start COMPONENT` / `stop COMPONENT` / `restart COMPONENT` | Explicitly manage an environment-owned `server`, `runner`, or `tunnel`. |
+| `repair-user-credential [--token-file PATH]` | Verify and replace the saved user credential without pairing or changing service state. |
+| `repair-credential runner` | Repair Windows SCM account credentials through hidden input. |
+
+Use `webcodex environment --help` for the complete namespace, including Tunnel profiles, explicit legacy migrations, and installer upgrade/recovery commands. Public environment commands support `--json` and `--environment-dir PATH`. Do not put tokens, pairing codes, or service passwords in command arguments. When pairing redemption is uncertain, read the recovery diagnostic before explicitly supplying a replacement through `resume --new-pairing-code --code-stdin`; do not replay the old code automatically.
+
 ### Project / local workflow
 
 These commands work on the current Git project.
@@ -122,6 +149,46 @@ keep their detached-process behavior when `--scope` is omitted.
 | `webcodex server status` | Check authoritative socket/service state, HTTP reachability, and build revisions |
 | `webcodex server logs` | Read the Server service journal |
 | `webcodex server uninstall` | Stop, disable, and remove the managed socket/service pair |
+
+## Controller (WSL/Linux V0)
+
+webcodex controller is the terminal control plane for WSL/Linux. V0 does not modify Desktop and does not change the lower-level Server, Runner, or OpenAI Tunnel process contracts. The Server may be locally managed or remotely observed; the Runner remains local and Controller-managed; the OpenAI Tunnel is available only for a local Server.
+
+    webcodex controller init
+    webcodex controller doctor
+    webcodex controller install
+
+The default configuration is ~/.config/webcodex/controller.toml. A running Controller exposes a local Unix Socket at $XDG_RUNTIME_DIR/webcodex/controller.sock, falling back to a per-user /tmp runtime directory when XDG_RUNTIME_DIR is unavailable.
+
+Common operations:
+
+    webcodex controller start
+    webcodex controller status
+    webcodex controller restart
+    webcodex controller restart server
+    webcodex controller restart runner
+    webcodex controller restart tunnel
+    webcodex controller logs --lines 100
+    webcodex controller stop
+    webcodex controller uninstall --confirm
+
+Project management:
+
+    webcodex controller project list
+    webcodex controller project register /path/to/project
+    webcodex controller project remove <project-id-or-path>
+
+The [server] section supports mode = "local" and mode = "remote". Local mode requires env_file and the Controller starts/supervises webcodex-server. Remote mode requires url; the Controller only probes that Server, does not start a local Server, and rejects a local regular Tunnel. In both modes the Runner uses the local runner.toml, whose server_url must match the Controller Server target. The Controller refuses duplicate ownership of existing local webcodex.service, webcodex.socket, or webcodex-runner.service instances.
+
+`controller install` installs a user service at `~/.config/systemd/user/webcodex-controller.service` by default and manages it through `systemctl --user`. `status` prefers the live Controller Unix Socket and also reports service state; if the socket is unavailable it still reports the installed service. `logs` prefers the Controller's bounded in-memory component logs and falls back to the user journal. `stop` automatically handles a foreground Controller or installed service. A component-less `restart` prefers an installed service and otherwise restarts the foreground runtime; `restart server|runner|tunnel` always uses Controller IPC. `uninstall --confirm` removes only the Controller unit and preserves controller.toml and controller.env.
+
+All `controller project` commands require `runner.enabled=true` and the configured Runner to be online and visible through the Server. The Controller daemon itself need not be running. Offline, inaccessible, or unsupported targets fail explicitly; there is no local registry fallback or automatic Runner start.
+
+Each command accepts `--user-token-file PATH`. When omitted, the CLI selects the matching Server/Runner connection's `webcodex-user-token`, preferring the connection containing the configured Runner file. A missing or ambiguous default requires an explicit file. An explicit file never falls back to another credential; Runner transport and Tunnel credentials are not substitutes.
+
+When a Runner has more than 100 projects, remove by the full project ID returned by the Server (for example `agent:runner-a:demo`); this uses an exact Server-side inventory filter. Short IDs and paths require an untruncated inventory to reject ambiguous targets safely.
+
+`project list` calls `list_projects` for the configured Runner and reports inventory synchronization and truncation (up to 100 results). `project register PATH` uses the existing online resolve-or-register API within the Runner's current allowed roots; it does not extend `[policy].allowed_roots`. `project remove ID-OR-PATH` resolves a unique project in a complete inventory and calls `unregister_project` with its revision. It unregisters the project without deleting workspace files, shrinking allowed roots, or stopping the Runner. Changes take effect online without a Runner restart. Revision conflicts fail; lost mutation responses are reported as uncertain and are never automatically retried or repaired by deleting local files. With `--json`, successful API output is written to stdout and command failures are JSON on stderr with a nonzero exit status.
 
 On Windows, `server init`, foreground `server run`, and explicit `share` are supported. The managed service lifecycle (`install`, `start`, `stop`, `restart`, `logs`, `uninstall`) remains Linux-only.
 

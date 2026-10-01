@@ -3,9 +3,10 @@ use crate::json_error;
 use crate::tool_request_trace::{
     estimate_json_bytes, new_trace_id, scope_active_trace, ToolRequestLifecycle,
 };
+#[cfg(feature = "legacy-gpt-actions")]
+use crate::tool_runtime::kernel::HostFileImportTrust;
 use crate::tool_runtime::kernel::{
-    HostFileImportTrust, ToolCallContext, ToolCallErrorStatus,
-    ToolCallRequest as KernelToolCallRequest, ToolTransport,
+    ToolCallContext, ToolCallErrorStatus, ToolCallRequest as KernelToolCallRequest, ToolTransport,
 };
 use crate::tool_runtime::model_ergonomics_telemetry::ModelErgonomicsCompletion;
 use crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD;
@@ -144,6 +145,7 @@ fn prepare_action_tools_call_response(
     project: Option<String>,
     result: crate::tool_runtime::ToolResult,
     model_ergonomics: Option<&ModelErgonomicsCompletion>,
+    canonical_audit_output: Option<Value>,
     correlation: &crate::tool_runtime::ToolCallCorrelation,
 ) -> (StatusCode, crate::tool_runtime::ToolResult) {
     let status = if result.success {
@@ -151,7 +153,8 @@ fn prepare_action_tools_call_response(
     } else {
         StatusCode::BAD_REQUEST
     };
-    let audit_output = action_audit_output_for_tool(tool, &result.output);
+    let audit_output = canonical_audit_output
+        .unwrap_or_else(|| action_audit_output_for_tool(tool, &result.output));
     let response = result;
     let mut summary = json!({"output": audit_output});
     if let Some(telemetry) = model_ergonomics
@@ -266,6 +269,9 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
             return;
         }
     };
+    if let Some(tool) = body.get("tool").and_then(Value::as_str) {
+        guard.capture_request_diagnostic(tool, body.get("params").unwrap_or(&body));
+    }
     let (tool, params) = match extract_tool_call(&body) {
         Ok(pair) => pair,
         Err(msg) => {
@@ -407,6 +413,7 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
                 outcome.project,
                 result,
                 model_ergonomics.as_ref(),
+                outcome.canonical_audit_output,
                 &outcome.correlation,
             );
             let response_value = guard
@@ -553,6 +560,7 @@ fn extract_recording_session_id(body: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 fn parse_gpt_action_gateway(body: Value) -> Result<(String, Value), String> {
     let mut object = body
         .as_object()
@@ -573,6 +581,7 @@ fn parse_gpt_action_gateway(body: Value) -> Result<(String, Value), String> {
     Ok((tool, arguments))
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 fn rewrite_gpt_action_file_params(arguments: &mut Value) -> Result<(), String> {
     let object = arguments
         .as_object_mut()
@@ -615,6 +624,7 @@ fn rewrite_gpt_action_file_params(arguments: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> {
     use crate::model_surface::AdaptiveRuntimeGatewayTargetRoute;
 
@@ -653,6 +663,7 @@ fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> 
     }
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 fn gpt_action_suggested_tool_call_route(
     target: &str,
 ) -> crate::model_surface::SuggestedToolCallRoute {
@@ -671,6 +682,7 @@ fn gpt_action_suggested_tool_call_route(
     }
 }
 
+#[cfg(feature = "legacy-gpt-actions")]
 #[handler]
 pub async fn gpt_action_invoke(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(path_tool) = req.param::<String>("tool_name") else {
@@ -797,6 +809,7 @@ pub async fn gpt_action_invoke(req: &mut Request, depot: &mut Depot, res: &mut R
                 outcome.project,
                 result,
                 outcome.model_ergonomics.as_ref(),
+                outcome.canonical_audit_output,
                 &outcome.correlation,
             );
             // ActionAudit above records canonical ToolRuntime truth. Only the
@@ -841,9 +854,32 @@ pub async fn runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Resp
     render_result(res, &audit, "runtime_status", None, result);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-gpt-actions"))]
 mod job_action_routing_tests {
     use super::*;
+
+    #[test]
+    fn frozen_endpoint_name_keeps_legacy_admission_and_canonical_audit_parity() {
+        use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
+        let gateway = crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME;
+        assert!(gpt_action_admit_target(gateway, "attach_agent_endpoint").is_ok());
+        assert!(gpt_action_admit_target(gateway, "rotate_agent_continuation_endpoint").is_err());
+        let args = serde_json::json!({
+            "agent_id":"wc_dagent_qqqqqqqqqqqqqqqq", "host":"ChatGPT",
+            "client_attachment_id":"exact-window", "idempotency_key":"legacy-endpoint"
+        });
+        let legacy = ToolCall::from_tool_name("attach_agent_endpoint", args.clone()).unwrap();
+        let canonical =
+            ToolCall::from_tool_name("rotate_agent_continuation_endpoint", args).unwrap();
+        assert_eq!(
+            legacy.session_log_arguments(),
+            canonical.session_log_arguments()
+        );
+        assert_eq!(
+            gpt_action_suggested_tool_call_route("attach_agent_endpoint"),
+            crate::model_surface::SuggestedToolCallRoute::Gateway(gateway)
+        );
+    }
 
     #[test]
     fn stop_job_actions_admission_and_followup_use_definition_owned_gateway_policy() {

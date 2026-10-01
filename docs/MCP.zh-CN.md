@@ -10,6 +10,18 @@ WebCodex 通过 MCP endpoint，让 ChatGPT、Claude 与其他 MCP client 使用�
 
 如果只是临时试用一个仓库，再使用下面的 `share` 路径。
 
+## ChatGPT Host 侧的 Developer MCP 错误
+
+如果 ChatGPT 返回：
+
+```text
+FORBIDDEN: This conversation does not support developer MCPs
+```
+
+该拒绝来自 ChatGPT Host 或会话级 Developer MCP 准入与路由层。它本身并不表示 WebCodex 永久关闭了开发者访问权限，也不能证明 Runner 已离线或项目注册已失效。
+
+请独立检查 Runner 与项目状态。如果两者仍然可用，而且请求没有到达 WebCodex，请在 ChatGPT 允许 Developer MCP 的会话中重试。不要仅因出现这个 Host 侧错误就修改 WebCodex 配置。
+
 ## ChatGPT：临时 `share`
 
 显式 `share` 支持 Linux、macOS 与 Windows，并由当前前台进程持有临时单项目环境。Windows x64 可直接使用 managed 默认 Cloudflare Quick Tunnel；固定版本 Cloudflare 没有官方 Windows ARM64 artifact，因此 ARM64 需要受信任的显式/`PATH` `cloudflared`。managed OpenAI `tunnel-client` 支持 Windows x64/arm64。
@@ -37,6 +49,48 @@ UI 文案可能随 rollout 变化；URL 与认证以 CLI 输出为准。Develope
 和 write/modify action 是否可用，还分别受 ChatGPT 套餐、workspace 与管理员设置控制；
 WebCodex scope 不会扩大这些客户端侧权限。
 
+如果 ChatGPT 自身返回 `FORBIDDEN: This conversation does not support developer MCPs`
+（或提示当前会话已禁用 developer MCP server），在有相反证据之前应先按 Host/conversation
+admission 问题处理。如果 Host 根本没有 dispatch `runtime_status`，这段文本并不是
+WebCodex tool result。修改 credential 或 Runner 配置前，先从独立路径确认 Server/Runner；
+完整流程见[故障排查](TROUBLESHOOTING.zh-CN.md)。
+
+## 同一 Server 的客户端策略
+
+普通 MCP 与 Host 原生编排共用工具。客户端可在连接设置中为每个请求附加以下
+HTTP header，也可由专用反向代理路由注入；不需要新增模型工具参数：
+
+```http
+X-WebCodex-MCP-Profile: direct
+X-WebCodex-MCP-Budget-Secs: 20
+```
+
+Profile 只接受 `direct` / `host_code_mode`；省略时使用服务端
+`WEBCODEX_MCP_HOST_PROFILE`，其默认是 `direct`。不会按客户端品牌、Window、
+Session 或历史调用猜测，也不证明模型实际使用了程序编排。必须每次请求携带，
+不是在 initialize / work_on_project 设置一次。如果服务端默认 host_code_mode，
+普通客户端需显式发送 direct；无法设置 header 时可使用注入 header 的代理路由。
+
+可选的正整数 Budget 只能缩短服务端已解析的 Host budget，不能放大服务端上限。
+继续保留 5 秒返回余量与极小预算下已有的 1 秒等待下限。例如服务端 budget=55，
+Direct 默认执行 handoff=10 秒、同步/观察上限=50 秒；Host Code Mode 保留
+5 秒 handoff/观察切片。readiness 最多等待 45 秒，同时受 budget 减去返回余量约束，
+不会被通用 5 秒 handoff 切片误缩短。空值、重复或畸形 header 在 dispatch 前拒绝，
+不回显其原文；超大的合法整数 budget 会被截到服务端上限。
+
+该预算只约束执行交接与 Job 观察/readiness 等待，不是所有 RPC 的统一 timeout。
+命令 `timeout_secs`、Job 身份、权限、执行生命周期及内部编排上限不变。
+`work_on_project.guidance_profile` 仍只覆盖当次指导文本；后续 context refresh
+按其自身请求策略处理。API transport、tools/list、App admission、错误语义及
+`WEBCODEX_MCP_TEXT_JSON_COMPAT` 均不改变。runtime_status 中的 mcp_host 继续
+表示部署默认值，而非所有客户端当前请求的策略。
+
+默认在当前 turn 完成工作：先做独立工作，依赖 Job 时进行一次有界
+wait_for_job_readiness，必要时 observe_jobs 获取结果。deadline 后重新判断工作与
+依赖，不机械续等、不重新派发执行、不假设自动开启下一 turn；无法完成时保留
+pending Job 的精确身份。wait_for_job_terminal 仅用于显式建立的可选 continuation
+workflow，不是阻塞等待，也不是普通 MCP 的前置要求。
+
 ## Claude 与其他 MCP client
 
 使用同一份输出的 `/mcp` URL 与认证值。Claude 中添加 custom connector 并粘贴 MCP URL；
@@ -54,10 +108,14 @@ share 的 Project Credential，并不是 PAT/OAuth/shared-key 的通用 query au
 Connection: Tunnel + No authentication；临时 WebCodex Bearer 留在本机，由固定且经过校验的
 OpenAI `tunnel-client` 注入。
 
-对于通过 OpenAI Secure Tunnel 访问的长期 **loopback-only** Server，operator 可以显式设置
-`WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true`，从而信任由本机 user API token
-认证的 ChatGPT host-file rewrite。该例外仅在 `WEBCODEX_ADDR` 解析为 loopback 且当前 credential
-是普通 user API token 时生效。默认关闭；network-accessible Server 不应使用它替代 OAuth。
+对于通过 OpenAI Secure Tunnel 访问的长期 **loopback-only** Server，可以设置
+`WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true`，从而信任由明确允许的本地 tunnel
+credential 认证的 ChatGPT host-file rewrite。WebCodex Desktop 自 v0.4.2 起会为它自己管理的
+本机 loopback Server 默认写入该值；已有显式配置不会被覆盖。该例外仅在 `WEBCODEX_ADDR`
+解析为 loopback，且当前 credential 是普通 user API token，或 Desktop regular Tunnel 使用的
+已配置 Server bootstrap credential 时生效。regular Tunnel 从本机 `WEBCODEX_TOKEN` 配置派生
+该 credential，并只把它注入私有 tunnel-client authorization；用户不应复制或暴露该
+credential。独立/network-accessible Server 仍默认关闭，不应使用它替代 OAuth。
 
 如果在 Windows 上使用普通独立 Server + Runner 并通过 OpenAI Tunnel 接入，或排查“本地 `/readyz` 正常但 ChatGPT Connector 创建失败”的情况，见 [Windows + OpenAI Secure MCP Tunnel 深入实操](WINDOWS_OPENAI_TUNNEL.zh-CN.md)。它是深入配置/排障文档，不是普通用户第一次必须阅读的教程。
 
@@ -83,7 +141,7 @@ OAuth 仍是独立的高级身份路径。
 
 ### Adaptive Runtime routing
 
-WebCodex 只有一个 model-facing MCP runtime contract：**Adaptive Runtime**。Canonical `ToolDefinition` rank 决定 direct tools；普通 model-visible long-tail tools 通过 `call_runtime_tool` 调用；server-owned protocol capability 与 MCP App admission 可以为对应请求加入 hidden extension。启动时不再选择 model surface。direct/gateway 只改变 presentation，不会绕过目标工具的 authentication、Project authority、permission、Runner capability、Session 或 safety checks。
+WebCodex 只有一个 model-facing MCP runtime contract：**Adaptive Runtime**。Canonical `ToolDefinition` rank 决定 direct tools；普通 model-visible long-tail tools 通过 `call_runtime_tool` 调用；server-owned protocol capability 与 MCP App admission 可以为对应请求加入 hidden extension。启动时不再选择 model surface。`tool_manifest(tool_name=...)` 只负责 discovery，不会动态向 Host 注册一个新 tool。exact manifest 的 `route.primary` 给出首选 callable；普通 direct tool 还会给出经 `call_runtime_tool` 的 `route.fallback`，用于 Host 当前没有该 direct callable 的情况；显式 MCP App presentation tool 会标明 Apps enabled 时该 fallback 被禁止。direct/gateway 只改变 presentation，不会绕过目标工具的 authentication、Project authority、permission、Runner capability、Session 或 safety checks。
 
 ### Tool result framing
 
@@ -200,13 +258,22 @@ Grok Custom MCP UI 与可用范围以 xAI 的
 ```text
 work_on_project
 → read_files / search_project_texts / 按需语义导航
-→ apply_text_edits 或其它 canonical edit 工具
+→ edit_project_files 或其它 canonical edit 工具
+→ substantial work 进入真实状态后调用一次 present_work_result
 → 按需 run_process / run_shell / focused validation
 → show_changes
 → finish_coding_task
 ```
 
-`work_on_project` 在普通 registered Project 上启动或精确恢复 Workflow Session。用户要求隔离时，`work_on_project(mode=worktree)` 才让 Runner 创建 canonical managed worktree，并把该 worktree 注册为另一个普通 Project；没有隔离要求时，本地 `share` / `run` 直接使用 setup 已注册的那一个 Project。
+`work_on_project` 在普通 registered Project 上启动或精确恢复 Workflow Session。用户要求隔离且已经有 registered Project 时，使用 `work_on_project(project=..., mode=worktree)`：Server 先重新授权 source Project，Runner 再派生内部 managed placement，并把生成的 worktree 注册为另一个普通 Project。模型不需要重新推导 Runner path，也不能选择 managed destination。`client_id + path + mode=worktree` 只保留为 compatibility/bootstrap 入口，并继续接受普通 path authority 检查；没有隔离要求时，本地 `share` / `run` 直接使用 setup 已注册的 Project。
+
+`present_work_result` 是 substantial coding 的一次性可视化层，不是 correctness primitive。挂载后，卡片通过 App-only state read 持续显示 Progress、Workspace、Validation 与 Review，无需模型轮询。`finish_coding_task` 在 non-blocking closeout 时把 eligible final changes seal 到 presentation cache，同一张卡随后发现这份 immutable snapshot，并按文件 lazy 展开 diff。tiny/read-only 工作应跳过这张卡，同一 Session 不应重复 presentation。
+
+普通的 portable read-only validation 优先使用 `project_validate`。它只接受封闭的 `format_check` / `check` / `test` intent，以及可选的 `auto` / `rust` / `go` adapter hint；Runner 在自己注册的真实文件系统上解析最近且无歧义的 recipe，然后进入现有 structured validation Job。Rust 分别映射到 `cargo fmt -- --check`、`cargo check --all-targets`、`cargo test`；Go 映射到 `go vet ./...` 或 `go test -json ./...`。可选的有界 `scope.packages`（1..8 项）会把 Rust check/test 映射为重复 Cargo `-p` selector，把 Go check/test 映射为 project-relative package pattern；带 package scope 的格式检查会 fail closed。当前检测到 Node/Python 时会返回有界的 unsupported 结果。请求不会携带 arbitrary executable、argv、shell grammar、安装动作或 source mutation；需要 ecosystem-specific 高级参数时继续使用现有 `cargo_*` / `go_test`。`project_validate` 依赖 additive `project_validation_v1` Runner capability；只有 scoped request 额外要求 `project_validation_package_scope_v1`，因此 mixed-version 部署会在 expanded request 发给旧 Runner 前 fail closed。
+
+普通的 portable Rust/Go 构建优先使用 `project_build`。它只接受精确 registered `project`、可选的 project-relative `cwd`、可选的 `auto` / `rust` / `go` adapter hint、有界 `scope.packages`（1..8 项）以及总 `timeout_secs`。Runner 解析最近且无歧义的 recipe 并拥有 canonical argv：Rust 映射为 `cargo build`，有 scope 时使用重复 `-p` selector；Go 映射为 `go build ./...` 或调用方给出的有界 project-relative package pattern。请求不能携带 executable、argv、shell、script、release/profile/target/features、workspace/exclude、依赖／网络策略或 artifact discovery contract；v1 检测到 Node/Python recipe 时 fail closed。
+
+`project_build` 在 planning 与 typed Job admission 两处都要求 additive `project_build_v1` Runner capability。Job 准入会重新规划 registered project/root、recipe、manifest/lock provenance、package scope 与 canonical invocation；若经过本地排队，worker 会在原生进程执行前再次核验同一个计划。计划 stale 时以 `not_started` 拒绝并释放 Job 槽位，不会静默重建或执行过期意图。长构建继续使用同一个 durable Job，并返回普通的 sparse pending continuation；pending 绝不授权 retry/redispatch。这个 closed gateway 限制的是 WebCodex 自己的命令权限，并不是 OS sandbox：Cargo/Go 构建逻辑以及项目 build script 仍可能产生自己的文件系统或网络副作用。超出 v1 contract 的构建继续显式使用 lower-level execution 工具。
 
 Adaptive Runtime 可以把常用工具直接暴露，把 long-tail 工具通过 `call_runtime_tool` 暴露。direct/gateway 只影响 model exposure，不改变 schema validation、OAuth scope、Project authority、permission policy、Runner capability、Session fence 或 tool effects。
 
@@ -215,6 +282,14 @@ Adaptive Runtime 可以把常用工具直接暴露，把 long-tail 工具通过 
 ### 长任务使用 Job lifecycle
 
 长时间 command 与 validation 使用 canonical WebCodex Job。发起调用返回 exact Job 后，用 `observe_jobs` 观察同一个 Job；只有 Job identity 确实丢失时才用 `list_jobs` 恢复，不要重复启动。Jobs 不再包装成 MCP Tasks，WebCodex 也不再 advertise 原 Connector-specific MCP Tasks extension。
+
+ChatGPT/model turn 与一次 MCP observation request 都不拥有 Job 的生命周期。因此 Host 侧
+出现 `Thinking stopped` / `Thinking failed`、request timeout 或 observation 中断，
+本身不能证明 Job 已经停止。优先在原会话继续并重新观察已有 Job；identity 丢失时先恢复
+Job inventory，再考虑 retry。不要仅仅因为 model turn 结束就重复 dispatch。符合条件的
+terminal wait 可以提供 best-effort Host continuation，但 Host 接受 continuation 并不保证
+新的 model turn 已经实际运行。详见
+[Troubleshooting](TROUBLESHOOTING.zh-CN.md#长任务期间-chatgpt-显示-thinking-stopped--thinking-failed)。
 
 ## 第一个安全 prompt
 
@@ -259,6 +334,28 @@ stderr、provider stderr 或任意 provider prose。
 ## Adaptive Runtime extensions
 
 同一个 ToolRuntime 通过一套 Adaptive Runtime contract 服务单项目、project-scoped 的本地 `share` / `run` 和多项目 hosted Server。project-scoped credential 改变可见性与 authority，不改变 model-facing runtime shape。特定 protocol capability 与 MCP App 可以 admission 额外的 hidden presentation/resource operation，但不会形成第二套 runtime surface。
+
+### 项目级验证
+
+`project_validate` 通过 Runner 上的现有适配器执行 Rust 的格式检查／检查／测试，
+以及 Go 的检查／测试。`scope.packages` 表示有界包范围。
+`action="test"` 可使用 `test.filter`：Rust 为一个 libtest 子串，Go 为原生 `-run`
+正则表达式（包含子测试的斜杠语义），并非跨语言统一查询语法。Go 保留空格；
+空字符串或省略表示不加过滤。
+
+```json
+{"project":"agent:runner:repo","action":"test","test":{"filter":"selected_test","require_tests":true,"min_tests":3}}
+```
+
+`require_tests` 默认为 true，要求至少一个已证明执行的测试；false 且未设
+`min_tests` 时允许已证明的零测试结果。`min_tests` 为 1..1,000,000 的证据后置条件，
+即使 require_tests=false 仍需满足；计数未知不表示零。check／format_check 不接受
+该 test 块。任意显式 test 块均需 `project_validation_test_options_v1` 能力，
+规划与 Job 准入各检查一次；省略时保持原有行为。完整参数不会变成任意 argv／shell。
+长任务仍观察同一个 Job，不能因 Host 中断而重跑。
+
+构建产物、修改源码的格式化、lint、Node/Python 生产适配器，以及更广泛的
+workspace／依赖策略仍是 #599 后续工作；现有 cargo_*、go_test 与显式进程工具保留。
 
 ### ChatGPT 文件桥接
 

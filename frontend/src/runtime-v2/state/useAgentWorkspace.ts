@@ -14,6 +14,7 @@ import {
   updateAgent,
 } from "../api/agents.js";
 import type { RuntimeV2Client } from "../api/client.js";
+import { useVisibleRefresh } from "./useVisibleRefresh.js";
 import {
   idempotencyKeyFor,
   operationKey,
@@ -39,6 +40,7 @@ export type AgentWorkspaceState = {
   selectedAgent: DurableAgent | null;
   selectedConversation: DurableConversation | null;
   conversationDetail: ConversationDetail | null;
+  conversationLoading: boolean;
   endpoint: AgentEndpoint | null;
   inbox: InboxDelivery[];
   busy: boolean;
@@ -66,6 +68,7 @@ export function useAgentWorkspace(
   const [conversations, setConversations] = useState<DurableConversation[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [selectedConversationId, setSelectedConversationId] = useState("");
+  const [conversationLoading, setConversationLoading] = useState(false);
   const [conversationDetail, setConversationDetail] = useState<ConversationDetail | null>(null);
   const [endpoints, setEndpoints] = useState<Map<string, AgentEndpoint>>(new Map());
   const [inbox, setInbox] = useState<InboxDelivery[]>([]);
@@ -73,6 +76,7 @@ export function useAgentWorkspace(
   const [status, setStatus] = useState("");
   const [revision, setRevision] = useState(0);
   const request = useRef<AbortController | null>(null);
+  const refreshQueued = useRef(false);
   const pendingAgentCreate = useRef<PendingKey>(null);
   const pendingConversationCreate = useRef<PendingKey>(null);
   const pendingMessage = useRef<PendingKey>(null);
@@ -89,11 +93,19 @@ export function useAgentWorkspace(
   );
   const endpoint = selectedAgentId ? endpoints.get(selectedAgentId) || null : null;
 
-  const refresh = useCallback(() => setRevision((value) => value + 1), []);
+  const refresh = useCallback(() => {
+    if (request.current) {
+      refreshQueued.current = true;
+      return;
+    }
+    setRevision((value) => value + 1);
+  }, []);
 
   useEffect(() => {
     if (!enabled) {
       request.current?.abort();
+      request.current = null;
+      refreshQueued.current = false;
       return;
     }
     const controller = new AbortController();
@@ -104,7 +116,7 @@ export function useAgentWorkspace(
     void Promise.all([
       fetchAgents(client, controller.signal),
       fetchConversations(client, controller.signal),
-    ]).then(async ([agentResponse, conversationResponse]) => {
+    ]).then(([agentResponse, conversationResponse]) => {
       if (disposed || request.current !== controller) return;
       if (agentResponse?.status === 401 || conversationResponse?.status === 401) {
         onUnauthorized();
@@ -132,29 +144,25 @@ export function useAgentWorkspace(
       setSelectedAgentId((current) => nextAgents.some((agent) => agent.agent_id === current)
         ? current
         : nextAgents[0]?.agent_id || "");
-      setSelectedConversationId((current) => nextConversations.some((conversation) => conversation.conversation_id === current)
-        ? current
-        : nextConversations[0]?.conversation_id || "");
+      setSelectedConversationId((current) => current || nextConversations[0]?.conversation_id || "");
       setStatus("");
-
-      const conversationId = selectedConversationId && nextConversations.some((row) => row.conversation_id === selectedConversationId)
-        ? selectedConversationId
-        : nextConversations[0]?.conversation_id || "";
-      if (conversationId) {
-        const summary = nextConversations.find((row) => row.conversation_id === conversationId);
-        const afterSeq = Math.max(0, Number(summary?.last_seq || 0) - 100);
-        const detailResponse = await fetchConversation(client, conversationId, afterSeq, controller.signal);
-        if (!disposed && detailResponse?.ok && detailResponse.data) setConversationDetail(detailResponse.data);
-      } else {
-        setConversationDetail(null);
+    }).finally(() => {
+      if (request.current !== controller) return;
+      request.current = null;
+      if (!disposed && refreshQueued.current) {
+        refreshQueued.current = false;
+        setRevision((value) => value + 1);
       }
     });
 
     return () => {
       disposed = true;
       controller.abort();
+      if (request.current === controller) request.current = null;
     };
   }, [client, enabled, onUnauthorized, revision]);
+
+  useEffect(() => { setConversationDetail(null); }, [selectedConversationId]);
 
   useEffect(() => {
     if (!enabled || !selectedConversationId) {
@@ -162,9 +170,12 @@ export function useAgentWorkspace(
       return;
     }
     const controller = new AbortController();
+    setConversationLoading(true);
     const afterSeq = Math.max(0, Number(selectedConversation?.last_seq || 0) - 100);
     void fetchConversation(client, selectedConversationId, afterSeq, controller.signal).then((response) => {
-      if (controller.signal.aborted || !response) return;
+      if (controller.signal.aborted) return;
+      setConversationLoading(false);
+      if (!response) return;
       if (response.status === 401) {
         onUnauthorized();
         return;
@@ -174,15 +185,14 @@ export function useAgentWorkspace(
         return;
       }
       if (response.status === 404) {
-        setSelectedConversationId("");
         setConversationDetail(null);
-        refresh();
         return;
       }
       if (response.ok && response.data) setConversationDetail(response.data);
+      else setStatus("Conversation refresh failed; previous messages retained.");
     });
     return () => controller.abort();
-  }, [client, enabled, onUnauthorized, refresh, selectedConversation?.last_seq, selectedConversationId]);
+  }, [client, enabled, onUnauthorized, refresh, selectedConversation?.last_seq, selectedConversationId, revision]);
 
   useEffect(() => {
     if (!enabled || !selectedAgentId || !endpoint) {
@@ -216,40 +226,59 @@ export function useAgentWorkspace(
     return () => controller.abort();
   }, [client, enabled, endpoint?.controller_generation, endpoint?.endpoint_id, onUnauthorized, selectedAgentId, revision]);
 
-  useEffect(() => {
-    if (!enabled) return;
-    const timer = window.setInterval(refresh, 30_000);
-    return () => window.clearInterval(timer);
-  }, [enabled, refresh]);
+  // Data observation pauses when hidden. Endpoint renewal below is a lease
+  // lifecycle, not a UI poll: do not bind it to document visibility.
+  useVisibleRefresh(enabled, () => { if (!request.current) refresh(); }, 30_000);
 
   useEffect(() => {
     if (!enabled || !endpoints.size) return;
+    const controller = new AbortController();
+    let renewing = false;
     const timer = window.setInterval(() => {
+      if (renewing) return;
+      renewing = true;
       void (async () => {
-        for (const [agentId, value] of Array.from(endpoints.entries())) {
-          const response = await renewEndpoint(client, value.endpoint_id, value.controller_generation);
-          if (response?.status === 401) {
-            onUnauthorized();
-            return;
+        try {
+          for (const [agentId, value] of Array.from(endpoints.entries())) {
+            const response = await renewEndpoint(client, value.endpoint_id, value.controller_generation, controller.signal);
+            // Ignore heartbeats from a detached/replaced Endpoint or disposed view.
+            if (controller.signal.aborted) return;
+            if (response?.status === 401) {
+              onUnauthorized();
+              return;
+            }
+            if (response?.status === 403) {
+              setManageAvailable(false);
+              return;
+            }
+            if (response?.status === 400 || response?.status === 404) {
+              setEndpoints((current) => {
+                const latest = current.get(agentId);
+                if (latest?.endpoint_id !== value.endpoint_id ||
+                    latest.controller_generation !== value.controller_generation) return current;
+                const updated = new Map(current);
+                updated.delete(agentId);
+                return updated;
+              });
+            } else if (response?.ok && response.data?.endpoint) {
+              setManageAvailable(true);
+              setEndpoints((current) => {
+                const latest = current.get(agentId);
+                if (latest?.endpoint_id !== value.endpoint_id ||
+                    latest.controller_generation !== value.controller_generation) return current;
+                return new Map(current).set(agentId, response.data!.endpoint!);
+              });
+            }
           }
-          if (response?.status === 403) {
-            setManageAvailable(false);
-            return;
-          }
-          if (response?.status === 400 || response?.status === 404) {
-            setEndpoints((current) => {
-              const updated = new Map(current);
-              updated.delete(agentId);
-              return updated;
-            });
-          } else if (response?.ok && response.data?.endpoint) {
-            setManageAvailable(true);
-            setEndpoints((current) => new Map(current).set(agentId, response.data!.endpoint!));
-          }
+        } finally {
+          renewing = false;
         }
       })();
     }, 30_000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      controller.abort();
+    };
   }, [client, enabled, endpoints, onUnauthorized]);
 
   const createAgentAction = useCallback(async (input: {
@@ -609,6 +638,7 @@ export function useAgentWorkspace(
     selectedAgent,
     selectedConversation,
     conversationDetail,
+    conversationLoading,
     endpoint,
     inbox,
     busy,

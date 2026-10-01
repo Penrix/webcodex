@@ -1,9 +1,10 @@
 use crate::types::{
-    clip_bytes, BrowserError, BrowserKey, BrowserResult, LAUNCH_TIMEOUT, MAX_NODE_TEXT_BYTES,
-    MAX_PAGES_PER_BROWSER, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_NODES, REQUEST_TIMEOUT,
+    clip_bytes, BrowserError, BrowserKey, BrowserResult, BrowserStability, ControlCapability,
+    LAUNCH_TIMEOUT, MAX_NODE_TEXT_BYTES, MAX_PAGES_PER_BROWSER, MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_NODES, REQUEST_TIMEOUT,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use webcodex_process::ManagedChild;
 
 const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CDP_LIST_BYTES: usize = 256 * 1024;
+const DOM_CONTROL_INDEX_DEPTH: i32 = 32;
 
 pub(crate) trait BackendFactory: Send + Sync {
     fn available(&self) -> bool;
@@ -25,9 +27,20 @@ pub(crate) trait BackendFactory: Send + Sync {
 pub(crate) trait BrowserBackend: Send {
     fn pages(&mut self) -> BrowserResult<Vec<BackendPage>>;
     fn new_page(&mut self) -> BrowserResult<String>;
-    fn snapshot(&mut self, target_id: &str) -> BrowserResult<BackendSnapshot>;
+    fn snapshot(&mut self, target_id: &str, max_depth: u32) -> BrowserResult<BackendSnapshot>;
     fn screenshot(&mut self, target_id: &str) -> BrowserResult<BackendScreenshot>;
+    fn console(
+        &mut self,
+        target_id: &str,
+    ) -> BrowserResult<BackendEventSnapshot<BackendConsoleEntry>>;
+    fn network(
+        &mut self,
+        target_id: &str,
+    ) -> BrowserResult<BackendEventSnapshot<BackendNetworkEntry>>;
+    fn diagnostics(&mut self, target_id: &str) -> BrowserResult<BackendDiagnosticsSnapshot>;
+    fn clear_diagnostics(&mut self, target_id: &str) -> BrowserResult<()>;
     fn navigate(&mut self, target_id: &str, url: &str) -> BrowserResult<()>;
+    fn reload(&mut self, target_id: &str) -> BrowserResult<()>;
     fn click(&mut self, target_id: &str, backend_node_id: i64) -> BrowserResult<()>;
     fn input_text(
         &mut self,
@@ -54,6 +67,11 @@ pub(crate) trait BrowserBackend: Send {
         path: &Path,
     ) -> BrowserResult<()>;
     fn key(&mut self, target_id: &str, key: BrowserKey) -> BrowserResult<()>;
+    fn wait_for_stable(
+        &mut self,
+        target_id: &str,
+        timeout: Duration,
+    ) -> BrowserResult<BrowserStability>;
     fn close_page(&mut self, target_id: &str) -> BrowserResult<()>;
     fn shutdown(&mut self, timeout: Duration) -> BrowserResult<()>;
 }
@@ -66,7 +84,7 @@ pub(crate) struct BackendPage {
     pub(crate) document_id: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct BackendNode {
     pub(crate) role: String,
     pub(crate) name: Option<String>,
@@ -81,7 +99,10 @@ pub(crate) struct BackendNode {
     pub(crate) disabled: Option<bool>,
     pub(crate) read_only: Option<bool>,
     pub(crate) backend_node_id: Option<i64>,
-    pub(crate) actionable: bool,
+    pub(crate) capability: ControlCapability,
+    /// Light-DOM `<option>` of a `<select>` that admits `select_option`.
+    /// Compact snapshots keep the label and value, and still issue no element id.
+    pub(crate) select_choice: bool,
 }
 
 #[derive(Debug)]
@@ -96,6 +117,141 @@ pub(crate) struct BackendScreenshot {
     pub(crate) data: String,
     pub(crate) width: u32,
     pub(crate) height: u32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendConsoleEntry {
+    pub(crate) sequence: u64,
+    pub(crate) level: String,
+    pub(crate) text: String,
+    pub(crate) source: Option<String>,
+    pub(crate) timestamp: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendNetworkEntry {
+    pub(crate) sequence: u64,
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) resource_type: Option<String>,
+    pub(crate) status: Option<u16>,
+    pub(crate) failed_reason: Option<String>,
+    pub(crate) timestamp: Option<f64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendEventSnapshot<T> {
+    pub(crate) entries: Vec<T>,
+    pub(crate) truncated: bool,
+    pub(crate) cursor: u64,
+    pub(crate) oldest_sequence: Option<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendDiagnosticsSnapshot {
+    pub(crate) console: BackendEventSnapshot<BackendConsoleEntry>,
+    pub(crate) network: BackendEventSnapshot<BackendNetworkEntry>,
+    pub(crate) cursor: u64,
+    pub(crate) cleared_through_cursor: u64,
+}
+
+#[derive(Default)]
+struct CdpEventBuffer {
+    console: VecDeque<BackendConsoleEntry>,
+    console_truncated: bool,
+    network: HashMap<String, BackendNetworkEntry>,
+    network_order: VecDeque<String>,
+    network_truncated: bool,
+    pending_network: HashSet<String>,
+    next_sequence: u64,
+    cleared_through_sequence: u64,
+}
+
+impl CdpEventBuffer {
+    fn next_sequence(&mut self) -> u64 {
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence
+    }
+
+    fn push_console(&mut self, mut entry: BackendConsoleEntry) {
+        entry.sequence = self.next_sequence();
+        if self.console.len() >= crate::types::MAX_CONSOLE_ENTRIES {
+            self.console.pop_front();
+            self.console_truncated = true;
+        }
+        self.console.push_back(entry);
+    }
+
+    fn insert_network(&mut self, request_id: String, mut entry: BackendNetworkEntry) {
+        entry.sequence = self.next_sequence();
+        self.pending_network.insert(request_id.clone());
+        if self.network.contains_key(&request_id) {
+            self.network_order
+                .retain(|existing| existing != &request_id);
+        } else if self.network.len() >= crate::types::MAX_NETWORK_ENTRIES {
+            if let Some(oldest) = self.network_order.pop_front() {
+                self.network.remove(&oldest);
+                self.network_truncated = true;
+            }
+        }
+        self.network.insert(request_id.clone(), entry);
+        self.network_order.push_back(request_id);
+    }
+
+    fn update_network<F>(&mut self, request_id: &str, update: F)
+    where
+        F: FnOnce(&mut BackendNetworkEntry),
+    {
+        let sequence = self.next_sequence();
+        if let Some(entry) = self.network.get_mut(request_id) {
+            update(entry);
+            entry.sequence = sequence;
+        }
+    }
+
+    fn finish_network(&mut self, request_id: &str) {
+        self.pending_network.remove(request_id);
+        self.update_network(request_id, |_| {});
+    }
+
+    fn clear(&mut self) {
+        self.cleared_through_sequence = self.next_sequence;
+        self.console.clear();
+        self.console_truncated = false;
+        self.network.clear();
+        self.network_order.clear();
+        self.network_truncated = false;
+        self.pending_network.clear();
+    }
+
+    fn cursor(&self) -> u64 {
+        self.next_sequence
+    }
+
+    fn network_cursor(&self) -> u64 {
+        self.network
+            .values()
+            .map(|entry| entry.sequence)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending_network.len()
+    }
+
+    fn console_oldest_sequence(&self) -> Option<u64> {
+        self.console.front().map(|entry| entry.sequence)
+    }
+
+    fn network_oldest_sequence(&self) -> Option<u64> {
+        self.network.values().map(|entry| entry.sequence).min()
+    }
+}
+
+struct CdpEventCollector {
+    websocket: WebSocket<TcpStream>,
+    events: CdpEventBuffer,
 }
 
 pub(crate) struct ChromiumFactory;
@@ -198,6 +354,7 @@ struct CdpBackend {
     _profile: TempDir,
     endpoint: Url,
     next_id: u64,
+    collectors: HashMap<String, CdpEventCollector>,
 }
 
 impl CdpBackend {
@@ -214,6 +371,7 @@ impl CdpBackend {
         let mut command = Command::new(executable);
         command
             .arg("--headless=new")
+            .arg("--window-size=1440,900")
             .arg("--remote-debugging-address=127.0.0.1")
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", profile.path().display()))
@@ -276,6 +434,7 @@ impl CdpBackend {
             _profile: profile,
             endpoint,
             next_id: 1,
+            collectors: HashMap::new(),
         })
     }
 
@@ -360,6 +519,47 @@ impl CdpBackend {
             effect,
             deadline,
         )
+    }
+
+    fn ensure_event_collector(&mut self, target_id: &str) -> BrowserResult<()> {
+        if self.collectors.contains_key(target_id) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let endpoint = self.page_endpoint_until(target_id, deadline)?;
+        let mut websocket = open_loopback_websocket(&endpoint, deadline)?;
+        for method in ["Runtime.enable", "Log.enable", "Network.enable"] {
+            cdp_call_on_websocket_until(
+                &mut websocket,
+                &mut self.next_id,
+                method,
+                json!({}),
+                false,
+                deadline,
+            )?;
+        }
+        self.collectors.insert(
+            target_id.to_string(),
+            CdpEventCollector {
+                websocket,
+                events: CdpEventBuffer::default(),
+            },
+        );
+        Ok(())
+    }
+
+    fn drain_target_collector(&mut self, target_id: &str) -> BrowserResult<()> {
+        let result = {
+            let collector = self
+                .collectors
+                .get_mut(target_id)
+                .expect("collector exists");
+            drain_event_collector(collector)
+        };
+        if result.is_err() {
+            self.collectors.remove(target_id);
+        }
+        result
     }
 
     fn page_list_until(&self, deadline: Instant) -> BrowserResult<Vec<BackendPage>> {
@@ -553,19 +753,28 @@ impl BrowserBackend for CdpBackend {
             })
     }
 
-    fn snapshot(&mut self, target_id: &str) -> BrowserResult<BackendSnapshot> {
+    fn snapshot(&mut self, target_id: &str, max_depth: u32) -> BrowserResult<BackendSnapshot> {
         let deadline = Instant::now() + REQUEST_TIMEOUT;
-        let frame_tree =
-            self.page_call_until(target_id, "Page.getFrameTree", json!({}), false, deadline)?;
+        let endpoint = self.page_endpoint_until(target_id, deadline)?;
+        let mut websocket = open_loopback_websocket(&endpoint, deadline)?;
+        let frame_tree = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut self.next_id,
+            "Page.getFrameTree",
+            json!({}),
+            false,
+            deadline,
+        )?;
         let document_id = frame_tree
             .pointer("/frameTree/frame/loaderId")
             .and_then(Value::as_str)
             .unwrap_or("unknown-document")
             .to_string();
-        let accessibility = self.page_call_until(
-            target_id,
+        let accessibility = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut self.next_id,
             "Accessibility.getFullAXTree",
-            json!({ "depth": 32 }),
+            json!({ "depth": max_depth.clamp(1, 32) }),
             false,
             deadline,
         )?;
@@ -574,66 +783,20 @@ impl BrowserBackend for CdpBackend {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let raw_by_id = raw_nodes
-            .iter()
-            .filter_map(|node| {
-                node.get("nodeId")
-                    .and_then(Value::as_str)
-                    .map(|id| (id.to_string(), node))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut nodes = Vec::new();
-        let mut truncated = raw_nodes.len() > MAX_SNAPSHOT_NODES;
-        let mut estimated_bytes = 0usize;
-        for raw in raw_nodes.iter().take(MAX_SNAPSHOT_NODES) {
-            let role = ax_value(raw, "role").unwrap_or_else(|| "generic".to_string());
-            if role == "RootWebArea" {
-                continue;
-            }
-            let name = ax_value(raw, "name");
-            let description = ax_value(raw, "description");
-            let value = ax_value(raw, "value");
-            let group = ax_group_context(raw, &raw_by_id);
-            let checked = ax_property_string(raw, "checked");
-            let selected = ax_property_bool(raw, "selected");
-            let required = ax_property_bool(raw, "required");
-            let disabled = ax_property_bool(raw, "disabled");
-            let read_only = ax_property_bool(raw, "readonly");
-            let backend_node_id = raw.get("backendDOMNodeId").and_then(Value::as_i64);
-            let actionable = is_actionable(&role) && backend_node_id.is_some();
-            estimated_bytes = estimated_bytes
-                .saturating_add(role.len())
-                .saturating_add(name.as_deref().map(str::len).unwrap_or(0))
-                .saturating_add(description.as_deref().map(str::len).unwrap_or(0))
-                .saturating_add(value.as_deref().map(str::len).unwrap_or(0))
-                .saturating_add(
-                    group
-                        .as_ref()
-                        .map(|(_, role, label)| role.len() + label.len())
-                        .unwrap_or(0),
-                )
-                .saturating_add(128);
-            if estimated_bytes > MAX_SNAPSHOT_BYTES {
-                truncated = true;
-                break;
-            }
-            nodes.push(BackendNode {
-                role,
-                name,
-                description,
-                value,
-                group_key: group.as_ref().map(|(key, _, _)| key.clone()),
-                group_role: group.as_ref().map(|(_, role, _)| role.clone()),
-                group_label: group.map(|(_, _, label)| label),
-                checked,
-                selected,
-                required,
-                disabled,
-                read_only,
-                backend_node_id,
-                actionable,
-            });
-        }
+        // DOM classification is required for structured controls. A failed
+        // document does not grant legacy click to descendants of browser-private
+        // form controls. Nodes omitted from a successful index admit nothing.
+        let dom_root = cdp_call_on_websocket_until(
+            &mut websocket,
+            &mut self.next_id,
+            "DOM.getDocument",
+            json!({ "depth": DOM_CONTROL_INDEX_DEPTH, "pierce": true }),
+            false,
+            deadline,
+        )
+        .ok()
+        .and_then(|document| document.get("root").cloned());
+        let (nodes, truncated) = project_ax_nodes(&raw_nodes, dom_root.as_ref());
         Ok(BackendSnapshot {
             document_id,
             nodes,
@@ -679,7 +842,98 @@ impl BrowserBackend for CdpBackend {
         })
     }
 
+    fn console(
+        &mut self,
+        target_id: &str,
+    ) -> BrowserResult<BackendEventSnapshot<BackendConsoleEntry>> {
+        self.ensure_event_collector(target_id)?;
+        self.drain_target_collector(target_id)?;
+        let collector = self
+            .collectors
+            .get(target_id)
+            .expect("collector survives successful drain");
+        Ok(BackendEventSnapshot {
+            entries: collector.events.console.iter().cloned().collect(),
+            truncated: collector.events.console_truncated,
+            cursor: collector.events.cursor(),
+            oldest_sequence: collector.events.console_oldest_sequence(),
+        })
+    }
+
+    fn network(
+        &mut self,
+        target_id: &str,
+    ) -> BrowserResult<BackendEventSnapshot<BackendNetworkEntry>> {
+        self.ensure_event_collector(target_id)?;
+        self.drain_target_collector(target_id)?;
+        let collector = self
+            .collectors
+            .get(target_id)
+            .expect("collector survives successful drain");
+        let mut values = collector
+            .events
+            .network
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        values.sort_by(|a, b| {
+            a.timestamp
+                .partial_cmp(&b.timestamp)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(BackendEventSnapshot {
+            entries: values,
+            truncated: collector.events.network_truncated,
+            cursor: collector.events.cursor(),
+            oldest_sequence: collector.events.network_oldest_sequence(),
+        })
+    }
+
+    fn diagnostics(&mut self, target_id: &str) -> BrowserResult<BackendDiagnosticsSnapshot> {
+        self.ensure_event_collector(target_id)?;
+        self.drain_target_collector(target_id)?;
+        let collector = self
+            .collectors
+            .get(target_id)
+            .expect("collector survives successful drain");
+        let cursor = collector.events.cursor();
+        let mut network = collector
+            .events
+            .network
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        network.sort_by_key(|entry| entry.sequence);
+        Ok(BackendDiagnosticsSnapshot {
+            console: BackendEventSnapshot {
+                entries: collector.events.console.iter().cloned().collect(),
+                truncated: collector.events.console_truncated,
+                cursor,
+                oldest_sequence: collector.events.console_oldest_sequence(),
+            },
+            network: BackendEventSnapshot {
+                entries: network,
+                truncated: collector.events.network_truncated,
+                cursor,
+                oldest_sequence: collector.events.network_oldest_sequence(),
+            },
+            cursor,
+            cleared_through_cursor: collector.events.cleared_through_sequence,
+        })
+    }
+
+    fn clear_diagnostics(&mut self, target_id: &str) -> BrowserResult<()> {
+        self.ensure_event_collector(target_id)?;
+        let next_id = &mut self.next_id;
+        let collector = self
+            .collectors
+            .get_mut(target_id)
+            .expect("collector exists");
+        clear_event_collector(collector, next_id)
+    }
+
     fn navigate(&mut self, target_id: &str, url: &str) -> BrowserResult<()> {
+        self.ensure_event_collector(target_id)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         self.page_call_until(
             target_id,
@@ -691,7 +945,15 @@ impl BrowserBackend for CdpBackend {
         .map(|_| ())
     }
 
+    fn reload(&mut self, target_id: &str) -> BrowserResult<()> {
+        self.ensure_event_collector(target_id)?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        self.page_call_until(target_id, "Page.reload", json!({}), true, deadline)
+            .map(|_| ())
+    }
+
     fn click(&mut self, target_id: &str, backend_node_id: i64) -> BrowserResult<()> {
+        self.ensure_event_collector(target_id)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         // CDP mouse coordinates are viewport-relative. Ensure off-screen
         // controls are visible before deriving the box-model click point.
@@ -766,6 +1028,7 @@ impl BrowserBackend for CdpBackend {
         backend_node_id: i64,
         text: &str,
     ) -> BrowserResult<()> {
+        self.ensure_event_collector(target_id)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         self.page_call_until(
             target_id,
@@ -821,6 +1084,7 @@ impl BrowserBackend for CdpBackend {
             }
             return { ok: true };
         }"#;
+        self.ensure_event_collector(target_id)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         self.call_element_function_until(
             target_id,
@@ -873,6 +1137,7 @@ impl BrowserBackend for CdpBackend {
             }
             return { ok: true };
         }"#;
+        self.ensure_event_collector(target_id)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         self.call_element_function_until(target_id, backend_node_id, SET_VALUE, value, deadline)
     }
@@ -889,6 +1154,7 @@ impl BrowserBackend for CdpBackend {
                 "Browser upload path is not representable as a CDP UTF-8 path",
             )
         })?;
+        self.ensure_event_collector(target_id)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         self.page_call_until(
             target_id,
@@ -905,6 +1171,7 @@ impl BrowserBackend for CdpBackend {
     }
 
     fn key(&mut self, target_id: &str, key: BrowserKey) -> BrowserResult<()> {
+        self.ensure_event_collector(target_id)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         let (key_name, code, text) = key.cdp();
         self.page_call_until(
@@ -934,15 +1201,149 @@ impl BrowserBackend for CdpBackend {
         .map_err(|error| post_effect_error(error, "snapshot"))
     }
 
+    fn wait_for_stable(
+        &mut self,
+        target_id: &str,
+        timeout: Duration,
+    ) -> BrowserResult<BrowserStability> {
+        const QUIET_PERIOD: Duration = Duration::from_millis(250);
+        const LONG_LIVED_NETWORK_QUIET_PERIOD: Duration = Duration::from_millis(750);
+        const POLL_INTERVAL: Duration = Duration::from_millis(75);
+        const STABILITY_EXPRESSION: &str = r#"JSON.stringify({
+            ready: document.readyState,
+            href: location.href,
+            elements: document.getElementsByTagName("*").length,
+            text: document.body ? document.body.innerText.length : 0
+        })"#;
+
+        let started = Instant::now();
+        let deadline = started + timeout;
+        let mut last_signature: Option<String> = None;
+        let mut last_network_cursor: Option<u64> = None;
+        let mut quiet_since: Option<Instant> = None;
+        let mut last_reason = "deadline".to_string();
+
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(BrowserStability {
+                    stable: false,
+                    waited_ms: started.elapsed().as_millis() as u64,
+                    reason: last_reason,
+                });
+            }
+
+            if self.ensure_event_collector(target_id).is_err()
+                || self.drain_target_collector(target_id).is_err()
+            {
+                last_reason = "collector_recovering".to_string();
+                std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                continue;
+            }
+
+            let (pending, network_cursor) = self
+                .collectors
+                .get(target_id)
+                .map(|collector| {
+                    (
+                        collector.events.pending_count(),
+                        collector.events.network_cursor(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            let observed = self.page_call_until(
+                target_id,
+                "Runtime.evaluate",
+                json!({
+                    "expression": STABILITY_EXPRESSION,
+                    "returnByValue": true,
+                    "awaitPromise": false
+                }),
+                false,
+                deadline,
+            );
+
+            let Ok(observed) = observed else {
+                last_reason = "document_recovering".to_string();
+                std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                continue;
+            };
+            let Some(signature) = observed
+                .pointer("/result/value")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                last_reason = "document_unavailable".to_string();
+                std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+                continue;
+            };
+            let ready = serde_json::from_str::<Value>(&signature)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("ready")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|state| state != "loading");
+
+            let dom_unchanged = last_signature.as_deref() == Some(signature.as_str());
+            let network_unchanged = last_network_cursor == Some(network_cursor);
+            if ready && dom_unchanged && network_unchanged {
+                let since = quiet_since.get_or_insert(now);
+                let required_quiet = if pending == 0 {
+                    QUIET_PERIOD
+                } else {
+                    LONG_LIVED_NETWORK_QUIET_PERIOD
+                };
+                if since.elapsed() >= required_quiet {
+                    return Ok(BrowserStability {
+                        stable: true,
+                        waited_ms: started.elapsed().as_millis() as u64,
+                        reason: if pending == 0 {
+                            "dom_and_network_quiet".to_string()
+                        } else {
+                            "dom_quiet_with_long_lived_network".to_string()
+                        },
+                    });
+                }
+                last_reason = if pending == 0 {
+                    "quiet_period".to_string()
+                } else {
+                    "long_lived_network_quiet_period".to_string()
+                };
+            } else {
+                quiet_since = ready.then_some(now);
+                last_reason = if !ready {
+                    "document_loading".to_string()
+                } else if !dom_unchanged {
+                    "dom_changed".to_string()
+                } else {
+                    "network_changed".to_string()
+                };
+            }
+            last_signature = Some(signature);
+            last_network_cursor = Some(network_cursor);
+            std::thread::sleep(
+                POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
     fn close_page(&mut self, target_id: &str) -> BrowserResult<()> {
         let deadline = Instant::now() + REQUEST_TIMEOUT;
-        self.browser_call_until(
-            "Target.closeTarget",
-            json!({ "targetId": target_id }),
-            true,
-            deadline,
-        )
-        .map(|_| ())
+        let result = self
+            .browser_call_until(
+                "Target.closeTarget",
+                json!({ "targetId": target_id }),
+                true,
+                deadline,
+            )
+            .map(|_| ());
+        if result.is_ok() {
+            self.collectors.remove(target_id);
+        }
+        result
     }
 
     fn shutdown(&mut self, timeout: Duration) -> BrowserResult<()> {
@@ -1000,6 +1401,508 @@ fn viewport_dimension(metrics: &Value, pointer: &str) -> u32 {
         .clamp(1.0, 4096.0) as u32
 }
 
+fn parse_ax_snapshot_nodes(raw_nodes: &[Value]) -> (Vec<BackendNode>, bool) {
+    let raw_by_id = raw_nodes
+        .iter()
+        .filter_map(|node| {
+            node.get("nodeId")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_string(), node))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut nodes = Vec::new();
+    let mut estimated_bytes = 0usize;
+    for raw in raw_nodes {
+        let role = ax_value(raw, "role").unwrap_or_else(|| "generic".to_string());
+        if role == "RootWebArea" {
+            continue;
+        }
+        let name = ax_value(raw, "name");
+        let description = ax_value(raw, "description");
+        let value = ax_value(raw, "value");
+        let group = ax_group_context(raw, &raw_by_id);
+        let checked = ax_property_string(raw, "checked");
+        let selected = ax_property_bool(raw, "selected");
+        let required = ax_property_bool(raw, "required");
+        let disabled = ax_property_bool(raw, "disabled");
+        let read_only = ax_property_bool(raw, "readonly");
+        let backend_node_id = raw.get("backendDOMNodeId").and_then(Value::as_i64);
+        estimated_bytes = estimated_bytes
+            .saturating_add(role.len())
+            .saturating_add(name.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(description.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(value.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(
+                group
+                    .as_ref()
+                    .map(|(_, role, label)| role.len() + label.len())
+                    .unwrap_or(0),
+            )
+            .saturating_add(128);
+        nodes.push(BackendNode {
+            role,
+            name,
+            description,
+            value,
+            group_key: group.as_ref().map(|(key, _, _)| key.clone()),
+            group_role: group.as_ref().map(|(_, role, _)| role.clone()),
+            group_label: group.map(|(_, _, label)| label),
+            checked,
+            selected,
+            required,
+            disabled,
+            read_only,
+            backend_node_id,
+            capability: ControlCapability::default(),
+            select_choice: false,
+        });
+    }
+    let truncated = nodes.len() > MAX_SNAPSHOT_NODES || estimated_bytes > MAX_SNAPSHOT_BYTES;
+    (nodes, truncated)
+}
+
+pub(crate) fn project_ax_nodes(
+    raw_nodes: &[Value],
+    dom_root: Option<&Value>,
+) -> (Vec<BackendNode>, bool) {
+    let (mut nodes, truncated) = parse_ax_snapshot_nodes(raw_nodes);
+    apply_dom_capabilities(&mut nodes, raw_nodes, dom_root);
+    (nodes, truncated)
+}
+
+#[derive(Debug)]
+struct DomControlFacts {
+    local_name: String,
+    input_type: Option<String>,
+    in_native_control_shadow: bool,
+    owning_select_backend_id: Option<i64>,
+    host_backend_node_id: Option<i64>,
+    host_local_name: Option<String>,
+    host_input_type: Option<String>,
+    host_label: Option<String>,
+    host_value: Option<String>,
+}
+
+struct ShadowHost {
+    backend_node_id: Option<i64>,
+    local_name: String,
+    input_type: Option<String>,
+    label: Option<String>,
+    value: Option<String>,
+}
+
+fn apply_dom_capabilities(
+    nodes: &mut Vec<BackendNode>,
+    raw_nodes: &[Value],
+    dom_root: Option<&Value>,
+) {
+    let index = dom_root.map(index_dom_controls);
+    let private_descendants = browser_private_control_descendants(raw_nodes);
+    let known_ids = nodes
+        .iter()
+        .filter_map(|node| node.backend_node_id)
+        .collect::<HashSet<_>>();
+    for node in nodes.iter_mut() {
+        node.capability = capability_for_ax_node(node, index.as_ref(), &private_descendants);
+    }
+    // Promote only when the DOM index proves the owner and the accessibility
+    // tree did not already expose that owner. The added node uses the owner's
+    // role, label, and value; the shadow part keeps its own identity.
+    let Some(index) = index.as_ref() else {
+        return;
+    };
+    let mut promotions: Vec<(i64, usize, u8, ControlCapability)> = Vec::new();
+    for (index_in_snapshot, node) in nodes.iter().enumerate() {
+        let rank = shadow_owner_promotion_rank(&node.role);
+        if rank == u8::MAX {
+            continue;
+        }
+        let Some(backend_node_id) = node.backend_node_id else {
+            continue;
+        };
+        let Some(facts) = index.get(&backend_node_id) else {
+            continue;
+        };
+        if !facts.in_native_control_shadow {
+            continue;
+        }
+        let Some(host_backend_node_id) = facts.host_backend_node_id else {
+            continue;
+        };
+        if known_ids.contains(&host_backend_node_id) {
+            continue;
+        }
+        let host_capability = capability_for_element(
+            facts.host_local_name.as_deref().unwrap_or(""),
+            facts.host_input_type.as_deref(),
+            "",
+        );
+        if !host_capability.admits_any() || host_projection(facts, host_capability).is_none() {
+            continue;
+        }
+        match promotions
+            .iter()
+            .position(|(host_id, _, _, _)| *host_id == host_backend_node_id)
+        {
+            Some(position) if rank < promotions[position].2 => {
+                promotions[position] = (
+                    host_backend_node_id,
+                    index_in_snapshot,
+                    rank,
+                    host_capability,
+                );
+            }
+            Some(_) => {}
+            None => promotions.push((
+                host_backend_node_id,
+                index_in_snapshot,
+                rank,
+                host_capability,
+            )),
+        }
+    }
+    let mut additions = Vec::new();
+    for (_, index_in_snapshot, _, host_capability) in promotions {
+        let Some(node) = nodes.get(index_in_snapshot) else {
+            continue;
+        };
+        let Some(backend_node_id) = node.backend_node_id else {
+            continue;
+        };
+        let Some(facts) = index.get(&backend_node_id) else {
+            continue;
+        };
+        let Some(projected) = host_projection(facts, host_capability) else {
+            continue;
+        };
+        additions.push((index_in_snapshot, projected));
+    }
+    additions.sort_by_key(|(index_in_snapshot, _)| *index_in_snapshot);
+    for (offset, (index_in_snapshot, projected)) in additions.into_iter().enumerate() {
+        nodes.insert(index_in_snapshot + offset, projected);
+    }
+    mark_native_select_choices(nodes, index);
+}
+
+fn mark_native_select_choices(nodes: &mut [BackendNode], index: &HashMap<i64, DomControlFacts>) {
+    let admitted_selects = nodes
+        .iter()
+        .filter(|node| node.capability.select_option)
+        .filter_map(|node| node.backend_node_id)
+        .filter(|backend_node_id| {
+            index.get(backend_node_id).is_some_and(|facts| {
+                facts.local_name == "select" && !facts.in_native_control_shadow
+            })
+        })
+        .collect::<HashSet<_>>();
+    for node in nodes.iter_mut() {
+        if node.role != "option" {
+            continue;
+        }
+        let Some(backend_node_id) = node.backend_node_id else {
+            continue;
+        };
+        let Some(facts) = index.get(&backend_node_id) else {
+            continue;
+        };
+        if facts.local_name != "option" || facts.in_native_control_shadow {
+            continue;
+        }
+        node.select_choice = facts
+            .owning_select_backend_id
+            .is_some_and(|select_id| admitted_selects.contains(&select_id));
+    }
+}
+
+fn capability_for_ax_node(
+    node: &BackendNode,
+    index: Option<&HashMap<i64, DomControlFacts>>,
+    private_descendants: &HashSet<i64>,
+) -> ControlCapability {
+    let Some(backend_node_id) = node.backend_node_id else {
+        return ControlCapability::default();
+    };
+    if let Some(index) = index {
+        return match index.get(&backend_node_id) {
+            Some(facts) if facts.in_native_control_shadow => ControlCapability::default(),
+            Some(facts) => {
+                capability_for_element(&facts.local_name, facts.input_type.as_deref(), &node.role)
+            }
+            // The document was classified, but this node was omitted. Do not
+            // guess a click target from its accessibility role.
+            None => ControlCapability::default(),
+        };
+    }
+    if private_descendants.contains(&backend_node_id) {
+        return ControlCapability::default();
+    }
+    legacy_role_capability(&node.role)
+}
+
+fn host_projection(facts: &DomControlFacts, capability: ControlCapability) -> Option<BackendNode> {
+    let role = host_role(
+        facts.host_local_name.as_deref().unwrap_or(""),
+        facts.host_input_type.as_deref(),
+    )?;
+    Some(BackendNode {
+        role: role.to_string(),
+        name: facts.host_label.clone(),
+        description: None,
+        value: facts.host_value.clone(),
+        group_key: None,
+        group_role: None,
+        group_label: None,
+        checked: None,
+        selected: None,
+        required: None,
+        disabled: None,
+        read_only: None,
+        backend_node_id: facts.host_backend_node_id,
+        capability,
+        select_choice: false,
+    })
+}
+
+fn host_role(local_name: &str, input_type: Option<&str>) -> Option<&'static str> {
+    match (local_name, input_type.unwrap_or("text")) {
+        ("select", _) => Some("combobox"),
+        ("textarea", _) => Some("textbox"),
+        ("input", "number") => Some("spinbutton"),
+        ("input", "range") => Some("slider"),
+        ("input", "date") => Some("Date"),
+        ("input", "time") => Some("InputTime"),
+        ("input", "color") => Some("ColorWell"),
+        ("input", "month" | "week" | "datetime-local") => Some("DateTime"),
+        ("input", "file" | "button" | "submit" | "reset" | "image") => Some("button"),
+        ("input", "checkbox") => Some("checkbox"),
+        ("input", "radio") => Some("radio"),
+        ("input", "text" | "email" | "tel" | "url" | "search" | "password") => Some("textbox"),
+        _ => None,
+    }
+}
+
+fn capability_for_element(
+    local_name: &str,
+    input_type: Option<&str>,
+    role: &str,
+) -> ControlCapability {
+    match local_name {
+        "select" => ControlCapability::select_option(),
+        "option" => ControlCapability::default(),
+        "textarea" => ControlCapability::text_input(),
+        "input" => match input_type.unwrap_or("text") {
+            "hidden" => ControlCapability::default(),
+            "file" => ControlCapability::file_upload(),
+            "number" | "range" | "date" | "datetime-local" | "month" | "week" | "time"
+            | "color" => ControlCapability::exact_value(),
+            "checkbox" | "radio" | "button" | "submit" | "reset" | "image" => {
+                ControlCapability::click()
+            }
+            "text" | "email" | "tel" | "url" | "search" | "password" => {
+                ControlCapability::text_input()
+            }
+            _ => legacy_role_capability(role),
+        },
+        "button" | "summary" => ControlCapability::click(),
+        "a" => legacy_role_capability(role),
+        _ if role == "option" => ControlCapability::default(),
+        _ => legacy_role_capability(role),
+    }
+}
+
+fn legacy_role_capability(role: &str) -> ControlCapability {
+    match role {
+        "textbox" | "searchbox" => ControlCapability::text_input(),
+        "button" | "link" | "checkbox" | "radio" | "switch" | "menuitem" | "tab" | "combobox"
+        | "DateTime" => ControlCapability::click(),
+        _ => ControlCapability::default(),
+    }
+}
+
+fn browser_private_control_descendants(raw_nodes: &[Value]) -> HashSet<i64> {
+    let by_id = raw_nodes
+        .iter()
+        .filter_map(|node| {
+            node.get("nodeId")
+                .and_then(Value::as_str)
+                .map(|id| (id.to_string(), node))
+        })
+        .collect::<HashMap<_, _>>();
+    raw_nodes
+        .iter()
+        .filter(|node| ax_descendant_of_browser_private_control(node, &by_id))
+        .filter_map(|node| node.get("backendDOMNodeId").and_then(Value::as_i64))
+        .collect()
+}
+
+fn ax_descendant_of_browser_private_control(node: &Value, by_id: &HashMap<String, &Value>) -> bool {
+    let mut parent_id = node.get("parentId").and_then(Value::as_str);
+    // No parent link is not evidence that this node is a browser-private part.
+    if parent_id.is_none() {
+        return false;
+    }
+    for _ in 0..32 {
+        let Some(id) = parent_id else {
+            return true;
+        };
+        let Some(parent) = by_id.get(id) else {
+            return true;
+        };
+        let role = ax_value(parent, "role").unwrap_or_default();
+        if is_browser_private_control_role(&role) {
+            return true;
+        }
+        if role == "RootWebArea" {
+            return false;
+        }
+        parent_id = parent.get("parentId").and_then(Value::as_str);
+    }
+    true
+}
+
+fn is_browser_private_control_role(role: &str) -> bool {
+    matches!(
+        role,
+        "Date" | "DateTime" | "InputTime" | "ColorWell" | "spinbutton" | "slider" | "combobox"
+    )
+}
+
+fn shadow_owner_promotion_rank(role: &str) -> u8 {
+    match role {
+        "spinbutton" | "slider" | "Date" | "DateTime" | "InputTime" | "ColorWell" => 0,
+        "button" | "combobox" => 1,
+        _ => u8::MAX,
+    }
+}
+
+fn index_dom_controls(root: &Value) -> HashMap<i64, DomControlFacts> {
+    let mut index = HashMap::new();
+    walk_dom_controls(root, None, None, &mut index);
+    index
+}
+
+fn walk_dom_controls(
+    node: &Value,
+    host: Option<&ShadowHost>,
+    owning_select: Option<i64>,
+    index: &mut HashMap<i64, DomControlFacts>,
+) {
+    let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+    let is_shadow_root = node.get("shadowRootType").is_some() || node_type == 11;
+    if is_shadow_root {
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                // Shadow contents are not light-DOM choices of an enclosing select.
+                walk_dom_controls(child, host, None, index);
+            }
+        }
+        return;
+    }
+    if node_type != 1 {
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk_dom_controls(child, host, owning_select, index);
+            }
+        }
+        return;
+    }
+
+    let local_name = node
+        .get("localName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let input_type = (local_name == "input").then(|| {
+        let raw = dom_attribute(node, "type").unwrap_or_else(|| "text".to_string());
+        if raw.is_empty() {
+            "text".to_string()
+        } else {
+            raw
+        }
+    });
+    let in_native_control_shadow = host
+        .as_ref()
+        .is_some_and(|host| matches!(host.local_name.as_str(), "input" | "select" | "textarea"));
+    let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64);
+    let child_owning_select = if local_name == "select" && !in_native_control_shadow {
+        backend_node_id
+    } else if in_native_control_shadow {
+        None
+    } else {
+        owning_select
+    };
+    if let Some(backend_node_id) = backend_node_id {
+        index.insert(
+            backend_node_id,
+            DomControlFacts {
+                local_name: local_name.clone(),
+                input_type: input_type.clone(),
+                in_native_control_shadow,
+                owning_select_backend_id: if local_name == "option" && !in_native_control_shadow {
+                    owning_select
+                } else {
+                    None
+                },
+                host_backend_node_id: host.and_then(|host| host.backend_node_id),
+                host_local_name: host.map(|host| host.local_name.clone()),
+                host_input_type: host.and_then(|host| host.input_type.clone()),
+                host_label: host.and_then(|host| host.label.clone()),
+                host_value: host.and_then(|host| host.value.clone()),
+            },
+        );
+    }
+    let next_host = ShadowHost {
+        backend_node_id,
+        local_name,
+        input_type,
+        label: element_label(node),
+        value: element_value(node),
+    };
+    if let Some(children) = node.get("children").and_then(Value::as_array) {
+        for child in children {
+            walk_dom_controls(child, host, child_owning_select, index);
+        }
+    }
+    if let Some(shadow_roots) = node.get("shadowRoots").and_then(Value::as_array) {
+        for shadow_root in shadow_roots {
+            walk_dom_controls(shadow_root, Some(&next_host), None, index);
+        }
+    }
+}
+
+fn dom_attribute(node: &Value, name: &str) -> Option<String> {
+    dom_attribute_raw(node, name).map(|value| value.to_ascii_lowercase())
+}
+
+fn dom_attribute_raw(node: &Value, name: &str) -> Option<String> {
+    let attributes = node.get("attributes")?.as_array()?;
+    let mut index = 0;
+    while index + 1 < attributes.len() {
+        if attributes[index].as_str() == Some(name) {
+            return attributes[index + 1]
+                .as_str()
+                .map(|value| value.trim().to_string());
+        }
+        index += 2;
+    }
+    None
+}
+
+fn element_label(node: &Value) -> Option<String> {
+    for name in ["aria-label", "title"] {
+        if let Some(value) = dom_attribute_raw(node, name).filter(|value| !value.is_empty()) {
+            return Some(clip_bytes(&value, MAX_NODE_TEXT_BYTES));
+        }
+    }
+    None
+}
+
+fn element_value(node: &Value) -> Option<String> {
+    dom_attribute_raw(node, "value")
+        .filter(|value| !value.is_empty())
+        .map(|value| clip_bytes(&value, MAX_NODE_TEXT_BYTES))
+}
+
 fn ax_value(node: &Value, key: &str) -> Option<String> {
     node.get(key)?
         .get("value")?
@@ -1054,23 +1957,6 @@ fn ax_group_context(
         parent_id = parent.get("parentId").and_then(Value::as_str);
     }
     None
-}
-
-fn is_actionable(role: &str) -> bool {
-    matches!(
-        role,
-        "button"
-            | "link"
-            | "textbox"
-            | "searchbox"
-            | "DateTime"
-            | "combobox"
-            | "checkbox"
-            | "radio"
-            | "switch"
-            | "menuitem"
-            | "tab"
-    )
 }
 
 fn fetch_page_descriptors(port: u16, deadline: Instant) -> BrowserResult<Vec<Value>> {
@@ -1226,6 +2112,215 @@ fn cdp_call(
     )
 }
 
+fn clear_event_collector(
+    collector: &mut CdpEventCollector,
+    next_id: &mut u64,
+) -> BrowserResult<()> {
+    // A response on the same ordered CDP websocket is a bounded barrier: all
+    // already-queued diagnostic messages are consumed before this response.
+    // Clearing only after the barrier prevents pre-clear backlog from resurfacing
+    // on the next observation without relying on a best-effort drain duration.
+    cdp_call_on_websocket_until(
+        &mut collector.websocket,
+        next_id,
+        "Page.getFrameTree",
+        json!({}),
+        false,
+        Instant::now() + REQUEST_TIMEOUT,
+    )
+    .map_err(pre_dispatch_error)?;
+    collector.events.clear();
+    Ok(())
+}
+
+fn drain_event_collector(collector: &mut CdpEventCollector) -> BrowserResult<()> {
+    let deadline = Instant::now() + Duration::from_millis(150);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        configure_socket_timeout(&mut collector.websocket, remaining)?;
+        match collector.websocket.read() {
+            Ok(Message::Text(text)) => {
+                let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                    continue;
+                };
+                record_cdp_event(&mut collector.events, &value);
+            }
+            Ok(Message::Close(_)) => {
+                return Err(BrowserError::observed(
+                    "cdp_receive_closed",
+                    "diagnostic CDP stream closed before observation completed",
+                    Some("pages"),
+                ))
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break
+            }
+            Err(error) => {
+                return Err(BrowserError::observed(
+                    "cdp_receive_failed",
+                    error.to_string(),
+                    None,
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_cdp_event(buffer: &mut CdpEventBuffer, value: &Value) {
+    let method = value.get("method").and_then(Value::as_str);
+    let params = value.get("params").cloned().unwrap_or_default();
+    match method {
+        Some("Runtime.consoleAPICalled") => {
+            let level = params.get("type").and_then(Value::as_str).unwrap_or("log");
+            let text = params
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(console_arg_text)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+            buffer.push_console(BackendConsoleEntry {
+                sequence: 0,
+                level: clip_bytes(level, 64),
+                text: clip_bytes(&text, crate::types::MAX_DIAGNOSTIC_TEXT_BYTES),
+                source: None,
+                timestamp: params.get("timestamp").and_then(Value::as_f64),
+            });
+        }
+        Some("Runtime.exceptionThrown") => {
+            let details = params.get("exceptionDetails").cloned().unwrap_or_default();
+            buffer.push_console(BackendConsoleEntry {
+                sequence: 0,
+                level: "exception".to_string(),
+                text: clip_bytes(
+                    details
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Uncaught exception"),
+                    crate::types::MAX_DIAGNOSTIC_TEXT_BYTES,
+                ),
+                source: details
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(|url| clip_bytes(url, crate::types::MAX_URL_BYTES)),
+                timestamp: params.get("timestamp").and_then(Value::as_f64),
+            });
+        }
+        Some("Log.entryAdded") => {
+            let entry = value.pointer("/params/entry").cloned().unwrap_or_default();
+            buffer.push_console(BackendConsoleEntry {
+                sequence: 0,
+                level: clip_bytes(
+                    entry.get("level").and_then(Value::as_str).unwrap_or("info"),
+                    64,
+                ),
+                text: clip_bytes(
+                    entry
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    crate::types::MAX_DIAGNOSTIC_TEXT_BYTES,
+                ),
+                source: entry
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(|url| clip_bytes(url, crate::types::MAX_URL_BYTES)),
+                timestamp: entry.get("timestamp").and_then(Value::as_f64),
+            });
+        }
+        Some("Network.requestWillBeSent") => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            let request = params.get("request").cloned().unwrap_or_default();
+            buffer.insert_network(
+                request_id.to_string(),
+                BackendNetworkEntry {
+                    sequence: 0,
+                    method: clip_bytes(
+                        request
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or("GET"),
+                        128,
+                    ),
+                    url: clip_bytes(
+                        request
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                        crate::types::MAX_URL_BYTES,
+                    ),
+                    resource_type: params
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(|resource_type| clip_bytes(resource_type, 64)),
+                    status: None,
+                    failed_reason: None,
+                    timestamp: params.get("timestamp").and_then(Value::as_f64),
+                },
+            );
+        }
+        Some("Network.responseReceived") => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            let response = params.get("response").cloned().unwrap_or_default();
+            let status = response
+                .get("status")
+                .and_then(Value::as_f64)
+                .map(|value| value as u16);
+            buffer.update_network(request_id, |entry| entry.status = status);
+        }
+        Some("Network.loadingFailed") => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            let failed_reason = params
+                .get("errorText")
+                .and_then(Value::as_str)
+                .map(|value| clip_bytes(value, 512));
+            buffer.update_network(request_id, |entry| entry.failed_reason = failed_reason);
+            buffer.finish_network(request_id);
+        }
+        Some("Network.loadingFinished") => {
+            let Some(request_id) = params.get("requestId").and_then(Value::as_str) else {
+                return;
+            };
+            buffer.finish_network(request_id);
+        }
+        _ => {}
+    }
+}
+
+fn console_arg_text(value: &Value) -> Option<String> {
+    value
+        .get("value")
+        .map(|value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+        .or_else(|| {
+            value
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
 fn cdp_call_until(
     endpoint: &Url,
     next_id: &mut u64,
@@ -1324,6 +2419,16 @@ fn cdp_call_on_websocket_until(
                 })
             }
             Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Socket timeouts vary by platform. Recheck the same absolute
+                // deadline above; never redispatch the request or renew its budget.
+                continue;
+            }
             Err(error) => {
                 return Err(if effect {
                     BrowserError::uncertain(
@@ -1348,17 +2453,308 @@ mod tests {
     use tungstenite::{accept, Message};
 
     #[test]
-    fn form_control_roles_needed_for_structured_fill_are_actionable() {
-        for role in ["textbox", "combobox", "DateTime"] {
-            assert!(
-                is_actionable(role),
-                "{role} should project an element identity"
-            );
-        }
+    fn dom_control_capabilities_follow_the_owning_element() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 1,
+                "children": [
+                    input(13, "text", json!([])),
+                    input(18, "search", json!([])),
+                    input(29, "number", json!([])),
+                    input(35, "range", json!([])),
+                    input(40, "date", json!([
+                        {"nodeType": 1, "localName": "span", "backendNodeId": 44},
+                        {"nodeType": 1, "localName": "div", "backendNodeId": 49, "attributes": ["id", "picker"]}
+                    ])),
+                    input(51, "month", json!([])),
+                    json!({
+                        "nodeType": 1,
+                        "localName": "input",
+                        "backendNodeId": 61,
+                        "attributes": ["type", "week", "aria-label", "Week", "value", "2026-W12"],
+                        "shadowRoots": [{
+                            "nodeType": 11,
+                            "shadowRootType": "user-agent",
+                            "children": [
+                                {"nodeType": 1, "localName": "span", "backendNodeId": 65},
+                                {"nodeType": 1, "localName": "span", "backendNodeId": 67}
+                            ]
+                        }]
+                    }),
+                    input(11, "time", json!([])),
+                    input(80, "datetime-local", json!([])),
+                    input(23, "color", json!([])),
+                    input(99, "file", json!([])),
+                    input(2, "email", json!([])),
+                    input(14, "password", json!([])),
+                    input(15, "checkbox", json!([])),
+                    input(16, "hidden", json!([])),
+                    {
+                        "nodeType": 1,
+                        "localName": "select",
+                        "backendNodeId": 106,
+                        "children": [
+                            {"nodeType": 1, "localName": "option", "backendNodeId": 113}
+                        ]
+                    },
+                    {"nodeType": 1, "localName": "textarea", "backendNodeId": 103},
+                    {"nodeType": 1, "localName": "div", "backendNodeId": 119},
+                    {"nodeType": 1, "localName": "div", "backendNodeId": 120},
+                    {"nodeType": 1, "localName": "button", "backendNodeId": 200},
+                    {"nodeType": 1, "localName": "a", "backendNodeId": 202},
+                    {"nodeType": 1, "localName": "a", "backendNodeId": 203, "attributes": ["href", "https://example.test/"]},
+                    {
+                        "nodeType": 1,
+                        "localName": "ua-like",
+                        "backendNodeId": 201,
+                        "shadowRoots": [{
+                            "nodeType": 11,
+                            "shadowRootType": "open",
+                            "children": [
+                                {"nodeType": 1, "localName": "div", "backendNodeId": 123},
+                                {"nodeType": 1, "localName": "button", "backendNodeId": 124}
+                            ]
+                        }]
+                    }
+                ]
+            }]
+        });
+        let raw_nodes = vec![
+            ax("text", "textbox", Some(13)),
+            ax("search", "searchbox", Some(18)),
+            ax("email", "textbox", Some(2)),
+            ax("password", "textbox", Some(14)),
+            ax("checkbox", "checkbox", Some(15)),
+            ax("hidden", "textbox", Some(16)),
+            ax("number", "spinbutton", Some(29)),
+            ax("range", "slider", Some(35)),
+            ax("date", "Date", Some(40)),
+            ax("date-part", "spinbutton", Some(44)),
+            ax("date-picker", "button", Some(49)),
+            ax("month", "DateTime", Some(51)),
+            ax("time", "InputTime", Some(11)),
+            ax("local", "DateTime", Some(80)),
+            ax("color", "ColorWell", Some(23)),
+            ax("file", "button", Some(99)),
+            ax("select", "combobox", Some(106)),
+            ax("alpha", "option", Some(113)),
+            ax("notes", "textbox", Some(103)),
+            ax("aria-spin", "spinbutton", Some(119)),
+            ax("aria-slider", "slider", Some(120)),
+            ax("button", "button", Some(200)),
+            ax("plain-anchor", "generic", Some(202)),
+            ax("link", "link", Some(203)),
+            ax("shadow-spin", "spinbutton", Some(123)),
+            ax("shadow-button", "button", Some(124)),
+            ax("week-part-a", "spinbutton", Some(65)),
+            ax("week-part-b", "button", Some(67)),
+            ax("legacy-button", "button", Some(4242)),
+            ax("legacy-datetime", "DateTime", Some(4243)),
+            ax("detached-date", "Date", Some(4244)),
+            ax("no-backend", "button", None),
+        ];
+        let (nodes, _) = project_ax_nodes(&raw_nodes, Some(&dom));
+        let by_name = nodes
+            .iter()
+            .map(|node| (node.name.as_deref().unwrap_or(""), node))
+            .collect::<HashMap<_, _>>();
+        let actions = |name: &str| by_name[name].capability.action_names();
+
+        assert_eq!(actions("text"), ["click", "input_text"]);
+        assert_eq!(actions("search"), ["click", "input_text"]);
+        assert_eq!(actions("email"), ["click", "input_text"]);
+        assert_eq!(actions("password"), ["click", "input_text"]);
+        assert_eq!(actions("checkbox"), ["click"]);
+        assert!(actions("hidden").is_empty());
+        assert_eq!(actions("notes"), ["click", "input_text"]);
+        assert_eq!(actions("number"), ["set_value"]);
+        assert_eq!(actions("range"), ["set_value"]);
+        assert_eq!(actions("date"), ["set_value"]);
+        assert_eq!(actions("month"), ["set_value"]);
+        assert_eq!(actions("time"), ["set_value"]);
+        assert_eq!(actions("local"), ["set_value"]);
+        assert_eq!(actions("color"), ["set_value"]);
+        assert!(actions("date-part").is_empty());
+        assert!(actions("date-picker").is_empty());
+        assert_eq!(by_name["date-part"].backend_node_id, Some(44));
+        assert_eq!(actions("file"), ["upload_file"]);
+        assert_eq!(actions("select"), ["select_option"]);
+        assert!(actions("alpha").is_empty());
+        assert!(actions("aria-spin").is_empty());
+        assert!(actions("aria-slider").is_empty());
+        assert!(actions("shadow-spin").is_empty());
+        assert_eq!(actions("button"), ["click"]);
         assert!(
-            !is_actionable("option"),
-            "native option nodes are semantic choices; the owning combobox carries select_option authority"
+            actions("plain-anchor").is_empty(),
+            "DOM classification must not expand a non-link anchor beyond its accessibility semantics"
         );
+        assert_eq!(actions("link"), ["click"]);
+        assert_eq!(actions("shadow-button"), ["click"]);
+        assert!(
+            actions("legacy-button").is_empty(),
+            "a node omitted from a successful DOM index does not regain click"
+        );
+        assert!(actions("legacy-datetime").is_empty());
+        assert!(actions("detached-date").is_empty());
+        assert!(actions("no-backend").is_empty());
+        assert_eq!(by_name["no-backend"].backend_node_id, None);
+
+        let week_hosts = nodes
+            .iter()
+            .filter(|node| node.capability.exact_value && node.backend_node_id == Some(61))
+            .collect::<Vec<_>>();
+        assert_eq!(week_hosts.len(), 1, "one missing owner is projected once");
+        assert_eq!(week_hosts[0].role, "DateTime");
+        assert_eq!(week_hosts[0].name.as_deref(), Some("Week"));
+        assert_eq!(week_hosts[0].value.as_deref(), Some("2026-W12"));
+        assert_eq!(week_hosts[0].capability.action_names(), ["set_value"]);
+        assert!(nodes.iter().any(|node| {
+            node.name.as_deref() == Some("week-part-a")
+                && node.role == "spinbutton"
+                && node.backend_node_id == Some(65)
+                && node.capability.action_names().is_empty()
+        }));
+        assert!(nodes.iter().any(|node| {
+            node.name.as_deref() == Some("week-part-b")
+                && node.role == "button"
+                && node.backend_node_id == Some(67)
+                && node.capability.action_names().is_empty()
+        }));
+    }
+
+    #[test]
+    fn failed_dom_query_keeps_ordinary_controls_and_drops_shadow_pickers() {
+        let raw_nodes = vec![
+            ax_child("root", "RootWebArea", Some(1), None),
+            ax_child("Continue", "button", Some(2), Some("ax-root")),
+            ax_child("Name", "textbox", Some(3), Some("ax-root")),
+            ax_child("When", "Date", Some(10), Some("ax-root")),
+            ax_child("picker", "button", Some(11), Some("ax-When")),
+            ax_child("year", "spinbutton", Some(12), Some("ax-When")),
+            ax_child("Author shadow", "button", Some(20), Some("ax-root")),
+            ax_child("Month", "DateTime", Some(30), Some("ax-root")),
+        ];
+        let (nodes, _) = project_ax_nodes(&raw_nodes, None);
+        let by_name = nodes
+            .iter()
+            .filter_map(|node| node.name.as_deref().map(|name| (name, node)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_name["Continue"].capability.action_names(), ["click"]);
+        assert_eq!(
+            by_name["Name"].capability.action_names(),
+            ["click", "input_text"]
+        );
+        assert_eq!(
+            by_name["Author shadow"].capability.action_names(),
+            ["click"]
+        );
+        assert!(by_name["picker"].capability.action_names().is_empty());
+        assert_eq!(by_name["picker"].backend_node_id, Some(11));
+        assert!(by_name["year"].capability.action_names().is_empty());
+        assert!(by_name["When"].capability.action_names().is_empty());
+        assert_eq!(by_name["Month"].capability.action_names(), ["click"]);
+    }
+
+    #[test]
+    fn depth_truncated_shadow_tree_does_not_click_the_picker() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 1,
+                "children": [
+                    json!({
+                        "nodeType": 1,
+                        "localName": "input",
+                        "backendNodeId": 40,
+                        "attributes": ["type", "date", "aria-label", "When"]
+                    }),
+                    {"nodeType": 1, "localName": "button", "backendNodeId": 200},
+                    {
+                        "nodeType": 1,
+                        "localName": "ua-like",
+                        "backendNodeId": 201,
+                        "shadowRoots": [{
+                            "nodeType": 11,
+                            "shadowRootType": "open",
+                            "children": [
+                                {"nodeType": 1, "localName": "button", "backendNodeId": 124}
+                            ]
+                        }]
+                    }
+                ]
+            }]
+        });
+        let raw_nodes = vec![
+            ax_child("root", "RootWebArea", Some(1), None),
+            ax_child("When", "Date", Some(40), Some("ax-root")),
+            ax_child("picker", "button", Some(49), Some("ax-When")),
+            ax_child("Continue", "button", Some(200), Some("ax-root")),
+            ax_child("Author shadow", "button", Some(124), Some("ax-root")),
+        ];
+        let (nodes, _) = project_ax_nodes(&raw_nodes, Some(&dom));
+        let by_name = nodes
+            .iter()
+            .filter_map(|node| node.name.as_deref().map(|name| (name, node)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_name["When"].capability.action_names(), ["set_value"]);
+        assert_eq!(by_name["When"].backend_node_id, Some(40));
+        assert!(by_name["picker"].capability.action_names().is_empty());
+        assert_eq!(by_name["picker"].role, "button");
+        assert_eq!(by_name["picker"].backend_node_id, Some(49));
+        assert_eq!(by_name["Continue"].capability.action_names(), ["click"]);
+        assert_eq!(
+            by_name["Author shadow"].capability.action_names(),
+            ["click"]
+        );
+    }
+
+    fn input(backend_node_id: i64, input_type: &str, shadow_children: Value) -> Value {
+        let mut node = json!({
+            "nodeType": 1,
+            "localName": "input",
+            "backendNodeId": backend_node_id,
+            "attributes": ["type", input_type]
+        });
+        if shadow_children
+            .as_array()
+            .is_some_and(|children| !children.is_empty())
+        {
+            node["shadowRoots"] = json!([{
+                "nodeType": 11,
+                "shadowRootType": "user-agent",
+                "children": shadow_children
+            }]);
+        }
+        node
+    }
+
+    fn ax(name: &str, role: &str, backend_node_id: Option<i64>) -> Value {
+        ax_child(name, role, backend_node_id, None)
+    }
+
+    fn ax_child(
+        name: &str,
+        role: &str,
+        backend_node_id: Option<i64>,
+        parent_id: Option<&str>,
+    ) -> Value {
+        let mut node = json!({
+            "nodeId": format!("ax-{name}"),
+            "role": {"value": role},
+            "name": {"value": name}
+        });
+        if let Some(backend_node_id) = backend_node_id {
+            node["backendDOMNodeId"] = json!(backend_node_id);
+        }
+        if let Some(parent_id) = parent_id {
+            node["parentId"] = json!(parent_id);
+        }
+        node
     }
 
     fn fake_cdp_server(reply: Option<Value>) -> (Url, thread::JoinHandle<()>) {
@@ -1491,7 +2887,7 @@ Connection: close
 
     #[test]
     fn ax_form_metadata_extracts_group_and_control_state() {
-        let raw_nodes = vec![
+        let raw_nodes = [
             json!({
                 "nodeId":"group-1",
                 "role":{"value":"group"},
@@ -1535,6 +2931,32 @@ Connection: close
         assert_eq!(ax_property_bool(&raw_nodes[2], "required"), Some(true));
         assert_eq!(ax_property_bool(&raw_nodes[2], "disabled"), Some(false));
         assert_eq!(ax_property_bool(&raw_nodes[2], "readonly"), None);
+    }
+
+    #[test]
+    fn ax_snapshot_parser_keeps_late_actionable_nodes_for_compaction() {
+        let mut raw_nodes = (0..=MAX_SNAPSHOT_NODES)
+            .map(|index| {
+                json!({
+                    "nodeId": format!("static-{index}"),
+                    "role": {"value": "paragraph"},
+                    "name": {"value": format!("Static {index}")},
+                })
+            })
+            .collect::<Vec<_>>();
+        raw_nodes.push(json!({
+            "nodeId": "late-action",
+            "role": {"value": "button"},
+            "name": {"value": "Continue"},
+            "backendDOMNodeId": 4242,
+        }));
+
+        let (nodes, truncated) = project_ax_nodes(&raw_nodes, None);
+        assert!(truncated);
+        let late = nodes.last().expect("late actionable node retained");
+        assert_eq!(late.name.as_deref(), Some("Continue"));
+        assert_eq!(late.capability.action_names(), ["click"]);
+        assert_eq!(late.backend_node_id, Some(4242));
     }
 
     #[test]
@@ -1631,10 +3053,7 @@ Connection: close
             started.elapsed() < Duration::from_millis(600),
             "non-matching CDP events must not renew the request deadline"
         );
-        assert!(matches!(
-            error.kind,
-            "cdp_receive_timeout" | "cdp_receive_failed"
-        ));
+        assert_eq!(error.kind, "cdp_receive_timeout");
         handle.join().unwrap();
     }
 
@@ -1704,6 +3123,305 @@ Connection: close
     }
 
     #[test]
+    fn closed_diagnostic_stream_is_not_reported_as_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            websocket.close(None).unwrap();
+        });
+        let endpoint = Url::parse(&format!(
+            "ws://127.0.0.1:{}/devtools/page/closed-diagnostics",
+            address.port()
+        ))
+        .unwrap();
+        let websocket =
+            open_loopback_websocket(&endpoint, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut collector = CdpEventCollector {
+            websocket,
+            events: CdpEventBuffer::default(),
+        };
+        collector.events.push_console(BackendConsoleEntry {
+            sequence: 0,
+            level: "error".into(),
+            text: "stale-buffer".into(),
+            source: None,
+            timestamp: None,
+        });
+        let error = drain_event_collector(&mut collector).unwrap_err();
+        assert_eq!(error.kind, "cdp_receive_closed");
+        assert_eq!(
+            error.execution_state,
+            crate::types::ExecutionState::Completed
+        );
+        assert_eq!(error.recovery_action, Some("pages"));
+        assert_eq!(collector.events.console.len(), 1);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn diagnostic_event_metadata_is_byte_bounded() {
+        let mut buffer = CdpEventBuffer::default();
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Runtime.exceptionThrown",
+                "params": {
+                    "exceptionDetails": {
+                        "text": "boom",
+                        "url": format!("https://example.test/{}", "x".repeat(crate::types::MAX_URL_BYTES * 2)),
+                    }
+                }
+            }),
+        );
+        let console = buffer.console.back().unwrap();
+        assert!(console.source.as_ref().unwrap().len() <= crate::types::MAX_URL_BYTES);
+
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "bounded-metadata",
+                    "request": {
+                        "method": "M".repeat(512),
+                        "url": "https://example.test/",
+                    },
+                    "type": "T".repeat(512),
+                }
+            }),
+        );
+        let network = buffer.network.get("bounded-metadata").unwrap();
+        assert!(network.method.len() <= 128);
+        assert!(network.resource_type.as_ref().unwrap().len() <= 64);
+    }
+
+    #[test]
+    fn clear_diagnostics_uses_cdp_barrier_before_resetting_buffer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            let request = websocket.read().unwrap();
+            let Message::Text(request) = request else {
+                panic!("expected clear barrier request");
+            };
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "Page.getFrameTree");
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "method": "Runtime.consoleAPICalled",
+                        "params": {"type": "error", "args": [{"value": "before-clear"}]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({"id": request["id"], "result": {"frameTree": {}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    json!({
+                        "method": "Runtime.consoleAPICalled",
+                        "params": {"type": "error", "args": [{"value": "after-clear"}]}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        let endpoint = Url::parse(&format!(
+            "ws://127.0.0.1:{}/devtools/page/clear",
+            address.port()
+        ))
+        .unwrap();
+        let websocket =
+            open_loopback_websocket(&endpoint, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut collector = CdpEventCollector {
+            websocket,
+            events: CdpEventBuffer::default(),
+        };
+        collector.events.push_console(BackendConsoleEntry {
+            sequence: 0,
+            level: "error".into(),
+            text: "buffered-before-clear".into(),
+            source: None,
+            timestamp: None,
+        });
+        let mut next_id = 1;
+        clear_event_collector(&mut collector, &mut next_id).unwrap();
+        assert!(collector.events.console.is_empty());
+        drain_event_collector(&mut collector).unwrap();
+        assert_eq!(collector.events.console.len(), 1);
+        assert_eq!(
+            collector.events.console.front().unwrap().text,
+            "after-clear"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn clear_diagnostics_barrier_failure_is_not_started_and_preserves_buffer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut websocket = accept(stream).unwrap();
+            let _ = websocket.read().unwrap();
+            // Close without acknowledging the read-only barrier. The diagnostic
+            // reset has not happened, so the caller must see a pre-effect failure.
+        });
+        let endpoint = Url::parse(&format!(
+            "ws://127.0.0.1:{}/devtools/page/clear-failure",
+            address.port()
+        ))
+        .unwrap();
+        let websocket =
+            open_loopback_websocket(&endpoint, Instant::now() + Duration::from_secs(1)).unwrap();
+        let mut collector = CdpEventCollector {
+            websocket,
+            events: CdpEventBuffer::default(),
+        };
+        collector.events.push_console(BackendConsoleEntry {
+            sequence: 0,
+            level: "error".into(),
+            text: "must-survive-failed-clear".into(),
+            source: None,
+            timestamp: None,
+        });
+        let mut next_id = 1;
+        let error = clear_event_collector(&mut collector, &mut next_id).unwrap_err();
+        assert_eq!(
+            error.execution_state,
+            crate::types::ExecutionState::NotStarted
+        );
+        assert_eq!(collector.events.console.len(), 1);
+        assert_eq!(
+            collector.events.console.front().unwrap().text,
+            "must-survive-failed-clear"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn diagnostic_event_buffers_roll_forward_instead_of_freezing_at_capacity() {
+        let mut buffer = CdpEventBuffer::default();
+        for index in 0..crate::types::MAX_CONSOLE_ENTRIES + 2 {
+            record_cdp_event(
+                &mut buffer,
+                &json!({
+                    "method": "Runtime.consoleAPICalled",
+                    "params": {
+                        "type": if index + 1 == crate::types::MAX_CONSOLE_ENTRIES + 2 { "error" } else { "log" },
+                        "args": [{"value": format!("console-{index}")}],
+                        "timestamp": index as f64,
+                    }
+                }),
+            );
+        }
+        assert_eq!(buffer.console.len(), crate::types::MAX_CONSOLE_ENTRIES);
+        assert!(buffer.console_truncated);
+        assert_eq!(buffer.console.front().unwrap().text, "console-2");
+        assert_eq!(
+            buffer.console.back().unwrap().level,
+            "error",
+            "a late error must not be starved by earlier benign console traffic"
+        );
+
+        for index in 0..crate::types::MAX_NETWORK_ENTRIES + 2 {
+            record_cdp_event(
+                &mut buffer,
+                &json!({
+                    "method": "Network.requestWillBeSent",
+                    "params": {
+                        "requestId": format!("request-{index}"),
+                        "request": {"method": "GET", "url": format!("https://example.test/{index}")},
+                        "type": "Fetch",
+                        "timestamp": index as f64,
+                    }
+                }),
+            );
+        }
+        assert_eq!(buffer.network.len(), crate::types::MAX_NETWORK_ENTRIES);
+        assert!(buffer.network_truncated);
+        assert!(!buffer.network.contains_key("request-0"));
+        assert!(!buffer.network.contains_key("request-1"));
+        let latest = format!("request-{}", crate::types::MAX_NETWORK_ENTRIES + 1);
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Network.loadingFailed",
+                "params": {"requestId": latest, "errorText": "late failure"}
+            }),
+        );
+        assert_eq!(
+            buffer
+                .network
+                .get(&format!(
+                    "request-{}",
+                    crate::types::MAX_NETWORK_ENTRIES + 1
+                ))
+                .and_then(|entry| entry.failed_reason.as_deref()),
+            Some("late failure"),
+            "a late failed request must remain diagnosable after the buffer fills"
+        );
+    }
+
+    #[test]
+    fn console_activity_does_not_reset_network_quiet_cursor() {
+        let mut buffer = CdpEventBuffer::default();
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Network.requestWillBeSent",
+                "params": {
+                    "requestId": "request-1",
+                    "request": {"method": "GET", "url": "https://example.test/api"},
+                    "type": "Fetch",
+                    "timestamp": 1.0,
+                }
+            }),
+        );
+        let network_cursor = buffer.network_cursor();
+        let event_cursor = buffer.cursor();
+
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Runtime.consoleAPICalled",
+                "params": {
+                    "type": "log",
+                    "args": [{"value": "chatty console"}],
+                    "timestamp": 2.0,
+                }
+            }),
+        );
+        assert!(buffer.cursor() > event_cursor);
+        assert_eq!(buffer.network_cursor(), network_cursor);
+
+        record_cdp_event(
+            &mut buffer,
+            &json!({
+                "method": "Network.responseReceived",
+                "params": {
+                    "requestId": "request-1",
+                    "response": {"status": 200},
+                }
+            }),
+        );
+        assert!(buffer.network_cursor() > network_cursor);
+    }
+
+    #[test]
     fn fake_cdp_close_after_effect_dispatch_is_outcome_unknown() {
         let (endpoint, handle) = fake_cdp_server(None);
         let mut next_id = 7;
@@ -1723,3 +3441,7 @@ Connection: close
         handle.join().unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "cdp/tests/transport.rs"]
+mod transport_tests;

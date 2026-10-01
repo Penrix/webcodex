@@ -2,8 +2,8 @@ use schemars::JsonSchema;
 use serde_json::{json, Map, Value};
 
 use webcodex_core::runtime_contract::{
-    ContinuationCarrier, ContinuationKind, CONTINUATION_CARRIER_VALUES, CONTINUATION_KIND_VALUES,
-    RECOVERY_KIND_VALUES,
+    ContinuationCarrier, ContinuationKind, GeneratedFollowUpKind, CONTINUATION_CARRIER_VALUES,
+    CONTINUATION_KIND_VALUES, GENERATED_FOLLOW_UP_KIND_VALUES, RECOVERY_KIND_VALUES,
 };
 use webcodex_core::workflow_session_contract::{
     SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION, SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON,
@@ -17,7 +17,7 @@ pub(super) fn validation_source_state_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "description": "Source freshness is independent of execution pass/fail. V1 never proves current source: uncrossed covers only canonical potential mutation dispatches in one live Control Project epoch, not external/process writes or an immutable snapshot. This is an observation, not a reusable currentness certificate.",
+        "description": "Never certifies current source, regardless of execution outcome. Uncrossed covers only canonical potential mutation dispatches in one live Control Project epoch, not external/process writes or an immutable snapshot.",
         "properties": {
             "freshness": {"type": "string", "enum": ["unproven", "stale"]},
             "observed_mutation_fence": {"type": "string", "enum": ["uncrossed", "crossed", "unknown"]},
@@ -111,22 +111,26 @@ pub fn continuation_semantics_schema(
 }
 
 /// Schema for an advisory parser-ready next tool call. The shape never grants
-/// authority or executes the tool; domain schemas remain responsible for the
-/// bounded argument contract.
+/// authority or executes the tool. follow_up_kind is intentionally first-class
+/// because it changes whether a Host may continue mechanically without a new
+/// model decision. Domain schemas remain responsible for bounded arguments.
 pub fn suggested_tool_call_schema(
+    follow_up_kind: GeneratedFollowUpKind,
     tool: &'static str,
     arguments: Value,
     description: &str,
 ) -> Value {
+    debug_assert!(GENERATED_FOLLOW_UP_KIND_VALUES.contains(&follow_up_kind.as_str()));
     json!({
         "type": "object",
         "description": description,
         "additionalProperties": false,
         "properties": {
+            "follow_up_kind": {"type": "string", "const": follow_up_kind.as_str()},
             "tool": {"type": "string", "const": tool},
             "arguments": arguments
         },
-        "required": ["tool", "arguments"]
+        "required": ["follow_up_kind", "tool", "arguments"]
     })
 }
 
@@ -134,8 +138,8 @@ pub fn suggested_tool_call_schema(
 ///
 /// This is intentionally structural rather than a model-visible marker keyword:
 /// adapters use it to project only formally declared action edges and never scan
-/// arbitrary tool output for user/plugin objects that happen to contain `tool`
-/// and `arguments` keys.
+/// arbitrary tool output for user/plugin objects that happen to contain tool
+/// and arguments keys.
 pub fn suggested_tool_call_schema_target(schema: &Value) -> Option<&str> {
     if schema.get("type").and_then(Value::as_str) != Some("object")
         || schema.get("additionalProperties").and_then(Value::as_bool) != Some(false)
@@ -143,18 +147,28 @@ pub fn suggested_tool_call_schema_target(schema: &Value) -> Option<&str> {
         return None;
     }
     let properties = schema.get("properties")?.as_object()?;
-    if properties.len() != 2
+    if properties.len() != 3
+        || !properties.contains_key("follow_up_kind")
         || !properties.contains_key("tool")
         || !properties.contains_key("arguments")
     {
         return None;
     }
     let required = schema.get("required")?.as_array()?;
-    if required.len() != 2
+    if required.len() != 3
+        || !required
+            .iter()
+            .any(|field| field.as_str() == Some("follow_up_kind"))
         || !required.iter().any(|field| field.as_str() == Some("tool"))
         || !required
             .iter()
             .any(|field| field.as_str() == Some("arguments"))
+    {
+        return None;
+    }
+    let follow_up_kind = properties.get("follow_up_kind")?;
+    if follow_up_kind.get("type").and_then(Value::as_str) != Some("string")
+        || !GENERATED_FOLLOW_UP_KIND_VALUES.contains(&follow_up_kind.get("const")?.as_str()?)
     {
         return None;
     }
@@ -164,7 +178,6 @@ pub fn suggested_tool_call_schema_target(schema: &Value) -> Option<&str> {
     }
     tool.get("const").and_then(Value::as_str)
 }
-
 pub fn job_activity_schema() -> Value {
     json!({
         "anyOf": [
@@ -200,6 +213,7 @@ pub fn job_activity_schema() -> Value {
 
 pub fn observe_job_continuation_schema() -> Value {
     suggested_tool_call_schema(
+        GeneratedFollowUpKind::FallbackRecovery,
         "observe_jobs",
         json!({
             "type": "object",
@@ -225,7 +239,6 @@ pub fn observe_job_continuation_schema() -> Value {
                 },
                 "wait_secs": {
                     "type": "integer",
-                    "const": webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS,
                     "minimum": 1,
                     "maximum": webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
                 },
@@ -558,6 +571,206 @@ pub fn recovery_kind_schema() -> Value {
     })
 }
 
+fn passive_failure_diagnostics_schema() -> Value {
+    use webcodex_core::validation_evidence::{PASSIVE_MAX_DIAGNOSTICS, PASSIVE_MAX_FAILED_TESTS};
+    let mut schema = super::testing::cargo_test_diagnostics_schema(
+        "Safe parser evidence, at most 8 KiB. For missing/truncated evidence use observe_jobs.",
+    );
+    let fields = schema["properties"].as_object_mut().unwrap();
+    for field in [
+        "parser",
+        "reason",
+        "invalid_diagnostics_omitted",
+        "truncated",
+    ] {
+        fields.remove(field);
+    }
+    fields.get_mut("diagnostics").unwrap()["maxItems"] = json!(PASSIVE_MAX_DIAGNOSTICS);
+    fields.get_mut("returned_diagnostic_count").unwrap()["maximum"] =
+        json!(PASSIVE_MAX_DIAGNOSTICS);
+    fields.get_mut("failed_test_details").unwrap()["maxItems"] = json!(PASSIVE_MAX_FAILED_TESTS);
+    // The generic decoration appears on many schemas; retain selection/bounds
+    // in one description instead of repeating full explicit-observation prose.
+    for field in fields.values_mut() {
+        if let Some(object) = field.as_object_mut() {
+            object.remove("description");
+        }
+    }
+    // Count names already express these facts; do not repeat them in each
+    // embedded passive schema alongside the explicit-observation descriptions.
+    if let Some(counts) = fields.get_mut("test_summary").unwrap()["properties"].as_object_mut() {
+        for count in counts.values_mut() {
+            count.as_object_mut().unwrap().remove("description");
+        }
+    }
+    schema["required"] = json!([
+        "available",
+        "diagnostics",
+        "returned_diagnostic_count",
+        "diagnostics_truncated",
+        "failed_test_details",
+        "failed_test_details_truncated"
+    ]);
+    schema
+}
+
+pub(super) fn passive_job_attention_schema() -> Value {
+    let details = suggested_tool_call_schema(
+        GeneratedFollowUpKind::FallbackRecovery,
+        "observe_jobs",
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "job_id": {"type": "string", "minLength": 1, "maxLength": 128}
+                        },
+                        "required": ["job_id"]
+                    }
+                }
+            },
+            "required": ["items"]
+        }),
+        "Read bounded details of this Job only if passive evidence is insufficient.",
+    );
+    let validation = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Historical validation proof; source_state independently describes the mutation fence.",
+        "properties": {
+            "tool": {"type": "string", "maxLength": 64},
+            "kind": {"type": "string", "enum": ["format", "check", "test", "validation", "build", "release"]},
+            "state": {"type": "string", "enum": ["pending", "running", "completed", "timed_out", "cancelled", "lost"]},
+            "passed": nullable_schema("boolean", "Authoritative validation verdict; null is unproven."),
+            "tests_detected": nullable_schema("boolean", "Tests detected by authoritative evidence."),
+            "tests_run_count": nullable_schema("integer", "Proven executed-test count, else null."),
+            "zero_tests_run": nullable_schema("boolean", "Whether zero tests ran; null if unproven."),
+            "test_count_assertion": cargo_test_count_assertion_schema(),
+            "require_tests": {"type": "boolean"},
+            "no_run": {"type": "boolean"},
+            "validation_target_id": {"type": "string", "maxLength": 256},
+            "source_state": validation_source_state_schema(),
+            "diagnostics": passive_failure_diagnostics_schema()
+        },
+        "required": ["kind", "source_state"]
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Changed Jobs in the exact authenticated Window/Project/Workflow Session. Passive only: never starts, retries, waits or polls.",
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "job_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "tool": {"type": "string", "maxLength": 64},
+                        "status": {"type": "string", "maxLength": 64},
+                        "state": {"type": "string", "enum": ["active", "terminal"]},
+                        "recovery_state": {"type": "string", "maxLength": 64},
+                        "recovery_reason_code": {"type": "string", "maxLength": 128},
+                        "outcome": {"type": "string", "enum": ["passed", "failed", "timed_out", "cancelled"], "description": "Terminal execution outcome. Without state/status, any validation also passed; source_state never certifies current source."},
+                        "exit_code": nullable_schema("integer", "Known terminal exit code, else null."),
+                        "command_ok": nullable_schema("boolean", "Process success only; see validation for proof."),
+                        "validation": validation,
+                        "details": details
+                    },
+                    "required": ["job_id", "tool"],
+                    "oneOf": [
+                        {
+                            "required": ["status", "state"],
+                            "properties": {"validation": {"required": ["tool", "state", "passed"]}}
+                        },
+                        {
+                            "required": ["outcome"],
+                            "properties": {
+                                "outcome": {"const": "passed"},
+                                "status": {"enum": []}, "state": {"enum": []},
+                                "exit_code": {"enum": []}, "command_ok": {"enum": []}, "details": {"enum": []},
+                                "recovery_state": {"enum": []}, "recovery_reason_code": {"enum": []},
+                                "validation": {
+                                    "properties": {
+                                        "state": {"enum": []}, "passed": {"enum": []}, "diagnostics": {"enum": []},
+                                        "source_state": {
+                                            "properties": {
+                                                "freshness": {"const": "unproven"},
+                                                "observed_mutation_fence": {"const": "uncrossed"}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        "required": ["items"]
+    })
+}
+
+fn add_optional_output_property(schema: &mut Value, name: &str, property_schema: &Value) {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties
+            .entry(name.to_string())
+            .or_insert_with(|| property_schema.clone());
+    } else if schema.get("additionalProperties").and_then(Value::as_bool) == Some(false) {
+        let mut properties = Map::new();
+        properties.insert(name.to_string(), property_schema.clone());
+        schema["properties"] = Value::Object(properties);
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = schema.get_mut(keyword).and_then(Value::as_array_mut) {
+            for branch in branches {
+                add_optional_output_property(branch, name, property_schema);
+            }
+        }
+    }
+    for keyword in ["then", "else"] {
+        if let Some(branch) = schema.get_mut(keyword) {
+            add_optional_output_property(branch, name, property_schema);
+        }
+    }
+}
+
+pub(super) fn add_passive_job_attention_to_envelope(schema: &mut Value) {
+    let attention = passive_job_attention_schema();
+    add_passive_job_attention_to_envelope_with_schema(schema, &attention);
+}
+
+fn add_passive_job_attention_to_envelope_with_schema(schema: &mut Value, attention: &Value) {
+    if let Some(output) = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("output"))
+    {
+        add_optional_output_property(output, "job_attention", attention);
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = schema.get_mut(keyword).and_then(Value::as_array_mut) {
+            for branch in branches {
+                add_passive_job_attention_to_envelope_with_schema(branch, attention);
+            }
+        }
+    }
+    for keyword in ["then", "else"] {
+        if let Some(branch) = schema.get_mut(keyword) {
+            add_passive_job_attention_to_envelope_with_schema(branch, attention);
+        }
+    }
+}
+
 pub fn wrapped_output_schema(output_properties: Vec<(&str, Value)>) -> Value {
     let properties = output_properties
         .into_iter()
@@ -657,14 +870,14 @@ pub fn cargo_test_count_assertion_schema() -> Value {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": webcodex_core::runner_protocol::CARGO_TEST_MIN_TESTS_MAX,
-                "description": "Effective caller-requested minimum after combining require_tests and min_tests."
+                "description": "Caller minimum combining require_tests and min_tests."
             },
             "actual_tests_run": {
                 "anyOf": [
                     {"type": "integer", "minimum": 0},
                     {"type": "null"}
                 ],
-                "description": "Proven executed test count, or null when complete count evidence was unavailable."
+                "description": "Proven executed count; null if complete count evidence is unavailable."
             },
             "status": {
                 "type": "string",
@@ -677,7 +890,7 @@ pub fn cargo_test_count_assertion_schema() -> Value {
             "evidence_reason_code": {
                 "type": "string",
                 "enum": ["complete_summary", "output_truncated", "partial_harness_summary", "no_complete_summary", "incomplete_stream"],
-                "description": "Why executed-test count evidence was proven or remained unavailable; this refines evidence diagnostics without changing the assertion verdict."
+                "description": "Why count evidence is proven/unavailable; diagnostic only, never changes the verdict."
             }
         },
         "required": ["minimum_tests", "actual_tests_run", "status", "reason_code", "evidence_reason_code"]
@@ -719,6 +932,23 @@ pub fn continuation_feedback_schema(description: &str) -> Value {
                 }
             }
         ]
+    })
+}
+
+pub(super) fn external_observation_schema(description: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": description,
+        "properties": {
+            "adapter_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+            "event_id": {"type": "string", "pattern": "^[0-9a-f]{64}$", "maxLength": 64},
+            "tool": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "maxLength": 64},
+            "exit_code": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            "recorded_at": {"type": "integer"},
+            "status": {"type": "string", "enum": ["unknown", "reported_success", "reported_failure"]}
+        },
+        "required": ["adapter_id", "event_id", "tool", "exit_code", "recorded_at", "status"]
     })
 }
 
@@ -793,6 +1023,67 @@ pub fn handoff_brief_schema(description: &str) -> Value {
             "minimum": 0
         }))
     };
+    let message_notes = || {
+        json!({
+            "type": "object",
+            "description": "Newest retained explicitly recorded Session notes. Reports are context, not execution/completion proof or new authority. A null total means the discussion snapshot was unavailable; truncation is explicit and this is not a full transcript.",
+            "additionalProperties": false,
+            "properties": {
+                "total": nullable_count(),
+                "returned": {"type": "integer", "minimum": 0, "maximum": 5},
+                "truncated": {"type": "boolean"},
+                "items": {
+                    "type": "array", "maxItems": 5,
+                    "items": {
+                        "type": "object", "additionalProperties": false,
+                        "properties": {
+                            "message_id": {"type": "string", "maxLength": 128},
+                            "status": {"type": "string", "enum": ["open", "resolved"]},
+                            "created_at": {"type": "integer"},
+                            "excerpt": {"type": "string", "maxLength": 600},
+                            "truncated": {"type": "boolean"},
+                            "superseded_by_message_id": nullable_with(json!({"type": "string", "maxLength": 128}))
+                        },
+                        "required": ["message_id", "status", "created_at", "excerpt", "truncated", "superseded_by_message_id"]
+                    }
+                }
+            },
+            "required": ["total", "returned", "truncated", "items"]
+        })
+    };
+    let external_observations = json!({
+        "type": "object",
+        "description": "Retained external claims for the exact output project and handoff Session. These reports never become native execution, validation, Goal, or completion evidence. Last five by server timestamp then identity; source order and capture completeness are unproven.",
+        "additionalProperties": false,
+        "properties": {
+            "status": {"type": "string", "enum": ["available", "unavailable"]},
+            "reason_code": nullable_with(json!({
+                "type": "string",
+                "enum": ["session_project_unavailable", "store_unavailable", "projection_unavailable"]
+            })),
+            "provenance": {"type": "string", "const": "external_report"},
+            "coverage": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "complete": {"type": "boolean", "const": false},
+                    "reason": {"type": "string", "enum": ["source_sequence_unavailable", "read_unavailable"]},
+                    "ordering": {"type": "string", "const": "server_recorded_at_then_identity"}
+                },
+                "required": ["complete", "reason", "ordering"]
+            },
+            "total": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 256})),
+            "returned": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 5})),
+            "truncated": nullable_bool(),
+            "unknown_count": nullable_with(json!({"type": "integer", "minimum": 0, "maximum": 256})),
+            "observations": nullable_with(json!({
+                "type": "array",
+                "maxItems": 5,
+                "items": external_observation_schema("Untrusted external report with exact adapter and event identity.")
+            }))
+        },
+        "required": ["status", "reason_code", "provenance", "coverage", "total", "returned", "truncated", "unknown_count", "observations"]
+    });
 
     json!({
         "type": "object",
@@ -827,9 +1118,11 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                 "additionalProperties": false,
                 "properties": {
                     "root_instruction": instruction_schema("The Workflow Session root instruction. It remains separate from later accepted task instructions."),
-                    "latest_instruction": instruction_schema("The latest retained task_instruction event. The same excerpt is returned when it equals the root instruction.")
+                    "latest_instruction": instruction_schema("The latest retained task_instruction event. The same excerpt is returned when it equals the root instruction."),
+                    "decisions": message_notes(),
+                    "recent_progress": message_notes()
                 },
-                "required": ["root_instruction", "latest_instruction"]
+                "required": ["root_instruction", "latest_instruction", "decisions", "recent_progress"]
             },
             "workspace": {
                 "type": "object",
@@ -919,6 +1212,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                 },
                 "required": ["status", "open_failures", "reason_code"]
             },
+            "external_observations": external_observations,
             "attention": {
                 "type": "object",
                 "description": "Proven workspace, Job, and open guidance counts. Null means the corresponding evidence was unavailable.",
@@ -958,13 +1252,15 @@ pub fn handoff_brief_schema(description: &str) -> Value {
                     "complete": schema_type("boolean", "True only when no fixed evidence-gap reason applies."),
                     "reason_codes": {
                         "type": "array",
-                        "maxItems": 9,
+                        "maxItems": 11,
                         "uniqueItems": true,
                         "items": {
                             "type": "string",
                             "enum": [
                                 "attempt_boundary_evicted",
                                 "continuation_unavailable",
+                                "discussion_unavailable",
+                                "external_observations_changed_during_snapshot",
                                 "guidance_unavailable",
                                 "job_summary_unavailable",
                                 "session_changed_during_snapshot",
@@ -989,7 +1285,7 @@ pub fn handoff_brief_schema(description: &str) -> Value {
         },
         "required": [
             "version", "session", "task", "workspace", "progress",
-            "validation", "attention", "next_actions", "basis",
+            "validation", "external_observations", "attention", "next_actions", "basis",
             "deterministic", "llm_summary"
         ]
     })

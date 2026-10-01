@@ -33,6 +33,7 @@ async fn oauth_mcp_service_with_plugin_runner(
         .runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 client_id: "oauth-plugin-runner".to_string(),
                 runner_instance_id: "oauth-plugin-runner-instance".to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -722,15 +723,15 @@ async fn oauth2_mcp_detached_process_requires_job_run_and_job_detach() {
             &service,
             &token,
             "tools/call",
-            json!({
-                "name": "run_detached_process",
-                "arguments": {
+            adaptive_runtime_gateway_params(
+                "run_detached_process",
+                json!({
                     "project": "demo",
                     "idempotency_key": "oauth-detached-scope",
                     "executable": "argv-helper",
                     "args": []
-                }
-            }),
+                }),
+            ),
         )
         .await;
         assert_mcp_oauth_scope_rejected(status, &body, challenge.as_deref(), Some(missing));
@@ -741,15 +742,15 @@ async fn oauth2_mcp_detached_process_requires_job_run_and_job_detach() {
         &service,
         &token,
         "tools/call",
-        json!({
-            "name": "run_detached_process",
-            "arguments": {
+        adaptive_runtime_gateway_params(
+            "run_detached_process",
+            json!({
                 "project": "demo",
                 "idempotency_key": "oauth-detached-both",
                 "executable": "argv-helper",
                 "args": []
-            }
-        }),
+            }),
+        ),
     )
     .await;
     assert_ne!(status, StatusCode::FORBIDDEN, "body: {:?}", body);

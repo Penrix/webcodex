@@ -1,5 +1,88 @@
 use super::*;
 
+#[tokio::test]
+async fn discovery_materializes_only_the_requested_contract_shape() {
+    use crate::tool_runtime::kernel::ToolProtocolCapabilities;
+    use webcodex_tool_contracts::take_tool_materialization_counts_for_test as take_counts;
+    let runtime = test_runtime();
+    take_counts();
+    let exact = runtime
+        .tool_manifest(
+            Some("run_process".into()),
+            None,
+            None,
+            false,
+            false,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(exact.success, "{:?}", exact.error);
+    assert_eq!(
+        take_counts(),
+        (1, 0),
+        "exact discovery projects one input and no outputs"
+    );
+    assert_eq!(
+        exact.output["contract"]["input_schema"],
+        webcodex_tool_contracts::input_schema_for_tool("run_process")
+    );
+    let category = runtime
+        .tool_manifest(
+            None,
+            Some("execution".into()),
+            None,
+            false,
+            true,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(category.success);
+    assert!(category.output["count"].as_u64().unwrap() > 0);
+    assert_eq!(take_counts(), (0, 0));
+    let mut projected = category;
+    crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut projected);
+    assert_eq!(
+        take_counts(),
+        (0, 0),
+        "description lookup must not rebuild full specs"
+    );
+    let hidden = runtime
+        .tool_manifest(
+            Some("memory_read".into()),
+            None,
+            None,
+            false,
+            false,
+            ToolProtocolCapabilities::default(),
+        )
+        .await;
+    assert!(
+        !hidden.success,
+        "metadata must not grant extension admission"
+    );
+    assert_eq!(take_counts(), (0, 0));
+    let summary = runtime.list_tools_payload(crate::tool_runtime::tool_inputs::ListToolsOptions {
+        category: None,
+        features: None,
+        limit: Some(1),
+        summary_only: true,
+    });
+    assert_eq!(summary["count"], 1);
+    assert_eq!(take_counts(), (0, 0));
+    let full = runtime.list_tools_payload(crate::tool_runtime::tool_inputs::ListToolsOptions {
+        category: None,
+        features: None,
+        limit: Some(1),
+        summary_only: false,
+    });
+    assert_eq!(full["count"], 1);
+    assert_eq!(
+        take_counts(),
+        (1, 1),
+        "full list must select before materializing"
+    );
+}
+
 #[cfg(feature = "experimental-code-mode")]
 use std::collections::HashMap;
 #[cfg(feature = "experimental-code-mode")]
@@ -11,7 +94,7 @@ use webcodex_code_mode::{
 };
 
 #[tokio::test]
-async fn stop_job_manifest_remains_one_direct_canonical_mutation() {
+async fn stop_job_manifest_remains_one_gateway_canonical_mutation() {
     let mut result = test_runtime()
         .dispatch(ToolCall::ToolManifest {
             tool_name: Some("stop_job".into()),
@@ -24,7 +107,13 @@ async fn stop_job_manifest_remains_one_direct_canonical_mutation() {
     assert!(result.success, "{:?}", result.error);
     crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut result);
     assert_eq!(result.output["name"], "stop_job");
-    assert_eq!(result.output["route"]["mode"], "direct");
+    assert_eq!(result.output["route"]["primary"]["mode"], "gateway");
+    assert_eq!(
+        result.output["route"]["primary"]["tool"],
+        "call_runtime_tool"
+    );
+    assert_eq!(result.output["route"]["primary"]["target"], "stop_job");
+    assert!(result.output["route"]["fallback"].is_null());
     assert_eq!(result.output["effect"], "mutate");
     assert_eq!(result.output["idempotency"], "desired_state");
     assert_eq!(
@@ -155,9 +244,9 @@ impl CodeModeHost for CallableExampleHost {
                     "execution_state": "running",
                     "terminal": false,
                     "job_id": "wc_job_example",
-                    "continuation": {"tool": "observe_jobs", "arguments": {}}
+                    "continuation": {"follow_up_kind": "fallback_recovery", "tool": "observe_jobs", "arguments": {}}
                 }),
-                "apply_text_edits" => json!({
+                "edit_project_files" => json!({
                     "state_changed": true,
                     "execution_state": "completed",
                     "error_kind": null,
@@ -459,249 +548,58 @@ fn assert_no_response_too_large(surface: &str, payload: &Value) {
     );
 }
 
-fn allowed_tool_definition_categories_for_discovery_group(group: &str) -> &'static [&'static str] {
-    match group {
-        "checkpoint" => &["checkpoint"],
-        "cleanup" => &["checkpoint", "cleanup"],
-        "coding_agent" => &["coding_agent"],
-        "agent_task" => &["agent_task"],
-        "agent_wait" => &["agent_wait"],
-        "communication" => &["communication"],
-        "edit" => &["artifact", "edit", "patch"],
-        "file_transfer" => &["artifact"],
-        "git" => &["checkpoint", "cleanup", "file", "git"],
-        "goal" => &["goal"],
-        "inspect" => &[
-            "browser",
-            "checkpoint",
-            "computer",
-            "file",
-            "git",
-            "job",
-            "lsp",
-            "project",
-            "runtime",
-            "session",
-            "workflow",
-        ],
-        "jobs" => &["job"],
-        "patch" => &["patch"],
-        "projects" => &["project"],
-        "review" => &["checkpoint", "cleanup", "file", "git", "workflow"],
-        "runtime" => &["checkpoint", "project", "runtime", "session", "workflow"],
-        "shell" => &["job", "validation"],
-        "validation" => &["validation"],
-        other => panic!("missing discovery group category allowlist for {other}"),
-    }
-}
-
-fn expected_cross_listed_discovery_groups(tool: &str) -> Option<&'static [&'static str]> {
-    match tool {
-        "apply_patch" => Some(&["edit", "patch"]),
-        "apply_unified_diff" => Some(&["edit", "patch"]),
-        "cargo_check" => Some(&["shell", "validation"]),
-        "cargo_fmt" => Some(&["shell", "validation"]),
-        "cargo_test" => Some(&["shell", "validation"]),
-        #[cfg(feature = "experimental-code-mode")]
-        "code_mode_exec" => Some(&["inspect", "runtime"]),
-        #[cfg(feature = "experimental-code-mode")]
-        "code_mode_exec_effectful" => Some(&["runtime", "validation"]),
-        #[cfg(feature = "experimental-code-mode")]
-        "code_mode_exec_mutating" => Some(&["edit", "runtime"]),
-        "discard_untracked" => Some(&["cleanup", "git"]),
-        "finish_coding_task" => Some(&["review", "runtime"]),
-        "artifact_upload_abort"
-        | "artifact_upload_begin"
-        | "artifact_upload_chunk"
-        | "artifact_upload_finish"
-        | "import_conversation_files_to_project"
-        | "read_project_artifact"
-        | "read_project_artifact_metadata"
-        | "save_project_artifact" => Some(&["edit", "file_transfer"]),
-        "git_diff_hunks" => Some(&["git", "inspect", "review"]),
-        "git_review_summary" => Some(&["git", "inspect", "review"]),
-        "git_log" => Some(&["git", "inspect", "review"]),
-        "git_restore_paths" => Some(&["cleanup", "git"]),
-        "git_status" => Some(&["git", "inspect", "review"]),
-        "list_runners" => Some(&["inspect", "runtime"]),
-        "list_projects" => Some(&["inspect", "projects", "runtime"]),
-        "list_tools" => Some(&["inspect", "runtime"]),
-        "run_job" => Some(&["jobs", "shell"]),
-        "run_detached_process" => Some(&["jobs", "shell"]),
-        "run_process" | "run_script" => Some(&["inspect", "shell"]),
-        "run_shell" => Some(&["inspect", "shell"]),
-        "open_session_shell"
-        | "session_shell_exec"
-        | "session_shell_status"
-        | "close_session_shell" => Some(&["jobs", "shell"]),
-        "runtime_status" => Some(&["inspect", "runtime"]),
-        "show_changes" => Some(&["git", "inspect", "review"]),
-        "work_on_project" => Some(&["inspect", "runtime"]),
-        "workspace_checkpoint_create" => Some(&["checkpoint", "git", "runtime"]),
-        "workspace_checkpoint_delete" => Some(&["checkpoint", "cleanup", "runtime"]),
-        "workspace_checkpoint_list" => Some(&["checkpoint", "inspect", "review", "runtime"]),
-        "workspace_checkpoint_restore" => Some(&["checkpoint", "git", "runtime"]),
-        "workspace_checkpoint_show" => Some(&["checkpoint", "inspect", "review", "runtime"]),
-        _ => None,
-    }
-}
-
 #[test]
-fn tool_discovery_groups_drive_tool_categories() {
-    use crate::tool_runtime::tool_definition::{
-        is_model_visible_tool_name, lookup_tool_definition, model_visible_tool_definitions,
-        TOOL_DISCOVERY_GROUPS,
-    };
-    use std::collections::{BTreeMap, BTreeSet};
-
+fn canonical_categories_match_list_and_manifest_without_overlapping_groups() {
+    let runtime = test_runtime();
     let categories = registered_tool_categories();
-    let category_map = categories.as_object().expect("categories object");
-    let actual_category_names = category_map
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let expected_group_names = TOOL_DISCOVERY_GROUPS
-        .iter()
-        .map(|group| group.name)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        actual_category_names, expected_group_names,
-        "registered_tool_categories keys must come only from TOOL_DISCOVERY_GROUPS"
-    );
-
-    let mut memberships: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-
-    for group in TOOL_DISCOVERY_GROUPS {
-        let actual_tools = string_array(
-            category_map
-                .get(group.name)
-                .unwrap_or_else(|| panic!("{} discovery category missing", group.name)),
-            group.name,
-        );
-        let tools = group
-            .tools
+    let manifest = runtime.compact_tool_manifest_payload();
+    assert_eq!(categories, manifest["categories"]);
+    let mut seen = BTreeSet::new();
+    for (category, members) in categories.as_object().unwrap() {
+        let members = members.as_array().unwrap();
+        let names = members
             .iter()
-            .map(|name| {
-                let definition = lookup_tool_definition(name)
-                    .unwrap_or_else(|| panic!("{name} discovery group entry missing definition"));
-                assert!(
-                    definition.visibility.is_model_visible(),
-                    "{name} discovery group entry must be model-visible"
-                );
-                assert!(
-                    is_model_visible_tool_name(name),
-                    "{name} discovery group entry must pass visibility facade"
-                );
-                assert!(
-                    allowed_tool_definition_categories_for_discovery_group(group.name)
-                        .contains(&definition.category)
-                        // Existing stage entrypoints retain their canonical runtime
-                        // category even in purpose-oriented discovery groups. Keep
-                        // these exceptions exact; do not admit arbitrary runtime tools.
-                        || matches!(
-                            (group.name, *name, definition.category),
-                            ("validation", "code_mode_exec_effectful", "runtime")
-                                | ("edit", "code_mode_exec_mutating", "runtime")
-                        ),
-                    "{} discovery group entry {} has ToolDefinition category {}, which is not in the explicit allowlist",
-                    group.name,
-                    name,
-                    definition.category
-                );
-                memberships.entry(name).or_default().push(group.name);
-                Value::String((*name).to_string())
-            })
+            .map(|name| name.as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(
-            category_map.get(group.name),
-            Some(&Value::Array(tools)),
-            "{} category must derive from ToolDefinition discovery groups",
-            group.name
-        );
-        assert_eq!(
-            actual_tools,
-            group
-                .tools
-                .iter()
-                .map(|tool| (*tool).to_string())
-                .collect::<Vec<_>>(),
-            "{} registered category order must match TOOL_DISCOVERY_GROUPS",
-            group.name
-        );
-    }
-
-    let exact_discovery_only = ["attach_agent_endpoint"]
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let mut omitted_from_groups = BTreeSet::new();
-    for definition in model_visible_tool_definitions() {
-        let Some(groups) = memberships.get(definition.name) else {
-            omitted_from_groups.insert(definition.name);
-            continue;
-        };
-        if groups.len() == 1 {
-            continue;
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in names {
+            assert!(seen.insert(name), "duplicate category membership: {name}");
+            assert_eq!(
+                crate::tool_runtime::tool_definition::runtime_tool_category(name),
+                category
+            );
         }
-        let expected =
-            expected_cross_listed_discovery_groups(definition.name).unwrap_or_else(|| {
-                panic!(
-                    "{} appears in multiple discovery groups without an explicit allowlist: {:?}",
-                    definition.name, groups
-                )
-            });
-        let actual_groups = groups.iter().copied().collect::<BTreeSet<_>>();
-        let expected_groups = expected.iter().copied().collect::<BTreeSet<_>>();
+        let filtered = runtime.list_tools_payload(ListToolsOptions {
+            category: Some(category.clone()),
+            features: None,
+            summary_only: true,
+            limit: None,
+        });
         assert_eq!(
-            actual_groups, expected_groups,
-            "{} discovery cross-listing changed",
-            definition.name
+            tool_entry_names(&filtered["tools"], category),
+            members
+                .iter()
+                .map(|name| name.as_str().unwrap().to_string())
+                .collect(),
+            "list_tools category selection must match its advertised category"
         );
     }
-    assert_eq!(
-        omitted_from_groups, exact_discovery_only,
-        "only exact-discovery compatibility primitives may stay out of ordinary discovery groups"
-    );
-
-    for allowed in [
-        "apply_unified_diff",
-        "cargo_check",
-        "cargo_fmt",
-        "cargo_test",
-        #[cfg(feature = "experimental-code-mode")]
-        "code_mode_exec",
-        "discard_untracked",
-        "finish_coding_task",
-        "git_diff_hunks",
-        "git_log",
-        "git_restore_paths",
-        "git_status",
-        "list_runners",
-        "list_projects",
-        "list_tools",
-        "run_job",
-        "run_process",
-        "run_script",
-        "runtime_status",
-        "show_changes",
-        "work_on_project",
-        #[cfg(feature = "workspace-checkpoints")]
-        "workspace_checkpoint_create",
-        #[cfg(feature = "workspace-checkpoints")]
-        "workspace_checkpoint_delete",
-        #[cfg(feature = "workspace-checkpoints")]
-        "workspace_checkpoint_list",
-        #[cfg(feature = "workspace-checkpoints")]
-        "workspace_checkpoint_restore",
-        #[cfg(feature = "workspace-checkpoints")]
-        "workspace_checkpoint_show",
+    let specs = registered_tool_specs();
+    assert_eq!(seen, specs.iter().map(|spec| spec.name.as_str()).collect());
+    for obsolete_group in [
+        "inspect",
+        "shell",
+        "jobs",
+        "projects",
+        "review",
+        "file_transfer",
     ] {
-        assert!(
-            memberships
-                .get(allowed)
-                .is_some_and(|groups| groups.len() > 1),
-            "{allowed} discovery cross-list allowlist must stay tied to an actual duplicate"
-        );
+        assert!(categories.get(obsolete_group).is_none(), "{obsolete_group}");
     }
+    assert!(
+        categories.get("memory").is_none(),
+        "hidden Memory is not admitted"
+    );
 }
 
 #[test]
@@ -791,7 +689,6 @@ fn tool_manifest_compact_categories_match_single_tool_definition_category() {
             definition.name
         );
     }
-
     let tools = manifest["tools"].as_array().expect("tool_manifest tools");
     assert_eq!(
         tools.len(),
@@ -1004,7 +901,7 @@ fn list_tools_category_filter_matches_tool_definition_categories() {
 #[test]
 fn tool_manifest_recommended_flows_reference_visible_defined_tools() {
     use crate::tool_runtime::tool_definition::{
-        is_model_visible_tool_name, lookup_tool_definition, TOOL_RECOMMENDED_FLOWS,
+        is_model_visible_tool_name, lookup_tool_definition, model_visible_recommended_flows,
     };
 
     let runtime = test_runtime();
@@ -1013,9 +910,12 @@ fn tool_manifest_recommended_flows_reference_visible_defined_tools() {
     let flows = manifest["recommended_flows"]
         .as_array()
         .expect("tool_manifest recommended_flows");
-    assert_eq!(flows.len(), TOOL_RECOMMENDED_FLOWS.len());
+    assert_eq!(flows.len(), model_visible_recommended_flows().count());
+    for inactive in ["agent_continuation_setup", "goal_agent_wait_orchestration"] {
+        assert!(!flows.iter().any(|flow| flow["name"] == inactive));
+    }
 
-    for (actual, expected) in flows.iter().zip(TOOL_RECOMMENDED_FLOWS) {
+    for (actual, expected) in flows.iter().zip(model_visible_recommended_flows()) {
         assert_eq!(actual["name"], expected.name);
         assert_eq!(actual["purpose"], expected.manifest_purpose);
         let tools = actual["tools"]
@@ -1201,7 +1101,6 @@ async fn tool_manifest_intent_coding_returns_ranked_compact_tools() {
         );
     }
     for gateway_specialist in [
-        "apply_patch",
         "cargo_fmt",
         "go_test",
         "workspace_hygiene_check",
@@ -1225,15 +1124,14 @@ async fn tool_manifest_intent_coding_returns_ranked_compact_tools() {
         "search_project_texts",
         "search_and_read",
         "read_files",
-        "apply_text_edits",
+        "edit_project_files",
         "run_process",
         "run_script",
         "run_shell",
         "observe_jobs",
         "cargo_check",
         "cargo_test",
-        "show_changes",
-        "git_diff_hunks",
+        "review_changes",
     ] {
         let tool = result.output["tools"]
             .as_array()
@@ -1335,7 +1233,13 @@ async fn tool_manifest_intent_can_combine_with_category_filter() {
     // validation_summary remains available through exact/category discovery.
     assert_eq!(
         names,
-        vec!["cargo_fmt", "cargo_check", "cargo_test", "go_test"]
+        vec![
+            "project_validate",
+            "cargo_fmt",
+            "cargo_check",
+            "cargo_test",
+            "go_test"
+        ]
     );
 }
 
@@ -1383,10 +1287,8 @@ async fn audit_and_exploration_intents_exclude_shell_and_jobs() {
                 "read_files",
                 "search_project_texts",
                 "git_status",
-                "git_review_summary",
-                "git_diff_hunks",
                 "git_log",
-                "show_changes",
+                "review_changes",
                 "workspace_hygiene_check",
                 "session_handoff_summary",
                 "finish_coding_task",
@@ -1395,6 +1297,12 @@ async fn audit_and_exploration_intents_exclude_shell_and_jobs() {
                 assert!(
                     names.contains(&required),
                     "audit intent must include {required}: {names:?}"
+                );
+            }
+            for demoted in webcodex_tool_contracts::ORDINARY_DISCOVERY_DEMOTED_REVIEW_TOOL_NAMES {
+                assert!(
+                    !names.contains(demoted),
+                    "audit intent should keep {demoted} out of ordinary review selection: {names:?}"
                 );
             }
             for compatibility_primitive in [
@@ -1635,12 +1543,12 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     assert!(
-        coding_names.contains(&"apply_text_edits"),
+        coding_names.contains(&"edit_project_files"),
         "coding intent tools should expose canonical precise edits: {coding_names:?}"
     );
     assert!(
-        coding_names.contains(&"apply_patch"),
-        "coding intent tools should expose model-generated Codex patch mutation: {coding_names:?}"
+        !coding_names.contains(&"apply_patch"),
+        "exact-manifest patch specialist should stay outside ordinary coding intent: {coding_names:?}"
     );
     assert!(
         !coding_names.contains(&"apply_unified_diff"),
@@ -1727,8 +1635,8 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     assert!(
-        with_patch_tools.contains(&"apply_patch"),
-        "with patch category, tools should include apply_patch: {with_patch_tools:?}"
+        !with_patch_tools.contains(&"apply_patch"),
+        "coding intent must not reintroduce exact-manifest apply_patch even when patch category is requested: {with_patch_tools:?}"
     );
     assert!(
         !with_patch_tools.contains(&"apply_unified_diff"),
@@ -1745,8 +1653,8 @@ async fn filtered_tool_manifest_recommended_flows_only_reference_returned_tools(
             .as_array()
             .unwrap()
             .iter()
-            .any(|tool| tool == "apply_patch"),
-        "with patch category, edit flow may include apply_patch: {edit_flow}"
+            .all(|tool| tool != "apply_patch"),
+        "filtered coding edit flow must not reintroduce exact-manifest apply_patch: {edit_flow}"
     );
     assert!(
         edit_flow["tools"]
@@ -1815,6 +1723,18 @@ async fn code_mode_exact_manifest_projects_canonical_stage_callable_contracts() 
             projection["constraints"]["validation_after_successful_known_mutation"],
             policy.validation_after_mutation
         );
+        assert!(
+            projection["constraints"]
+                .get("nested_sync_wait_max_secs")
+                .is_none(),
+            "{entry_tool} must not expose internal return timing"
+        );
+        assert!(
+            !projection["examples"]
+                .to_string()
+                .contains("sync_wait_secs"),
+            "{entry_tool} examples must not teach hidden compatibility timing"
+        );
         let projected_names = projection["tools"]
             .as_array()
             .expect("projected callable tools")
@@ -1833,6 +1753,10 @@ async fn code_mode_exact_manifest_projects_canonical_stage_callable_contracts() 
             let input_properties = input["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{tool_name} projected input properties"));
+            assert!(
+                !input_properties.contains_key("sync_wait_secs"),
+                "{tool_name} callable projection must keep legacy sync_wait_secs hidden"
+            );
             assert!(
                 input_properties
                     .keys()
@@ -1858,6 +1782,12 @@ async fn code_mode_exact_manifest_projects_canonical_stage_callable_contracts() 
                     <= crate::tool_runtime::surface::CODE_MODE_OUTPUT_FIELDS_PER_TOOL_MAX,
                 "{tool_name} output projection exceeded its per-tool field bound: {}",
                 output_fields.len()
+            );
+            assert!(
+                output_fields.iter().all(|field| field
+                    .as_str()
+                    .is_none_or(|field| !field.contains("job_attention"))),
+                "{tool_name} nested callable projection must not advertise outer-only job_attention"
             );
             assert_eq!(
                 input["additionalProperties"], canonical.input_schema["additionalProperties"],
@@ -2012,7 +1942,7 @@ async fn code_mode_callable_projection_preserves_key_input_constraints_and_outpu
         .unwrap();
     let edit = guarded_tools
         .iter()
-        .find(|tool| tool["tool"] == "apply_text_edits")
+        .find(|tool| tool["tool"] == "edit_project_files")
         .expect("apply_text_edits projection");
     assert_eq!(edit["input"]["properties"]["changes"]["maxItems"], 16);
     assert!(edit["input"]["properties"].get("project").is_none());
@@ -2072,13 +2002,12 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
     assert!(contract["description"].as_str().is_some());
     assert_eq!(contract["input_schema"]["type"], "object");
     assert!(contract["input_schema"]["properties"]["package"].is_object());
-    let sync_wait = &contract["input_schema"]["properties"]["sync_wait_secs"];
-    assert_eq!(sync_wait["type"], "integer");
-    assert_eq!(sync_wait["minimum"], 1);
-    assert!(sync_wait.get("maximum").is_none());
-    assert!(sync_wait["description"]
-        .as_str()
-        .is_some_and(|description| description.to_ascii_lowercase().contains("clamp")));
+    assert!(
+        contract["input_schema"]["properties"]
+            .get("sync_wait_secs")
+            .is_none(),
+        "tool_manifest must not re-expose legacy sync_wait_secs tuning"
+    );
     assert!(contract["annotations"].is_object());
     let specs = registered_tool_specs();
     let manifest_spec = spec_named(&specs, "tool_manifest");
@@ -2108,6 +2037,100 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
     assert_eq!(result.output["tools"][0]["availability"], "direct");
     assert!(result.output["tools"][0]["gateway_tool"].is_null());
     assert!(result.output["tools"][0].get("input_schema").is_none());
+}
+
+#[tokio::test]
+async fn exact_tool_manifest_projects_bounded_host_orchestration_from_tool_definition_only() {
+    let runtime = test_runtime();
+    let cases = [
+        (
+            "read_files",
+            json!({
+                "guidance_only": true,
+                "concurrency": "independent_parallel_read",
+                "native_batch_field": "items",
+                "compound_preferred": false,
+            }),
+        ),
+        (
+            "search_and_read",
+            json!({
+                "guidance_only": true,
+                "concurrency": "independent_parallel_read",
+                "native_batch_field": "queries",
+                "compound_preferred": true,
+            }),
+        ),
+        (
+            "cargo_check",
+            json!({
+                "guidance_only": true,
+                "concurrency": "sequential",
+                "native_batch_field": "packages",
+                "compound_preferred": false,
+            }),
+        ),
+    ];
+
+    for (tool_name, expected) in cases {
+        let result = runtime
+            .dispatch(ToolCall::ToolManifest {
+                tool_name: Some(tool_name.to_string()),
+                category: None,
+                intent: None,
+                include_recommended_flows: false,
+                include_risk_summary: false,
+            })
+            .await;
+        assert!(result.success, "{tool_name}: {:?}", result.error);
+        assert_eq!(result.output["host_orchestration"], expected, "{tool_name}");
+        assert_no_response_too_large(tool_name, &result.output);
+
+        let definition =
+            crate::tool_runtime::tool_definition::lookup_tool_definition(tool_name).unwrap();
+        assert_eq!(
+            result.output["host_orchestration"]["concurrency"],
+            definition.host_orchestration.concurrency.as_str(),
+            "{tool_name}"
+        );
+    }
+
+    let no_hint = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("run_shell".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(no_hint.success, "{:?}", no_hint.error);
+    assert!(no_hint.output.get("host_orchestration").is_none());
+
+    let specs = registered_tool_specs();
+    let manifest_spec = spec_named(&specs, "tool_manifest");
+    let output_properties = output_schema_properties(manifest_spec);
+    let schema = &output_properties["host_orchestration"];
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["concurrency"]["enum"],
+        json!(["unspecified", "independent_parallel_read", "sequential"])
+    );
+
+    let specs = registered_tool_specs();
+    for tool_name in [
+        "read_files",
+        "search_project_texts",
+        "search_and_read",
+        "cargo_check",
+        "edit_project_files",
+    ] {
+        let serialized = serde_json::to_string(spec_named(&specs, tool_name)).unwrap();
+        assert!(
+            !serialized.contains("host_orchestration"),
+            "{tool_name} default ToolSpec must not carry Host orchestration metadata"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2173,7 +2196,7 @@ async fn tool_manifest_projects_canonical_execution_selection_for_exact_and_filt
     let filtered = runtime
         .dispatch(ToolCall::ToolManifest {
             tool_name: None,
-            category: Some("job".to_string()),
+            category: Some("execution".to_string()),
             intent: Some("coding".to_string()),
             include_recommended_flows: false,
             include_risk_summary: false,
@@ -2338,8 +2361,11 @@ async fn tool_manifest_routing_metadata_uses_canonical_adaptive_routes() {
         ("import_conversation_files_to_project", "direct", None),
         ("project_artifact", "direct", None),
         ("session_discussion_summary", "direct", None),
-        ("list_jobs", "direct", None),
-        ("git_diff_hunks", "direct", None),
+        ("list_jobs", "gateway", Some("call_runtime_tool")),
+        ("review_changes", "direct", None),
+        ("show_changes", "gateway", Some("call_runtime_tool")),
+        ("git_diff_hunks", "gateway", Some("call_runtime_tool")),
+        ("git_review_summary", "gateway", Some("call_runtime_tool")),
         ("run_script", "direct", None),
         (
             "workspace_hygiene_check",
@@ -2519,7 +2545,7 @@ async fn tool_manifest_exact_tool_fails_closed_for_unknown_or_mixed_filters() {
 
 #[tokio::test]
 async fn unfiltered_tool_manifest_keeps_full_recommended_flows() {
-    use crate::tool_runtime::tool_definition::TOOL_RECOMMENDED_FLOWS;
+    use crate::tool_runtime::tool_definition::model_visible_recommended_flows;
 
     let runtime = test_runtime();
     let result = runtime
@@ -2538,8 +2564,8 @@ async fn unfiltered_tool_manifest_keeps_full_recommended_flows() {
         .expect("unfiltered recommended_flows");
     assert_eq!(
         flows.len(),
-        TOOL_RECOMMENDED_FLOWS.len(),
-        "unfiltered recommended_flows must keep full global set"
+        model_visible_recommended_flows().count(),
+        "unfiltered recommended_flows must keep the full currently callable set"
     );
     let serialized = result.output["recommended_flows"]
         .to_string()

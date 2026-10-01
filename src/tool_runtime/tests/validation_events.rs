@@ -24,6 +24,7 @@ async fn run_shell_declared_validation_enters_unified_summary_with_shell_and_roo
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "cargo test focused".to_string(),
                         session_id: Some(session_id),
@@ -85,6 +86,7 @@ async fn completed_run_job_validation_enters_handoff_from_job_authority() {
     let capabilities = crate::runner_protocol::RunnerCapabilities {
         async_shell_jobs: true,
         explicit_shell_selection: true,
+        bash_login_shell: true,
         ..Default::default()
     };
     register_agent_projects_for_auth(
@@ -249,9 +251,7 @@ async fn promoted_run_process_cargo_test_materializes_canonical_validation_evide
     assert_eq!(request.process.as_ref().unwrap().executable, "cargo");
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert!(handoff.output.get("promoted_to_job").is_none());
-    assert_eq!(handoff.output["continuation"]["tool"], "observe_jobs");
-    let job_id = handoff.output["job_id"].as_str().unwrap().to_string();
+    let job_id = assert_sparse_pending_job_handoff(&handoff.output).to_string();
     let admitted = runtime.runner_registry.get_job(&job_id).await.unwrap();
     let metadata = admitted.structured_execution.as_ref().unwrap();
     assert_eq!(metadata.execution_source, "run_process");
@@ -370,6 +370,7 @@ async fn finish_coding_task_validation_available_when_ledger_has_validation_even
                         no_default_features: None,
                         features: None,
                         package: None,
+                        packages: None,
                         timeout_secs: Some(55),
                         sync_wait_secs: Some(55),
                     },

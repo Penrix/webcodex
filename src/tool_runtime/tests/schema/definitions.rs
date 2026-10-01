@@ -12,6 +12,7 @@ fn retired_delete_files_alias_stays_absent() {
     assert!(!registered_tool_specs()
         .iter()
         .any(|spec| spec.name == "delete_files"));
+    #[cfg(feature = "legacy-gpt-actions")]
     assert!(crate::openapi::build_openapi_spec()["paths"]
         .get("/api/projects/delete_files")
         .is_none());
@@ -89,10 +90,18 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
     let expected_hidden: BTreeSet<&str> = [
         "start_session",
         "job_tail",
-        "goal_plan_state",
-        "goal_plan_recheck_attention",
+        "goal_plan_sync",
         "work_result_state",
+        "work_result_activity_detail",
+        "work_result_send_message",
+        "apply_patch",
+        "apply_unified_diff",
+        "write_project_file",
         "changes_file_diff",
+        "record_external_observation",
+        "session_handoff_state",
+        "present_agent_continuation",
+        "present_job_terminal_continuation",
         "agent_continuation_bind",
         "agent_continuation_recover_endpoint",
         "agent_continuation_state",
@@ -125,7 +134,7 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
     assert_eq!(
         model_hidden_tool_names().collect::<BTreeSet<_>>(),
         expected_hidden,
-        "hidden ToolDefinitions must match the documented App-only and compatibility inventory"
+        "hidden ToolDefinitions must match the documented App-only, dormant presentation and compatibility inventory"
     );
 }
 
@@ -136,7 +145,7 @@ fn tool_definitions_match_agent_capability_dispatch_helper() {
     };
 
     for definition in tool_definitions() {
-        // ModelHidden tools are dispatched for back-compat but have no
+        // ModelHidden tools retain explicit protocol/domain paths but have no
         // model-facing ToolSpec, so sample_tool_args (which reads the spec's
         // required fields) cannot build arguments for them. They are still
         // covered by the parser-name-gate test. Here we assert the full

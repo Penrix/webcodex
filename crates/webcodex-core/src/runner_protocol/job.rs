@@ -15,6 +15,10 @@ pub const RUST_TEST_FILTER_MAX_BYTES: usize = 200;
 /// `-p`). Matches the `is_canonical` per-argument bound.
 pub const CARGO_VALUE_MAX_BYTES: usize = 500;
 
+/// Maximum number of workspace packages accepted by one structured Cargo
+/// validation request.
+pub const CARGO_PACKAGE_MAX_ITEMS: usize = 32;
+
 /// Largest caller-declared Cargo test-count minimum.
 pub const CARGO_TEST_MIN_TESTS_MAX: u64 = 1_000_000;
 
@@ -173,6 +177,8 @@ pub struct ShellJobOpRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub login: bool,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
@@ -226,7 +232,7 @@ impl ShellJobValidationStep {
             ("format", "cargo") => args == ["fmt", "--", "--check"],
             ("check", "cargo") => is_canonical_cargo_check_args(&args),
             ("test", "cargo") => is_canonical_cargo_test_args(&args),
-            ("check", "go") => args == ["vet", "./..."],
+            ("check", "go") => is_canonical_go_vet_args(&args),
             ("test", "go") => args == ["test", "./..."] || self.is_structured_go_test_json(),
             ("format", "python") => {
                 args == ["-m", "ruff", "format", "--check"] || args == ["-m", "black", "--check"]
@@ -256,19 +262,26 @@ impl ShellJobValidationStep {
         let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
         is_canonical_go_test_json_args(&args)
     }
+
+    pub fn is_multi_package_cargo_check(&self) -> bool {
+        self.name == "check"
+            && self.program == "cargo"
+            && self.is_canonical()
+            && self.args.iter().filter(|arg| arg.as_str() == "-p").count() > 1
+    }
 }
 
 /// Canonical `cargo check` argv: `check` followed by zero or more distinct
 /// read-only flags (`--all-targets`, `--all-features`,
 /// `--no-default-features`) and `--features <value>` / `-p <value>` pairs.
 fn is_canonical_cargo_check_args(args: &[&str]) -> bool {
-    args.first() == Some(&"check") && is_canonical_cargo_flags(&args[1..], false)
+    args.first() == Some(&"check") && is_canonical_cargo_flags(&args[1..], false, true)
 }
 
 /// Canonical `cargo test` argv: the `test` subcommand, an optional libtest
 /// filter (never a Cargo option), then zero or more distinct read-only flags
-/// and `--features <value>` / `-p <value>` pairs, optionally including the
-/// Cargo test-only `--lib` and `--no-run` selectors.
+/// and `--features <value>` / repeated `-p <value>` pairs, optionally including
+/// the Cargo test-only `--lib` and `--no-run` selectors.
 ///
 /// The flat argv boundary has inherent information loss: `["test",
 /// "--all-features"]` is a legal `cargo test --all-features` whether the
@@ -283,13 +296,13 @@ fn is_canonical_cargo_test_args(args: &[&str]) -> bool {
         Some(filter) if valid_rust_test_filter(filter) => 2,
         _ => 1,
     };
-    is_canonical_cargo_flags(&args[flags_start..], true)
+    is_canonical_cargo_flags(&args[flags_start..], true, true)
 }
 
 /// Normalize and validate one value-taking Cargo argument (`--features`,
-/// `-p`). This is the single shared contract used by the synchronous command
-/// builders and the structured long-Job argv builder, so a given request runs
-/// identical arguments no matter how long it takes.
+/// `-p`). This is the single shared normalization contract used by validation
+/// planning and Runner-side canonical-step validation, so command-text and
+/// structured-argv projections preserve identical argument semantics.
 ///
 /// Applies exactly one leading/trailing whitespace trim, then rejects values
 /// that are NUL/control-containing, longer than [`CARGO_VALUE_MAX_BYTES`],
@@ -318,12 +331,44 @@ pub fn normalize_cargo_value(raw: &str) -> Result<Option<String>, &'static str> 
     Ok(Some(trimmed.to_string()))
 }
 
-/// Normalize the optional package scope of the first-class `go_test` tool.
-/// Omission preserves the historical `./...` scope; an explicit list must
-/// contain one to eight already-normalized project-relative patterns.
-pub fn normalize_go_test_packages(
+/// Canonicalize the legacy single-package selector and the multi-package
+/// selector into one sorted, duplicate-free representation.
+pub fn normalize_cargo_packages(
+    package: Option<&str>,
     packages: Option<&[String]>,
-) -> Result<Vec<String>, &'static str> {
+) -> Result<Option<Vec<String>>, &'static str> {
+    if package.is_some() && packages.is_some() {
+        return Err("package and packages are mutually exclusive");
+    }
+    let mut normalized = match (package, packages) {
+        (Some(package), None) => match normalize_cargo_value(package)? {
+            Some(package) => vec![package],
+            None => return Ok(None),
+        },
+        (None, Some(packages)) => {
+            if packages.is_empty() || packages.len() > CARGO_PACKAGE_MAX_ITEMS {
+                return Err("packages must contain between 1 and 32 items");
+            }
+            packages
+                .iter()
+                .map(|package| {
+                    normalize_cargo_value(package)?
+                        .ok_or("packages cannot contain an empty package name")
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => unreachable!("selector conflict handled above"),
+    };
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(Some(normalized))
+}
+
+/// Normalize one bounded project-relative Go package scope.
+/// Omission preserves the canonical `./...` project scope; an explicit list
+/// must contain one to eight already-normalized project-relative patterns.
+pub fn normalize_go_packages(packages: Option<&[String]>) -> Result<Vec<String>, &'static str> {
     let Some(packages) = packages else {
         return Ok(vec!["./...".to_string()]);
     };
@@ -332,11 +377,18 @@ pub fn normalize_go_test_packages(
     }
     packages
         .iter()
-        .map(|package| normalize_go_test_package(package))
+        .map(|package| normalize_go_package(package))
         .collect()
 }
 
-fn normalize_go_test_package(raw: &str) -> Result<String, &'static str> {
+/// Compatibility entry for existing structured Go validation callers.
+pub fn normalize_go_test_packages(
+    packages: Option<&[String]>,
+) -> Result<Vec<String>, &'static str> {
+    normalize_go_packages(packages)
+}
+
+fn normalize_go_package(raw: &str) -> Result<String, &'static str> {
     if raw.is_empty() {
         return Err("package pattern cannot be empty");
     }
@@ -391,11 +443,46 @@ fn normalize_go_test_package(raw: &str) -> Result<String, &'static str> {
     Ok(raw.to_string())
 }
 
+/// Bounded native Go -run expression. Do not trim: spaces and slash-separated
+/// subtest expressions have native meaning. Go validates regexp syntax; the
+/// Runner transports one literal argv value, never shell or additional flags.
+pub fn normalize_go_test_filter(raw: &str) -> Result<Option<String>, &'static str> {
+    if raw.len() > RUST_TEST_FILTER_MAX_BYTES || raw.chars().any(char::is_control) {
+        return Err("Go test filter exceeds 200 bytes or contains control characters");
+    }
+    Ok((!raw.is_empty()).then(|| raw.to_owned()))
+}
+
+fn is_canonical_go_vet_args(args: &[&str]) -> bool {
+    if args.len() < 2 || args[0] != "vet" {
+        return false;
+    }
+    let packages = args[1..]
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    matches!(
+        normalize_go_test_packages(Some(&packages)),
+        Ok(normalized) if normalized == packages
+    )
+}
+
 fn is_canonical_go_test_json_args(args: &[&str]) -> bool {
     if args.len() < 3 || args[0] != "test" || args[1] != "-json" {
         return false;
     }
-    let packages = args[2..]
+    let package_start = if args.get(2) == Some(&"-run") {
+        let Some(filter) = args.get(3) else {
+            return false;
+        };
+        if !matches!(normalize_go_test_filter(filter), Ok(Some(value)) if value == *filter) {
+            return false;
+        }
+        4
+    } else {
+        2
+    };
+    let packages = args[package_start..]
         .iter()
         .map(|value| (*value).to_string())
         .collect::<Vec<_>>();
@@ -406,20 +493,26 @@ fn is_canonical_go_test_json_args(args: &[&str]) -> bool {
 }
 
 /// Validate the read-only Cargo flag tail shared by `cargo check` and
-/// `cargo test` validation steps. Each single flag and each value-taking flag
-/// appears at most once. A value-taking flag's value must already satisfy the
-/// shared [`normalize_cargo_value`] contract: non-empty after trimming, not a
-/// `-`-prefixed option, NUL/control-free, bounded to `CARGO_VALUE_MAX_BYTES`,
+/// `cargo test` validation steps. Each single flag and `--features` appears at
+/// most once. Cargo check and Cargo test may repeat `-p` for distinct
+/// packages. Every value must already satisfy
+/// the shared [`normalize_cargo_value`] contract: non-empty after trimming, not
+/// a `-`-prefixed option, NUL/control-free, bounded to `CARGO_VALUE_MAX_BYTES`,
 /// and already normalized (no leading/trailing whitespace). `--lib` and
 /// `--no-run` are accepted only for `cargo test`.
-fn is_canonical_cargo_flags(args: &[&str], cargo_test: bool) -> bool {
+fn is_canonical_cargo_flags(
+    args: &[&str],
+    cargo_test: bool,
+    allow_multiple_packages: bool,
+) -> bool {
     let mut seen = HashSet::new();
+    let mut seen_packages = HashSet::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = match *arg {
             "--all-targets" | "--all-features" | "--no-default-features" => *arg,
             "--lib" | "--no-run" if cargo_test => *arg,
-            "--features" | "-p" => {
+            "--features" => {
                 if !seen.insert(*arg) {
                     return false;
                 }
@@ -431,6 +524,22 @@ fn is_canonical_cargo_flags(args: &[&str], cargo_test: bool) -> bool {
                 // over-long value is not a canonical cargo value.
                 match normalize_cargo_value(value) {
                     Ok(Some(normalized)) if normalized == *value => continue,
+                    _ => return false,
+                }
+            }
+            "-p" => {
+                if !allow_multiple_packages && !seen.insert(*arg) {
+                    return false;
+                }
+                let Some(value) = iter.next() else {
+                    return false;
+                };
+                match normalize_cargo_value(value) {
+                    Ok(Some(normalized))
+                        if normalized == *value && seen_packages.insert(*value) =>
+                    {
+                        continue
+                    }
                     _ => return false,
                 }
             }
@@ -454,9 +563,9 @@ fn node_script_allowed(kind: &str, script: &str) -> bool {
 
 /// Normalize and validate the single argv value that may follow `cargo test`:
 /// a libtest name substring, never a Cargo option. This is the shared contract
-/// used by the planner (`safe_rust_filter`), the synchronous command builder,
-/// and the structured long-Job argv builder, so a given filter runs identically
-/// regardless of runtime path.
+/// used by the recipe planner (`safe_rust_filter`), adapter-owned validation
+/// planning, and Runner-side canonical-step validation, so a given filter keeps
+/// identical semantics regardless of runtime path.
 ///
 /// Applies exactly one leading/trailing trim and rejects control bytes,
 /// over-long values, and anything that begins with `-` after trimming, so a
@@ -599,6 +708,8 @@ impl ShellJobActivity {
 /// protocol metadata; it is not a model input and never contains shell text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellJobValidationMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_validation: Option<crate::project_validation::ProjectValidationProvenance>,
     pub tool: String,
     pub kind: String,
     pub steps: Vec<ShellJobValidationStep>,
@@ -629,7 +740,7 @@ pub struct ShellJobValidationMetadata {
 
 impl ShellJobValidationMetadata {
     pub fn is_valid(&self) -> bool {
-        if self.adapter != self.tool
+        if (self.tool != "project_validate" && self.adapter != self.tool)
             || self.steps.len() != 1
             || !self.steps[0].is_canonical()
             || self.effective_timeout_secs < 1
@@ -650,10 +761,14 @@ impl ShellJobValidationMetadata {
         {
             return false;
         }
-        if self.minimum_tests.is_some() && self.tool != "cargo_test" {
+        if self.minimum_tests.is_some()
+            && !matches!(self.adapter.as_str(), "cargo_test" | "go_test")
+        {
             return false;
         }
-        if (self.require_tests.is_some() || self.no_run.is_some()) && self.tool != "cargo_test" {
+        if (self.require_tests.is_some() || self.no_run.is_some())
+            && !matches!(self.adapter.as_str(), "cargo_test" | "go_test")
+        {
             return false;
         }
         if self.no_run == Some(true) && self.minimum_tests.is_some() {
@@ -664,8 +779,28 @@ impl ShellJobValidationMetadata {
         {
             return false;
         }
+        if self.tool == "project_validate" {
+            let Some(provenance) = &self.project_validation else {
+                return false;
+            };
+            if !provenance.is_valid()
+                || provenance.request.action.kind() != self.kind
+                || !matches!(
+                    (provenance.backend.as_str(), self.adapter.as_str()),
+                    ("rust", "cargo_fmt" | "cargo_check" | "cargo_test")
+                        | ("go", "go_vet" | "go_test")
+                )
+                || (self.require_tests, self.minimum_tests)
+                    != provenance.request.test_requirements()
+                || self.no_run.is_some()
+            {
+                return false;
+            }
+        } else if self.project_validation.is_some() {
+            return false;
+        }
         let step = &self.steps[0];
-        match self.tool.as_str() {
+        match self.adapter.as_str() {
             "cargo_fmt" => {
                 self.kind == "format" && step.name == "format" && step.program == "cargo"
             }
@@ -674,6 +809,7 @@ impl ShellJobValidationMetadata {
             }
             "cargo_test" => self.kind == "test" && step.name == "test" && step.program == "cargo",
             "go_test" => self.kind == "test" && step.is_structured_go_test_json(),
+            "go_vet" => self.kind == "check" && step.name == "check" && step.program == "go",
             _ => false,
         }
     }
@@ -755,6 +891,24 @@ impl ShellJobStructuredExecutionMetadata {
                 self.language.is_none()
                     && self.script_bytes.is_none()
                     && self.arg_count <= PROCESS_ARG_MAX_COUNT
+            }
+            "run_process_interactive" => {
+                self.language.is_none()
+                    && self.script_bytes.is_none()
+                    && self.arg_count <= PROCESS_ARG_MAX_COUNT
+                    && !self.stdin_present
+                    && self.validation_identity.is_none()
+                    && self.validation_tool.is_none()
+                    && self.assertion_name.is_none()
+            }
+            "project_build" => {
+                self.language.is_none()
+                    && self.script_bytes.is_none()
+                    && self.arg_count <= PROCESS_ARG_MAX_COUNT
+                    && !self.stdin_present
+                    && self.validation_identity.is_none()
+                    && self.validation_tool.is_none()
+                    && self.assertion_name.is_none()
             }
             "run_script" => {
                 self.language.is_some()

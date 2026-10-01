@@ -13,6 +13,8 @@ use crate::auth::scopes::OAuthToolScopePolicy;
 use crate::auth::AuthContext;
 use serde_json::Value;
 
+mod postprocess;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolTransport {
     Api,
@@ -57,13 +59,21 @@ pub(crate) struct ToolCallRequest {
 /// input and the kernel continues to own all authority checks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ToolInvocationMetadata {
+    pub(crate) control: Option<super::control_sidecar::ControlSidecars>,
+    // Historical wrapper name retained for protocol compatibility. Exact IDs may
+    // acknowledge either legacy Session-board messages or Window collaboration
+    // messages; each collaboration store still performs its own principal/Window checks.
     pub(crate) ack_session_message_ids: Vec<String>,
+    pub(crate) ack_ref: Option<String>,
     pub(crate) session_message_resolution: Option<ToolCallSessionMessageResolution>,
+    pub(crate) window_reply: Option<super::window_collaboration::ToolCallWindowReply>,
     pub(crate) context_request: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ToolProtocolCapabilities {
+    /// Explicit model-facing control wrapper support; internal/App calls default off.
+    pub(crate) control_sidecars: bool,
     pub(crate) context_sidecar: bool,
     pub(crate) skill_runtime: bool,
     pub(crate) skill_management: bool,
@@ -78,7 +88,7 @@ pub(crate) struct ToolProtocolCapabilities {
     /// This never replaces canonical communication/Goal authorization.
     pub(crate) goal_plan_app: bool,
     /// Protocol-surface support for Work Result App live refresh and frozen
-    /// lazy diff reads. Exact Project + Session authority is checked per call;
+    /// lazy diff reads. Exact Project and optional Session context are checked per call;
     /// lazy reads additionally fence caller, snapshot, and advertised path.
     pub(crate) work_result_app: bool,
     /// Protocol-surface support for ModelHidden MCP App Host-continuation
@@ -105,6 +115,9 @@ pub(crate) struct ToolCallOutcome {
     pub(crate) error_status: Option<ToolCallErrorStatus>,
     pub(crate) project: Option<String>,
     pub(crate) model_ergonomics: Option<ModelErgonomicsCompletion>,
+    /// Existing privacy-safe audit projection captured before model compaction.
+    /// Never serialized into ToolResult or interpreted as execution authority.
+    pub(crate) canonical_audit_output: Option<Value>,
     /// Trusted internal Window/Workflow Session correlation evidence. This is
     /// adapter metadata only and is never part of the public ToolResult.
     pub(crate) correlation: super::window_activity::ToolCallCorrelation,
@@ -227,6 +240,25 @@ fn check_session_message_resolution_scope(
 }
 
 impl ToolRuntime {
+    #[cfg(feature = "experimental-code-mode")]
+    pub(crate) fn call_tool_with_context_and_return_timing<'a>(
+        &'a self,
+        request: ToolCallRequest,
+        context: ToolCallContext<'a>,
+        return_timing: super::return_timing::ToolReturnTimingPolicy,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolCallOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.call_tool_with_invocation_metadata_and_return_timing(
+                request,
+                context,
+                ToolInvocationMetadata::default(),
+                ToolProtocolCapabilities::default(),
+                return_timing,
+            )
+            .await
+        })
+    }
+
     pub(crate) fn call_tool_with_context<'a>(
         &'a self,
         request: ToolCallRequest,
@@ -263,6 +295,7 @@ impl ToolRuntime {
             context,
             ToolProtocolCapabilities {
                 context_sidecar: context_sidecar_capable,
+                control_sidecars: false,
                 skill_runtime: context_sidecar_capable,
                 skill_management: false,
                 memory_surface: false,
@@ -297,15 +330,70 @@ impl ToolRuntime {
         invocation_metadata: ToolInvocationMetadata,
         capabilities: ToolProtocolCapabilities,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolCallOutcome> + Send + 'a>> {
+        self.call_tool_with_invocation_metadata_and_return_timing(
+            request,
+            context,
+            invocation_metadata,
+            capabilities,
+            super::return_timing::ToolReturnTimingPolicy::unconstrained(),
+        )
+    }
+
+    fn call_tool_with_invocation_metadata_and_return_timing<'a>(
+        &'a self,
+        request: ToolCallRequest,
+        context: ToolCallContext<'a>,
+        mut invocation_metadata: ToolInvocationMetadata,
+        capabilities: ToolProtocolCapabilities,
+        return_timing: super::return_timing::ToolReturnTimingPolicy,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolCallOutcome> + Send + 'a>> {
         // MCP enters the kernel here directly rather than through
         // call_tool_with_context, so give it the same bounded adapter future.
         Box::pin(async move {
-            let telemetry =
+            let mut telemetry =
                 ModelErgonomicsTimer::start_with_arguments(&request.tool_name, &request.arguments);
+            if let Some(telemetry) = telemetry.as_mut() {
+                telemetry.invocation =
+                    super::model_ergonomics_telemetry::invocation::InvocationFacts::from_metadata(
+                        &invocation_metadata,
+                        context.session_id.is_some(),
+                    );
+                telemetry.resolve_work_on_project_guidance_profile(
+                    self.mcp_host_policy,
+                    matches!(context.transport, ToolTransport::Mcp),
+                );
+            }
+            let tool_name = request.tool_name.clone();
+            let mut control = invocation_metadata
+                .control
+                .take()
+                .map(super::control_sidecar::ControlExecution::new);
             let mut outcome = self
-                .call_tool_with_context_inner(request, context, invocation_metadata, capabilities)
+                .call_tool_with_context_inner(
+                    request,
+                    context,
+                    invocation_metadata,
+                    capabilities,
+                    return_timing,
+                    &mut control,
+                    &mut telemetry,
+                )
                 .await;
+            if let Some(control) = control {
+                control.decorate(&mut outcome);
+            }
             outcome.model_ergonomics = telemetry.map(ModelErgonomicsTimer::finish);
+            if let (Some(completion), Some(result)) =
+                (&mut outcome.model_ergonomics, &outcome.result)
+            {
+                completion.job_convergence = self.job_convergence_record(
+                    &tool_name,
+                    result,
+                    &outcome.correlation,
+                    context.auth,
+                    context.window,
+                );
+            }
             outcome
         })
     }
@@ -316,7 +404,40 @@ impl ToolRuntime {
         context: ToolCallContext<'_>,
         invocation_metadata: ToolInvocationMetadata,
         capabilities: ToolProtocolCapabilities,
+        return_timing: super::return_timing::ToolReturnTimingPolicy,
+        control: &mut Option<super::control_sidecar::ControlExecution>,
+        telemetry: &mut Option<ModelErgonomicsTimer>,
     ) -> ToolCallOutcome {
+        // Admit before any tool-specific await or side effect. The permit is
+        // retained through the complete call, including direct SSH effects.
+        let _maintenance_permit = match self.runner_registry.admit_runtime_call().await {
+            Ok(permit) => permit,
+            Err(message) => {
+                return ToolCallOutcome {
+                    success: false,
+                    result: None,
+                    error_status: Some(ToolCallErrorStatus::InvalidArguments {
+                        message: message.to_string(),
+                    }),
+                    project: None,
+                    model_ergonomics: None,
+                    canonical_audit_output: None,
+                    correlation: Default::default(),
+                }
+            }
+        };
+        if let Some(control) = control.as_ref() {
+            if let Err(outcome) = control.validate(
+                &request.tool_name,
+                context,
+                capabilities,
+                invocation_metadata.session_message_resolution.is_some(),
+            ) {
+                return outcome;
+            }
+        }
+        let ack_ref = invocation_metadata.ack_ref.clone();
+        let window_reply = invocation_metadata.window_reply.clone();
         let mut recorder_metadata =
             ToolCallRecorderMetadata::from_business_arguments(&request.arguments);
         recorder_metadata.ack_session_message_ids = invocation_metadata.ack_session_message_ids;
@@ -340,14 +461,11 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+                canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
-        if matches!(
-            request.tool_name.as_str(),
-            "goal_plan_state" | "goal_plan_recheck_attention"
-        ) && !capabilities.goal_plan_app
-        {
+        if request.tool_name == "goal_plan_sync" && !capabilities.goal_plan_app {
             return ToolCallOutcome {
                 success: false,
                 result: None,
@@ -357,19 +475,25 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+            canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
-        if request.tool_name == "work_result_state" && !capabilities.work_result_app {
+        if matches!(
+            request.tool_name.as_str(),
+            "work_result_state" | "work_result_activity_detail" | "work_result_send_message"
+        ) && !capabilities.work_result_app
+        {
             return ToolCallOutcome {
                 success: false,
                 result: None,
                 error_status: Some(ToolCallErrorStatus::InvalidArguments {
-                    message: "Work Result App state is available only on Stateless MCP 2026 requests with Work Result App capability"
+                    message: "Work Result App operations are available only on Stateless MCP 2026 requests with Work Result App capability"
                         .to_string(),
                 }),
                 project: None,
                 model_ergonomics: None,
+            canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -383,6 +507,7 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+            canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -407,6 +532,7 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+            canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -428,6 +554,7 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+            canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -450,6 +577,7 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+                canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -470,6 +598,7 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+                canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -487,6 +616,7 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+                canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -506,9 +636,31 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+                canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
+        let canonical_recording_session_id = match context.session_id {
+            Some(raw) => match self.canonicalize_explicit_session_selector(raw, context.auth) {
+                Ok(canonical) => Some(canonical),
+                Err(message) => {
+                    return ToolCallOutcome {
+                        success: false,
+                        result: None,
+                        error_status: Some(ToolCallErrorStatus::InvalidArguments { message }),
+                        project: None,
+                        model_ergonomics: None,
+                        canonical_audit_output: None,
+                        correlation: Default::default(),
+                    };
+                }
+            },
+            None => None,
+        };
+        let context = ToolCallContext {
+            session_id: canonical_recording_session_id.as_deref(),
+            ..context
+        };
         // Action-dependent gateways resolve exact policy before the generic
         // static Session/permission lifecycle and own one specialized ledger.
         if let Some(mut outcome) =
@@ -517,6 +669,20 @@ impl ToolRuntime {
             if super::tool_definition::is_model_visible_tool_name(&request.tool_name) {
                 let peer_project = outcome.project.clone();
                 if let Some(result) = outcome.result.as_mut() {
+                    self.add_window_model_reply_sidecar(
+                        result,
+                        context.auth,
+                        context.window,
+                        window_reply.as_ref(),
+                    );
+                    if request.tool_name != "present_work_result" {
+                        self.add_window_operator_projection(
+                            result,
+                            context.auth,
+                            context.window,
+                            &recorder_metadata.ack_session_message_ids,
+                        );
+                    }
                     self.add_peer_collaboration_projection(
                         result,
                         context.auth,
@@ -528,7 +694,8 @@ impl ToolRuntime {
             }
             return outcome;
         }
-        let concrete_arguments = strip_tool_call_expectation_metadata(request.arguments.clone());
+        let mut concrete_arguments =
+            strip_tool_call_expectation_metadata(request.arguments.clone());
         let context_request = if capabilities.context_sidecar {
             invocation_metadata.context_request
         } else {
@@ -553,11 +720,21 @@ impl ToolRuntime {
                     error_status: None,
                     project: None,
                     model_ergonomics: None,
+                    canonical_audit_output: None,
                     correlation: Default::default(),
                 };
             }
         }
-        let recorder_ack_requested = !recorder_metadata.ack_session_message_ids.is_empty();
+        let recorder_ack_requested =
+            !recorder_metadata.ack_session_message_ids.is_empty() || ack_ref.is_some();
+        let explicit_session_ack_ids = context.session_id.map(|recorder_session_id| {
+            session_context::session_ack_message_ids(
+                &self.sessions,
+                recorder_session_id,
+                &recorder_metadata.ack_session_message_ids,
+                ack_ref.as_deref(),
+            )
+        });
         if let Some(recorder_session_id) = context.session_id {
             recorder_metadata.recording_session_id = Some(recorder_session_id.to_string());
             recorder_metadata.recording_session_project = self
@@ -578,6 +755,7 @@ impl ToolRuntime {
                 }),
                 project: None,
                 model_ergonomics: None,
+                canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -591,14 +769,31 @@ impl ToolRuntime {
                 error_status: Some(error_status),
                 project: None,
                 model_ergonomics: None,
+                canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
+        if let Err(message) =
+            self.canonicalize_session_reference_argument(&mut concrete_arguments, context.auth)
+        {
+            return ToolCallOutcome {
+                success: false,
+                result: None,
+                error_status: Some(ToolCallErrorStatus::InvalidArguments { message }),
+                project: None,
+                model_ergonomics: None,
+                canonical_audit_output: None,
+                correlation: Default::default(),
+            };
+        }
+
         let outer_ack_observation = context.session_id.map(|recorder_session_id| {
             session_context::observe_session_attention_acks(
                 &self.sessions,
                 recorder_session_id,
-                &recorder_metadata.ack_session_message_ids,
+                explicit_session_ack_ids
+                    .as_deref()
+                    .unwrap_or(&recorder_metadata.ack_session_message_ids),
             )
         });
         if collaboration_session_tool(&request.tool_name) {
@@ -620,6 +815,7 @@ impl ToolRuntime {
                         error_status: None,
                         project: None,
                         model_ergonomics: None,
+                        canonical_audit_output: None,
                         correlation: Default::default(),
                     };
                 }
@@ -648,6 +844,7 @@ impl ToolRuntime {
                         error_status: None,
                         project: None,
                         model_ergonomics: None,
+                        canonical_audit_output: None,
                         correlation: Default::default(),
                     };
                 }
@@ -701,6 +898,7 @@ impl ToolRuntime {
                 &mut result,
                 &self.sessions,
                 session_id,
+                "recording_session",
                 outer_ack_observation
                     .as_ref()
                     .expect("authorized outer recorder must have ACK observation"),
@@ -712,6 +910,7 @@ impl ToolRuntime {
                 error_status: None,
                 project: None,
                 model_ergonomics: None,
+                canonical_audit_output: None,
                 correlation: Default::default(),
             };
         }
@@ -729,6 +928,7 @@ impl ToolRuntime {
                     error_status: Some(error_status),
                     project: None,
                     model_ergonomics: None,
+                    canonical_audit_output: None,
                     correlation: Default::default(),
                 };
             }
@@ -738,10 +938,15 @@ impl ToolRuntime {
         // pre-execution audit projection and later dispatch. Malformed input is
         // recorded with an empty request projection rather than reparsed through
         // a schema-filter fallback.
-        let parsed_call = ToolCall::from_tool_name(&request.tool_name, concrete_arguments);
+        crate::tool_request_trace::capture_effective_arguments(
+            &request.tool_name,
+            &concrete_arguments,
+        );
+        let parsed_call =
+            ToolCall::from_tool_name_with_normalization(&request.tool_name, concrete_arguments);
         let session_log_arguments = parsed_call
             .as_ref()
-            .map(|call| session_log_arguments_for_typed_call(&request.tool_name, call))
+            .map(|(call, _)| session_log_arguments_for_typed_call(&request.tool_name, call))
             .unwrap_or_else(|_| Value::Object(Default::default()));
         let mut session_event = self.sessions.record_tool_call_started_with_metadata(
             context.session_id,
@@ -774,13 +979,14 @@ impl ToolRuntime {
                     error_status: Some(error_status),
                     project: None,
                     model_ergonomics: None,
+                    canonical_audit_output: None,
                     correlation: Default::default(),
                 };
             }
         }
 
-        let mut call = match parsed_call {
-            Ok(call) => call,
+        let (mut call, input_normalization) = match parsed_call {
+            Ok(parsed) => parsed,
             Err(message) => {
                 self.sessions.record_tool_call_finished(
                     session_event,
@@ -795,6 +1001,7 @@ impl ToolRuntime {
                     error_status: Some(ToolCallErrorStatus::InvalidArguments { message }),
                     project: None,
                     model_ergonomics: None,
+                    canonical_audit_output: None,
                     correlation: Default::default(),
                 };
             }
@@ -833,6 +1040,7 @@ impl ToolRuntime {
                     &mut result,
                     &self.sessions,
                     session_id,
+                    "recording_session",
                     outer_ack_observation
                         .as_ref()
                         .expect("authorized outer recorder must have ACK observation"),
@@ -844,6 +1052,7 @@ impl ToolRuntime {
                     error_status: None,
                     project: None,
                     model_ergonomics: None,
+                    canonical_audit_output: None,
                     correlation: Default::default(),
                 };
             }
@@ -866,9 +1075,24 @@ impl ToolRuntime {
         }
 
         let project = tool_project(&call);
-        // Preserve the concrete business Session only for final presentation. The
-        // generic recorder remains independent provenance and Window affinity
-        // never becomes execution or Session authority.
+        if let Some(control) = control.as_mut() {
+            if let Err(outcome) = control.before(self, &call, context).await {
+                if let Some(result) = outcome.result.as_ref() {
+                    self.sessions.record_tool_call_finished(
+                        session_event,
+                        false,
+                        &result.output,
+                        result.error.as_deref(),
+                        Some("control_before_failed"),
+                    );
+                }
+                return outcome;
+            }
+            control.main_dispatched = true;
+        }
+        // Preserve the concrete business Session for final presentation and
+        // bounded ActionAudit evidence. The generic recorder remains independent
+        // provenance and Window affinity never becomes execution or Session authority.
         let business_session_id = call.session_id().map(str::to_string);
         // Permission is evaluated once inside dispatch (pre-exec gate). Kernel
         // only reuses the attached decision for the outer recording session —
@@ -887,8 +1111,26 @@ impl ToolRuntime {
                     memory_surface: capabilities.memory_surface,
                 },
                 capabilities,
+                return_timing,
             )
             .await;
+        if result.success {
+            if let Some(code) = input_normalization {
+                result.output["input_normalization"] =
+                    serde_json::json!({"code": code, "hint": code.model_hint()});
+            }
+        }
+        if let Some(control) = control.as_mut() {
+            control
+                .after(self, &request.tool_name, &result, context)
+                .await;
+        }
+        if result.success {
+            // The concrete ToolCall has already passed canonical business Session
+            // lifecycle/authority checks. Retain only its exact identity as bounded
+            // audit evidence; it never becomes recorder or execution authority.
+            correlation.business_session_id = business_session_id.clone();
+        }
         if let Some(session_id) = context.session_id {
             correlation.add_workflow_session(super::window_activity::WorkflowSessionCorrelation {
                 session_id: session_id.to_string(),
@@ -896,15 +1138,19 @@ impl ToolRuntime {
                 relation: super::window_activity::WorkflowSessionCorrelationRelation::Recording,
             });
         }
-        if result.success && context.session_id.is_none() {
-            correlation.recorder_gap_session_id = self
-                .workflow_recording_gap_candidate(
-                    &request.tool_name,
-                    context.window,
-                    context.auth,
-                    &correlation,
-                )
-                .await;
+        let window_attention_session_id = if context.session_id.is_none() {
+            self.workflow_window_affinity_candidate(
+                &request.tool_name,
+                context.window,
+                context.auth,
+                &correlation,
+            )
+            .await
+        } else {
+            None
+        };
+        if result.success {
+            correlation.recorder_gap_session_id = window_attention_session_id.clone();
         }
         if let Some(start) = session_event.as_mut() {
             if let Some(permission) =
@@ -930,101 +1176,68 @@ impl ToolRuntime {
                 &mut result,
                 &self.sessions,
                 session_id,
+                "recording_session",
                 outer_ack_observation
                     .as_ref()
                     .expect("authorized outer recorder must have ACK observation"),
                 recorder_ack_requested,
             );
-        }
-        // Canonical execution evidence and every Session/context overlay are now
-        // complete. Consume the request-scoped plan exactly once to produce the
-        // final model-facing read/search result.
-        result_projection.project(&mut result);
-        if let (Some(session_id), Some(project)) = (
-            correlation.recorder_gap_session_id.as_deref(),
-            correlation.resolved_project.as_deref(),
-        ) {
-            // The gap remains correlation/audit truth. It is not actionable model
-            // guidance when this exact call already supplied the same authorized
-            // business Session for the same resolved Project.
-            if business_session_id.as_deref() != Some(session_id) {
-                if let Some(output) = result.output.as_object_mut() {
-                    output.insert(
-                        "workflow_recording_attention".to_string(),
-                        serde_json::json!({
-                            "status": "recording_session_missing",
-                            "candidate_session_id": session_id,
-                            "project": project,
-                            "reason": "same_window_recent_explicit_association"
-                        }),
-                    );
-                }
-            }
-        }
-        if request.tool_name == "tool_manifest" {
-            super::surface::sparsify_tool_manifest_model_result(&mut result);
-        }
-        // Final model-facing projection: authoritative permission decisions and
-        // recorder events have already been consumed by the Session ledger.
-        super::dispatch::sparsify_failure_model_result_metadata(&request.tool_name, &mut result);
-        if !result.success
-            && request.tool_name != "read_tool_trace"
-            && capabilities.trace_diagnostics
-            && context
-                .auth
-                .is_some_and(|auth| auth.has_scope(crate::auth::SCOPE_ADMIN))
+        } else if let Some(session_id) = window_attention_session_id
+            .as_deref()
+            .filter(|_| result.output.get("session_attention").is_none())
         {
-            if let (Some(trace_ref), Some(output)) = (
-                crate::tool_request_trace::current_full_trace_ref(),
-                result.output.as_object_mut(),
-            ) {
-                output.insert("trace_ref".to_string(), Value::String(trace_ref));
-            }
-        }
-        super::dispatch::sparsify_success_model_result_metadata(&request.tool_name, &mut result);
-        // The continuity hint is diagnostic only. Keep it inside the shared
-        // model-result hard ceiling; if an unrelated producer already consumed
-        // the full envelope, omit this non-authoritative overlay rather than
-        // changing the business result.
-        if result
-            .output
-            .as_object()
-            .is_some_and(|output| output.contains_key("workflow_recording_attention"))
-            && crate::json_measurement::serialized_json_len(&result).is_ok_and(|bytes| {
-                bytes > webcodex_workspace::file_read_range::MAX_SERIALIZED_OUTPUT_BYTES
-            })
-        {
-            if let Some(output) = result.output.as_object_mut() {
-                output.remove("workflow_recording_attention");
-            }
-        }
-        if super::tool_definition::is_model_visible_tool_name(&request.tool_name) {
-            let peer_project = correlation
-                .resolved_project
-                .as_deref()
-                .or(recorder_metadata.recording_session_project.as_deref());
-            self.add_peer_collaboration_projection(
-                &mut result,
-                context.auth,
-                context.window,
-                peer_project,
+            // Window affinity is correlation evidence only. It may locate one
+            // authorized active Session message board for request-scoped ACK and
+            // delivery, but never becomes recorder, business input, execution
+            // context, or durable resolution authority.
+            let session_ack_ids = session_context::session_ack_message_ids(
+                &self.sessions,
+                session_id,
                 &recorder_metadata.ack_session_message_ids,
+                ack_ref.as_deref(),
+            );
+            let ack = session_context::observe_session_attention_acks(
+                &self.sessions,
+                session_id,
+                &session_ack_ids,
+            );
+            session_context::add_session_attention_projection(
+                &mut result,
+                &self.sessions,
+                session_id,
+                "window_affinity",
+                &ack,
+                recorder_ack_requested,
             );
         }
-        if request.tool_name == "observe_jobs" {
-            super::observe_jobs::sparsify_observe_jobs_model_result(&mut result);
+        // Session/permission evidence is sealed above. The response stage owns
+        // canonical audit capture, one-shot model projection, and late sidecars.
+        let postprocess::PostRecordResult {
+            result,
+            canonical_audit_output,
+        } = postprocess::PostRecordResponse {
+            tool_name: &request.tool_name,
+            context,
+            capabilities,
+            recorder: &recorder_metadata,
+            correlation: &correlation,
+            business_session_id: business_session_id.as_deref(),
+            window_reply: window_reply.as_ref(),
         }
+        .finish(self, result, result_projection, telemetry.as_mut())
+        .await;
         ToolCallOutcome {
             success: result.success,
             result: Some(result),
             error_status: None,
             project,
             model_ergonomics: None,
+            canonical_audit_output,
             correlation,
         }
     }
 
-    async fn workflow_recording_gap_candidate(
+    async fn workflow_window_affinity_candidate(
         &self,
         tool_name: &str,
         window: Option<&crate::client_window::ClientWindow>,
@@ -1168,6 +1381,7 @@ mod tests {
             crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD,
             crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
             crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+            crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD,
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD,
         ] {
             assert!(!business_object.contains_key(wrapper));

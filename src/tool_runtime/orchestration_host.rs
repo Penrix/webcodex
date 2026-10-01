@@ -15,14 +15,13 @@ use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 use webcodex_core::workflow_session_contract::{
-    TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD,
+    TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_REF_FIELD,
     TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTED_FAILURE_FIELD,
     TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
 };
 use webcodex_tool_contracts::{
-    runtime_tool_composition_policy, runtime_tool_execution_contract, runtime_tool_metadata,
-    ToolCompositionPolicy, ToolEffect, ToolExecutionContinuation,
+    runtime_tool_composition_policy, runtime_tool_metadata, ToolCompositionPolicy, ToolEffect,
 };
 
 /// Process-local serialization for orchestration-originated Project mutation.
@@ -116,11 +115,10 @@ pub(crate) struct OrchestrationPolicy {
     /// canonical Server-owned target/invocation fields below are always denied
     /// by the host and cannot be weakened by a frontend policy.
     pub(crate) additional_forbidden_argument_fields: &'static [&'static str],
-    /// Optional frontend-only cap for an explicitly requested synchronous handoff
-    /// preference of canonical tools whose continuation is observe_jobs. Omission
-    /// stays omitted so the child uses its canonical default. This never changes
-    /// the child's total execution timeout or Job identity.
-    pub(crate) nested_sync_wait_max_secs: Option<u64>,
+    /// Trusted frontend-owned return policy for nested canonical calls. This may
+    /// only shorten synchronous handoff of an already-started durable execution;
+    /// it never changes execution lifetime, Job identity, or Job observation.
+    pub(crate) child_return_timing: super::return_timing::ToolReturnTimingPolicy,
     /// Optional per-cell budget for canonical mutation attempts. Classification
     /// comes only from ToolEffect::Mutate; a rejected over-budget call never
     /// crosses canonical business dispatch.
@@ -145,8 +143,11 @@ const SERVER_OWNED_ARGUMENT_FIELDS: &[&str] = &[
     "session_id",
     TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
+    TOOL_CALL_ACK_REF_FIELD,
     TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+    super::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD,
     TOOL_CALL_CONTEXT_REQUEST_FIELD,
+    super::control_sidecar::CONTROL_FIELD,
     TOOL_EXPECTED_FAILURE_FIELD,
     TOOL_EXPECTED_FAILURE_KIND_FIELD,
     TOOL_RESULT_EXPECTATION_FIELD,
@@ -374,10 +375,20 @@ impl OrchestrationEffectAccumulator {
             }
             return;
         }
-        if output.get("terminal").and_then(Value::as_bool) != Some(true) {
+        let continuation = output
+            .get("continuation")
+            .filter(|value| value["tool"].as_str() == Some("observe_jobs"));
+        let continuation_job_id =
+            continuation.and_then(|value| value["arguments"]["items"][0]["job_id"].as_str());
+        if execution_state == Some("pending")
+            || output.get("terminal").and_then(Value::as_bool) == Some(false)
+        {
             if let (Some(job_id), Some(continuation)) = (
-                output.get("job_id").and_then(Value::as_str),
-                output.get("continuation").filter(|value| value.is_object()),
+                output
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .or(continuation_job_id),
+                continuation,
             ) {
                 if let Some(child) = self.children.get_mut(&ordinal) {
                     child.outcome = ConsequentialChildOutcome::JobHandoff;
@@ -687,11 +698,7 @@ impl CanonicalOrchestrationHost {
         receipt
     }
 
-    fn prepare_arguments(
-        &self,
-        tool_name: &str,
-        arguments: Value,
-    ) -> Result<Value, OrchestrationHostError> {
+    fn prepare_arguments(&self, arguments: Value) -> Result<Value, OrchestrationHostError> {
         let Some(mut arguments) = arguments.as_object().cloned() else {
             return Err(OrchestrationHostError::new(
                 OrchestrationHostFailureKind::InvalidArguments,
@@ -717,17 +724,6 @@ impl CanonicalOrchestrationHost {
                 OrchestrationHostFailureKind::InvalidArguments,
                 format!("nested tool arguments may not set frontend-reserved field `{field}`"),
             ));
-        }
-        if let Some(max_secs) = self.policy.nested_sync_wait_max_secs {
-            if runtime_tool_execution_contract(tool_name).is_some_and(|execution| {
-                execution.continuation == ToolExecutionContinuation::ObserveJobs
-            }) {
-                if let Some(value) = arguments.get_mut("sync_wait_secs") {
-                    if value.as_u64().is_some_and(|seconds| seconds > max_secs) {
-                        *value = Value::from(max_secs);
-                    }
-                }
-            }
         }
         arguments.insert("project".to_string(), Value::String(self.project.clone()));
         arguments.insert(
@@ -756,7 +752,7 @@ impl CanonicalOrchestrationHost {
         // explicit admitted tool set. Once admitted, argument/scope failures are
         // still counted as attempted child calls so diagnostics preserve them.
         let mut child_guard = self.begin_nested_call(&tool_name);
-        let arguments = self.prepare_arguments(&tool_name, arguments)?;
+        let arguments = self.prepare_arguments(arguments)?;
         let scheduling_guard = self.acquire_scheduling_guard(&tool_name).await?;
         let mutation_guard = if runtime_tool_metadata(&tool_name).effect == ToolEffect::Mutate {
             Some(
@@ -798,7 +794,7 @@ impl CanonicalOrchestrationHost {
                 }
                 if matches!(tool_name.as_str(), "cargo_check" | "cargo_test")
                     && !effects.children.values().any(|child| {
-                        child.tool == "apply_text_edits"
+                        child.tool == "edit_project_files"
                             && child.outcome == ConsequentialChildOutcome::KnownResult
                             && child.success == Some(true)
                             && child.state_changed.is_some()
@@ -806,7 +802,7 @@ impl CanonicalOrchestrationHost {
                 {
                     return Err(OrchestrationHostError::new(
                         OrchestrationHostFailureKind::CompositionPolicyDenied,
-                        "validation requires a successful canonical apply_text_edits result with known state_changed in this cell; rejected or unknown edits cannot be validated",
+                        "validation requires a successful canonical edit_project_files result with known state_changed in this cell; rejected or unknown edits cannot be validated",
                     ));
                 }
             }
@@ -850,7 +846,7 @@ impl CanonicalOrchestrationHost {
         );
         let outcome = self
             .tools
-            .call_tool_with_context(
+            .call_tool_with_context_and_return_timing(
                 ToolCallRequest {
                     tool_name: tool_name.clone(),
                     arguments,
@@ -865,6 +861,7 @@ impl CanonicalOrchestrationHost {
                     record_oauth_scope_denials: true,
                     host_file_import_trust: HostFileImportTrust::Untrusted,
                 },
+                self.policy.child_return_timing,
             )
             .await;
         // Both orchestration fences cover exactly the canonical ToolRuntime
@@ -936,7 +933,7 @@ mod receipt_tests {
     #[test]
     fn mutation_result_without_authoritative_state_changed_fails_closed() {
         let mut effects = OrchestrationEffectAccumulator::default();
-        effects.begin_if_consequential(1, "apply_text_edits");
+        effects.begin_if_consequential(1, "edit_project_files");
         effects.finish(
             1,
             &crate::tool_runtime::ToolResult::ok(serde_json::json!({

@@ -1,9 +1,9 @@
 use super::project_resolution::ResolvedProject;
 use super::startup_brief::{
-    builtin_coding_workflow_projection, project_instructions_context_projection,
+    builtin_coding_workflow_projection_with_policy, project_instructions_context_projection,
 };
 use super::tool_inputs::CodingGuidanceProfile;
-use super::{ToolResult, ToolRuntime};
+use super::{SuggestedToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::json_measurement::serialized_json_len;
 use serde::Serialize;
@@ -94,6 +94,16 @@ pub(crate) const CONTEXT_MATERIAL_SPECS: &[ContextMaterialSpec] = &[
     },
 ];
 
+// Optional workflow chapters are discovered through the stable webcodex.workflow
+// entrypoint, not repeated in every cached tool descriptor's example key list.
+// Adding a chapter therefore needs neither new tool registration nor schema refresh.
+const GOAL_WORKFLOW_MATERIAL: ContextMaterialSpec = ContextMaterialSpec {
+    key: crate::model_workflow::GOAL_WORKFLOW_CONTEXT_KEY,
+    project_required: false,
+    scope_policy: ContextMaterialScopePolicy::Public,
+    surface: ContextMaterialSurface::AnySidecar,
+};
+
 pub(crate) fn context_material_keys_csv() -> String {
     CONTEXT_MATERIAL_SPECS
         .iter()
@@ -103,7 +113,10 @@ pub(crate) fn context_material_keys_csv() -> String {
 }
 
 fn context_material_spec(key: &str) -> Option<&'static ContextMaterialSpec> {
-    CONTEXT_MATERIAL_SPECS.iter().find(|spec| spec.key == key)
+    CONTEXT_MATERIAL_SPECS
+        .iter()
+        .chain(std::iter::once(&GOAL_WORKFLOW_MATERIAL))
+        .find(|spec| spec.key == key)
 }
 
 fn context_material_surface_available(
@@ -188,6 +201,7 @@ impl ToolRuntime {
             capabilities,
             CodingGuidanceProfile::default(),
             None,
+            None,
         )
         .await;
     }
@@ -201,6 +215,7 @@ impl ToolRuntime {
         capabilities: ContextMaterialCapabilities,
         guidance_profile: CodingGuidanceProfile,
         window: Option<&crate::client_window::ClientWindow>,
+        instructions: Option<&super::project_instructions::ProjectInstructionsSnapshot>,
     ) {
         if requested.is_empty() {
             return;
@@ -209,13 +224,20 @@ impl ToolRuntime {
         let mut seen = HashSet::new();
         let mut materials = Vec::new();
         let mut truncated = false;
-        for key in requested
+        let requested: Vec<_> = requested
             .iter()
             .map(|key| key.trim())
             .filter(|key| !key.is_empty())
             .filter(|key| seen.insert((*key).to_string()))
             .take(MAX_CONTEXT_REQUEST_ITEMS)
-        {
+            .collect();
+        // Reserve the canonical public workflow before shortening an earlier
+        // instruction body; never reorder, reload, or silently discard rules.
+        let workflow = requested.contains(&"webcodex.workflow").then(|| json!({
+            "key":"webcodex.workflow", "status":"available",
+            "projection":builtin_coding_workflow_projection_with_policy(guidance_profile, self.model_workflow_policy),
+        }));
+        for (index, key) in requested.iter().copied().enumerate() {
             let material = if let Some(spec) = context_material_spec(key) {
                 if !context_material_surface_available(spec.surface, capabilities) {
                     unavailable(key, "context_material_surface_unavailable")
@@ -228,8 +250,16 @@ impl ToolRuntime {
                         "project.instructions" => {
                             let project =
                                 resolved_project.expect("registry requires project target");
-                            let snapshot =
-                                self.load_effective_coding_instructions(project, auth).await;
+                            let loaded;
+                            let snapshot = match instructions {
+                                Some(snapshot) => snapshot,
+                                None => {
+                                    loaded = self
+                                        .load_effective_coding_instructions(project, auth)
+                                        .await;
+                                    &loaded
+                                }
+                            };
                             let mut material = if snapshot.scan_complete {
                                 json!({"key": key, "status": "available", "projection": null})
                             } else {
@@ -242,16 +272,26 @@ impl ToolRuntime {
                             };
                             // Measure the complete prospective envelope, including
                             // earlier materials and the unavailable-reason overhead.
+                            let previous_len = materials.len();
                             materials.push(material.clone());
+                            for later in &requested[index + 1..] {
+                                // Exact public workflow bytes; only an omission
+                                // receipt for other providers. No speculative I/O.
+                                materials.push(if *later == "webcodex.workflow" {
+                                    workflow.as_ref().expect("requested workflow").clone()
+                                } else {
+                                    unavailable(later, "context_projection_budget_exceeded")
+                                });
+                            }
                             let reserved = serialized_json_len(&ContextProjectionMeasure {
                                 materials: &materials,
                                 truncated,
                             })
                             .unwrap_or(usize::MAX)
                             .saturating_sub(4); // Replace the literal JSON null.
-                            materials.pop();
+                            materials.truncate(previous_len);
                             material["projection"] = project_instructions_context_projection(
-                                &snapshot,
+                                snapshot,
                                 MAX_CONTEXT_PROJECTION_BYTES.saturating_sub(reserved),
                             );
                             material
@@ -323,10 +363,13 @@ impl ToolRuntime {
                                 Err(reason_code) => unavailable(key, reason_code),
                             }
                         }
-                        "webcodex.workflow" => json!({
+                        "webcodex.workflow" => {
+                            workflow.as_ref().expect("requested workflow").clone()
+                        }
+                        crate::model_workflow::GOAL_WORKFLOW_CONTEXT_KEY => json!({
                             "key": key,
                             "status": "available",
-                            "projection": builtin_coding_workflow_projection(guidance_profile),
+                            "projection": self.model_workflow_policy.goal_workflow_projection(),
                         }),
                         _ => unreachable!("context material registry/provider match drifted"),
                     }
@@ -443,14 +486,19 @@ impl ToolRuntime {
                 candidates_truncated = true;
                 break;
             }
-            candidates.push(json!({
+            let session_ref = self.session_reference_for_id(&session_id, auth);
+            let mut candidate = json!({
                 "session_id": session_id,
                 "project": project,
                 "lifecycle": "active",
                 "title": title,
                 "relations": link.relations,
                 "last_linked_at_ms": link.last_linked_at_ms,
-            }));
+            });
+            if let Some(session_ref) = session_ref {
+                candidate["session_ref"] = json!(session_ref);
+            }
+            candidates.push(candidate);
         }
 
         let mut projection = json!({
@@ -460,10 +508,14 @@ impl ToolRuntime {
             "selection": "caller_must_choose_exact_session",
         });
         if candidates.len() == 1 {
-            projection["suggested_call"] = json!({
-                "tool": "session_handoff_summary",
-                "arguments": {"session_id": candidates[0]["session_id"]},
-            });
+            let session_selector = candidates[0]
+                .get("session_ref")
+                .unwrap_or(&candidates[0]["session_id"]);
+            projection["suggested_call"] = SuggestedToolCall::fallback_recovery(
+                "session_handoff_summary",
+                json!({"session_id": session_selector}),
+            )
+            .to_value();
         }
         Ok(projection)
     }

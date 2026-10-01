@@ -8,6 +8,63 @@ use serde::Deserialize;
 use tauri::{AppHandle, State};
 
 #[tauri::command]
+pub async fn authorize_runner_capabilities(
+    state: State<'_, AppState>,
+    request: crate::runner_capability_grant::GrantRequest,
+) -> DesktopResult<crate::runner_capability_grant::AuthorizationSnapshot> {
+    state.authorize_runner_capabilities(request).await
+}
+
+#[tauri::command]
+pub async fn runner_capability_authorization(
+    state: State<'_, AppState>,
+    expected: crate::webcodex::settings::SettingsTarget,
+) -> DesktopResult<crate::runner_capability_grant::AuthorizationSnapshot> {
+    state.runner_capability_authorization(expected).await
+}
+
+#[tauri::command]
+pub async fn ssh_resource_list(
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::ssh_resources::SshResourcesSnapshot> {
+    state.ssh_resource_list().await
+}
+
+#[tauri::command]
+pub async fn ssh_resource_register(
+    state: State<'_, AppState>,
+    request: crate::ssh_resources::SshRegisterRequest,
+) -> DesktopResult<crate::ssh_resources::SshMutationResult> {
+    state.ssh_resource_register(request).await
+}
+
+#[tauri::command]
+pub async fn ssh_resource_remove(
+    state: State<'_, AppState>,
+    request: crate::ssh_resources::SshRemoveRequest,
+) -> DesktopResult<crate::ssh_resources::SshMutationResult> {
+    state.ssh_resource_remove(request).await
+}
+
+#[tauri::command]
+pub async fn save_coding_agent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::coding_agents::CodingAgentUpdate,
+) -> DesktopResult<DesktopStateSnapshot> {
+    project_state_result(&app, state.save_coding_agent(request).await)
+}
+
+#[tauri::command]
+pub async fn remove_coding_agent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::coding_agents::CodingAgentRemove,
+) -> DesktopResult<DesktopStateSnapshot> {
+    project_state_result(&app, state.remove_coding_agent(request).await)
+}
+
+#[tauri::command]
 pub async fn save_mcp_provider(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -52,6 +109,30 @@ pub async fn update_tunnel_config(
     request: crate::tunnel_config::TunnelConfigRequest,
 ) -> Result<DesktopStateSnapshot, DesktopError> {
     project_state_result(&app, state.update_tunnel_config(request).await)
+}
+
+#[tauri::command]
+pub async fn managed_instructions_read(
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::managed_instructions::Snapshot> {
+    state.managed_instructions_read().await
+}
+
+#[tauri::command]
+pub async fn managed_instructions_save(
+    state: State<'_, AppState>,
+    request: crate::managed_instructions::SaveRequest,
+) -> DesktopResult<crate::managed_instructions::Snapshot> {
+    state.managed_instructions_save(request).await
+}
+
+#[tauri::command]
+pub async fn managed_instructions_enable(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::managed_instructions::EnableRequest,
+) -> DesktopResult<DesktopStateSnapshot> {
+    project_state_result(&app, state.managed_instructions_enable(request).await)
 }
 
 #[derive(Deserialize)]
@@ -184,6 +265,14 @@ pub async fn resume_saved_runtime(
 }
 
 #[tauri::command]
+pub async fn resume_saved_connections(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    project_state_result(&app, state.resume_saved_connections().await)
+}
+
+#[tauri::command]
 pub async fn update_tunnel_proxy(
     request: TunnelProxyRequest,
     app: AppHandle,
@@ -213,6 +302,36 @@ pub async fn configure_local_setup(
         .configure_local_setup(request.project_path.as_deref())
         .await;
     project_state_result(&app, result)
+}
+
+#[tauri::command]
+pub async fn repair_environment_user_credential(
+    request: crate::models::EnvironmentUserCredentialRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    project_state_result(
+        &app,
+        state.repair_environment_user_credential(request).await,
+    )
+}
+
+#[tauri::command]
+pub async fn environment_service_action(
+    request: crate::models::EnvironmentServiceRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    project_state_result(&app, state.environment_service_action(request).await)
+}
+
+#[tauri::command]
+pub async fn configure_environment(
+    request: crate::models::EnvironmentInput,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    project_state_result(&app, state.configure_environment(request).await)
 }
 
 #[tauri::command]
@@ -317,6 +436,15 @@ pub async fn update_runner_settings(
 ) -> Result<DesktopStateSnapshot, DesktopError> {
     project_state_result(&app, state.update_runner_settings(request).await)
 }
+
+#[tauri::command]
+pub async fn update_runner_allowed_roots(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: crate::webcodex::settings::AllowedRootsUpdate,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    project_state_result(&app, state.update_runner_allowed_roots(request).await)
+}
 #[tauri::command]
 pub async fn restart_owned_runner(
     app: AppHandle,
@@ -329,9 +457,29 @@ pub async fn restart_owned_runner(
 #[tauri::command]
 pub fn get_computer_permissions(
     app: AppHandle,
+    state: State<'_, AppState>,
+) -> crate::platform::permissions::ComputerPermissions {
+    computer_permissions_snapshot(&app, &state)
+}
+
+#[tauri::command]
+pub fn request_computer_permission(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    action: crate::platform::permissions::PermissionAction,
+) -> Result<crate::platform::permissions::ComputerPermissions, DesktopError> {
+    let runner_path = runner_execution_path(&state);
+    crate::platform::permissions::request(action, runner_path.as_deref())?;
+    Ok(computer_permissions_snapshot(&app, &state))
+}
+
+fn computer_permissions_snapshot(
+    app: &AppHandle,
+    state: &AppState,
 ) -> crate::platform::permissions::ComputerPermissions {
     use tauri::Manager;
-    let mut permissions = crate::platform::permissions::probe();
+    let runner_path = runner_execution_path(state);
+    let mut permissions = crate::platform::permissions::probe_for_runner(runner_path.as_deref());
     permissions.foreground = app
         .get_webview_window(crate::desktop_shell::MAIN_WINDOW_LABEL)
         .is_some_and(|window| {
@@ -339,15 +487,15 @@ pub fn get_computer_permissions(
         });
     permissions
 }
-#[tauri::command]
-pub fn request_computer_permission(
-    app: AppHandle,
-    action: crate::platform::permissions::PermissionAction,
-) -> Result<crate::platform::permissions::ComputerPermissions, DesktopError> {
-    crate::platform::permissions::request(action)?;
-    Ok(get_computer_permissions(app))
-}
 
+fn runner_execution_path(state: &AppState) -> Option<std::path::PathBuf> {
+    let directory = state.get_state().binaries?.directory;
+    #[cfg(target_os = "windows")]
+    let binary = "webcodex-runner.exe";
+    #[cfg(not(target_os = "windows"))]
+    let binary = "webcodex-runner";
+    Some(std::path::PathBuf::from(directory).join(binary))
+}
 #[tauri::command]
 pub async fn add_runner_plugin(
     app: AppHandle,
@@ -363,4 +511,181 @@ pub async fn workspace_query(
     request: crate::workspace::WorkspaceRequest,
 ) -> Result<serde_json::Value, DesktopError> {
     state.workspace_query(request).await
+}
+
+#[tauri::command]
+pub async fn get_runtime_settings(
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::runtime_selection::RuntimeSettings> {
+    state.runtime_settings().await
+}
+
+#[tauri::command]
+pub async fn probe_runtime(
+    source: crate::runtime_selection::RuntimeSource,
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::runtime_selection::RuntimeSettings> {
+    state.probe_runtime(source).await
+}
+
+#[tauri::command]
+pub async fn recheck_runtime(
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::runtime_selection::RuntimeSettings> {
+    state.recheck_runtime().await
+}
+
+#[tauri::command]
+pub async fn switch_runtime(
+    request: crate::runtime_selection::RuntimeSwitchRequest,
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::runtime_selection::RuntimeSwitchResult> {
+    state.switch_runtime(request).await
+}
+
+#[tauri::command]
+pub async fn restore_previous_configuration(
+    expected_primary_sha256: String,
+    state: State<'_, AppState>,
+) -> DesktopResult<DesktopStateSnapshot> {
+    state
+        .restore_previous_configuration(expected_primary_sha256)
+        .await
+}
+
+#[tauri::command]
+pub async fn get_diagnostics(
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::diagnostics::DiagnosticSnapshot> {
+    state.diagnostics().await
+}
+
+#[tauri::command]
+pub async fn set_tool_request_tracing(
+    request: crate::diagnostics::TraceUpdate,
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::diagnostics::TraceSettings> {
+    state.set_tool_request_tracing(request).await
+}
+
+#[tauri::command]
+pub async fn open_diagnostic_resource(
+    kind: crate::diagnostics::ResourceKind,
+    state: State<'_, AppState>,
+) -> DesktopResult<()> {
+    state.open_diagnostic_resource(kind).await
+}
+
+#[tauri::command]
+pub async fn copy_runtime_console_credential(
+    expected_fence: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> DesktopResult<()> {
+    state.copy_console_credential(&app, &expected_fence).await
+}
+
+#[tauri::command]
+pub async fn copy_diagnostic_report(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> DesktopResult<()> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let report = state.diagnostics().await?;
+    app.clipboard()
+        .write_text(report.markdown)
+        .map_err(|_| crate::diagnostics::diagnostic_error("clipboard_unavailable"))
+}
+
+#[tauri::command]
+pub async fn export_support_bundle(path: String, state: State<'_, AppState>) -> DesktopResult<()> {
+    let report = state.diagnostics().await?.report;
+    tokio::task::spawn_blocking(move || {
+        crate::diagnostics::export_support(std::path::Path::new(&path), &report)
+    })
+    .await
+    .map_err(|_| crate::diagnostics::diagnostic_error("support_bundle_write_unconfirmed"))?
+}
+
+#[tauri::command]
+pub async fn check_for_updates(
+    manual: bool,
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::updates::UpdateStatus> {
+    state.check_for_updates(manual).await
+}
+#[tauri::command]
+pub fn get_update_download_state(state: State<'_, AppState>) -> crate::updates::DownloadStatus {
+    state.get_update_download_state()
+}
+
+#[tauri::command]
+pub async fn download_update(
+    version: String,
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::updates::UpdateStatus> {
+    state.download_update(&version).await
+}
+
+#[tauri::command]
+pub fn cancel_update_download(state: State<'_, AppState>) -> crate::updates::DownloadStatus {
+    state.cancel_update_download()
+}
+
+#[tauri::command]
+pub async fn set_automatic_update_download(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::updates::UpdateStatus> {
+    state.set_automatic_update_download(enabled).await
+}
+
+#[tauri::command]
+pub async fn install_verified_update(
+    version: String,
+    confirmed: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> DesktopResult<()> {
+    if state.install_verified_update(&version, confirmed).await? {
+        // Only the explicit Install confirmation authorizes this exit. The
+        // normal exit path closes Desktop-owned processes, not persistent services.
+        app.exit(0);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn remind_update_later(
+    state: State<'_, AppState>,
+) -> DesktopResult<crate::updates::UpdateStatus> {
+    state.remind_update_later().await
+}
+#[tauri::command]
+pub async fn open_latest_release(state: State<'_, AppState>) -> DesktopResult<()> {
+    state.open_latest_release().await
+}
+
+#[tauri::command]
+pub fn get_desktop_build_info() -> webcodex_core::desktop_runtime_contract::MachineBuildInfo {
+    let mut info = webcodex_build_info::machine_build_info("webcodex-desktop");
+    info.version = env!("CARGO_PKG_VERSION").to_string();
+    info
+}
+
+#[tauri::command]
+pub async fn prepare_project_unregister(
+    project: String,
+    state: State<'_, AppState>,
+) -> Result<crate::project_inventory::UnregisterObservation, DesktopError> {
+    state.prepare_project_unregister(&project).await
+}
+
+#[tauri::command]
+pub async fn unregister_project(
+    request: crate::project_inventory::UnregisterRequest,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DesktopStateSnapshot, DesktopError> {
+    project_state_result(&app, state.unregister_project(request).await)
 }

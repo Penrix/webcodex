@@ -22,6 +22,7 @@ pub(super) enum PendingRequestEnqueueError {
     UnknownRunner { client_id: String },
     RunnerOffline { client_id: String },
     QueueFull { client_id: String, limit: usize },
+    Maintenance,
 }
 
 impl fmt::Display for PendingRequestEnqueueError {
@@ -42,6 +43,7 @@ impl fmt::Display for PendingRequestEnqueueError {
                 formatter,
                 "too many pending requests for runner {client_id} (limit {limit})"
             ),
+            Self::Maintenance => write!(formatter, "runner admission is paused for maintenance"),
         }
     }
 }
@@ -302,7 +304,7 @@ pub(super) fn job_view(job: &ShellJobRecord) -> ShellJobInfo {
         // cursor-aware token for its frozen returned log snapshot.
         observation_token: webcodex_core::job_observation::JobObservationToken::new_baseline(
             job.job_id.clone(),
-            job.observation.epoch.to_string(),
+            &job.observation.epoch,
             job.observation
                 .revision
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -528,15 +530,36 @@ pub(super) fn observe_job_terminal(job: &mut ShellJobRecord, now: i64) {
 /// authoritative snapshot. `notify_waiters` (not `notify_one`) so that every
 /// concurrent waiter observes the update; waiters re-check the snapshot after
 /// every wake, so spurious broadcasts are harmless.
-pub(super) fn notify_job_update(job: &ShellJobRecord) {
+fn notify_job_observation(job: &ShellJobRecord, meaningful: bool) {
     use std::sync::atomic::Ordering;
-    job.observation.revision.fetch_add(1, Ordering::Relaxed);
+    let revision = job
+        .observation
+        .revision
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if meaningful {
+        job.observation
+            .last_meaningful_revision
+            .store(revision, Ordering::Relaxed);
+    }
     job.observation.notify.notify_waiters();
     if job.lifecycle.is_terminal() {
         if let Some(candidates) = &job.observation.receipt_candidates {
             candidates.lock().unwrap().insert(job.job_id.clone());
         }
     }
+}
+
+/// Broadcast a semantically meaningful public Job update.
+pub(super) fn notify_job_update(job: &ShellJobRecord) {
+    notify_job_observation(job, true);
+}
+
+/// Broadcast a sequence-only liveness update. Existing change observers still
+/// wake because the ordinary revision advances; meaningful-change observers
+/// can distinguish it through `last_meaningful_revision`.
+pub(super) fn notify_job_heartbeat(job: &ShellJobRecord) {
+    notify_job_observation(job, false);
 }
 
 pub(super) fn is_runner_active_job_status(status: &str) -> bool {
@@ -588,7 +611,7 @@ pub(super) fn mark_job_lost(
     notify_job_update(job);
 }
 
-fn runner_is_connected_locked(inner: &RunnerRegistryInner, client_id: &str) -> bool {
+pub(crate) fn runner_is_connected_locked(inner: &RunnerRegistryInner, client_id: &str) -> bool {
     inner
         .runners
         .get(client_id)
@@ -654,6 +677,13 @@ pub(super) fn ensure_dispatch_supported_locked(
     inner: &RunnerRegistryInner,
     client_id: &str,
 ) -> Result<(), PendingRequestEnqueueError> {
+    if inner
+        .maintenance
+        .as_ref()
+        .is_some_and(|lease| lease.scope.covers(client_id))
+    {
+        return Err(PendingRequestEnqueueError::Maintenance);
+    }
     if !inner.runners.contains_key(client_id) {
         return Err(PendingRequestEnqueueError::UnknownRunner {
             client_id: client_id.to_string(),

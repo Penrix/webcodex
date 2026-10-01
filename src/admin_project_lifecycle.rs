@@ -877,6 +877,7 @@ mod tests {
 
     fn active_job_request(client_id: &str, command: &str) -> ShellJobOpRequest {
         ShellJobOpRequest {
+            login: false,
             op: "start".to_string(),
             client_id: Some(client_id.to_string()),
             cwd: None,
@@ -899,6 +900,7 @@ mod tests {
         registry
             .register(crate::test_support::current_runner_registration(
                 RunnerRegisterRequest {
+                    computer_session_availability: None,
                     client_id: "owned-runner".to_string(),
                     runner_instance_id: "instance-owned".to_string(),
                     runner_protocol_generation:

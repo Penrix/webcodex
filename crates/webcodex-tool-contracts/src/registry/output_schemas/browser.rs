@@ -15,9 +15,16 @@ fn target_schema() -> Value {
                 "properties": {
                     "browser_observe": {"type": "boolean"},
                     "browser_control": {"type": "boolean"},
+                    "browser_element_action_admission": {"type": "boolean"},
+                    "browser_batch": {"type": "boolean"},
                     "browser_launch": {"type": "boolean"}
                 },
-                "required": ["browser_observe", "browser_control", "browser_launch"]
+                "required": [
+                    "browser_observe",
+                    "browser_control",
+                    "browser_element_action_admission",
+                    "browser_launch"
+                ]
             }
         },
         "required": ["client_id", "display_name", "connected", "capabilities"]
@@ -57,11 +64,76 @@ fn node_schema() -> Value {
         "properties": {
             "role": {"type": "string", "maxLength": 64},
             "name": {"anyOf": [{"type": "string", "maxLength": 512}, {"type": "null"}]},
+            "description": {"anyOf": [{"type": "string", "maxLength": 512}, {"type": "null"}]},
             "value": {"anyOf": [{"type": "string", "maxLength": 512}, {"type": "null"}]},
+            "group_id": {"anyOf": [{"type": "string", "maxLength": 32}, {"type": "null"}]},
+            "group_role": {"anyOf": [{"type": "string", "maxLength": 64}, {"type": "null"}]},
+            "group_label": {"anyOf": [{"type": "string", "maxLength": 512}, {"type": "null"}]},
+            "checked": {"anyOf": [{"type": "string", "maxLength": 32}, {"type": "null"}]},
+            "selected": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "required": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "disabled": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "read_only": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
             "element_id": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 128}, {"type": "null"}]},
+            "actions": {
+                "type": "array",
+                "maxItems": 5,
+                "uniqueItems": true,
+                "items": {
+                    "type": "string",
+                    "enum": ["click", "input_text", "select_option", "set_value", "upload_file"]
+                }
+            },
             "actionable": {"type": "boolean"}
         },
         "required": ["role", "actionable"]
+    })
+}
+
+fn stability_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "stable": {"type": "boolean"},
+            "waited_ms": {"type": "integer", "minimum": 0},
+            "reason": {"type": "string", "maxLength": 64}
+        },
+        "required": ["stable", "waited_ms", "reason"]
+    })
+}
+
+fn bounded_count(maximum: u64) -> Value {
+    json!({"type": "integer", "minimum": 0, "maximum": maximum})
+}
+
+fn console_entry_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "level": {"type": "string", "maxLength": 64},
+            "text": {"type": "string", "maxLength": 2048},
+            "source": {"anyOf": [{"type": "string", "maxLength": 8192}, {"type": "null"}]},
+            "timestamp": {"anyOf": [{"type": "number"}, {"type": "null"}]}
+        },
+        "required": ["level", "text", "source", "timestamp"]
+    })
+}
+
+fn network_entry_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "method": {"type": "string", "maxLength": 128},
+            "url": {"type": "string", "maxLength": 8192},
+            "resource_type": {"anyOf": [{"type": "string", "maxLength": 64}, {"type": "null"}]},
+            "status": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 65535}, {"type": "null"}]},
+            "failed_reason": {"anyOf": [{"type": "string", "maxLength": 512}, {"type": "null"}]},
+            "timestamp": {"anyOf": [{"type": "number"}, {"type": "null"}]}
+        },
+        "required": ["method", "url", "resource_type", "status", "failed_reason", "timestamp"]
     })
 }
 
@@ -109,6 +181,7 @@ fn recovery_schema() -> Value {
         "properties": {
             "reason": {"type": "string", "maxLength": 256},
             "suggested_call": suggested_tool_call_schema(
+                webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery,
                 "browser_observe",
                 arguments,
                 "Observation-first reconciliation call. It never retries the uncertain Browser effect."
@@ -150,10 +223,69 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
                 (
                     "count",
-                    json!({"type": "integer", "minimum": 0, "maximum": 64}),
+                    json!({"type": "integer", "minimum": 0, "maximum": 300}),
                 ),
                 ("total_count", json!({"type": "integer", "minimum": 0})),
                 ("truncated", json!({"type": "boolean"})),
+                (
+                    "snapshot_mode",
+                    json!({"type": "string", "enum": ["full", "interactive"]}),
+                ),
+                ("auto_compacted", json!({"type": "boolean"})),
+                (
+                    "max_nodes",
+                    json!({"type": "integer", "minimum": 1, "maximum": 256}),
+                ),
+                (
+                    "max_depth",
+                    json!({"type": "integer", "minimum": 1, "maximum": 32}),
+                ),
+                ("cursor", json!({"type": "integer", "minimum": 0})),
+                ("since_cursor", json!({"type": "integer", "minimum": 0})),
+                ("delta_truncated", json!({"type": "boolean"})),
+                ("new_console_errors", bounded_count(200)),
+                ("new_console_warnings", bounded_count(200)),
+                ("new_failed_requests", bounded_count(300)),
+                ("new_4xx", bounded_count(300)),
+                ("new_5xx", bounded_count(300)),
+                (
+                    "retained_count",
+                    json!({"type": "integer", "minimum": 0, "maximum": 300}),
+                ),
+                (
+                    "entries",
+                    json!({
+                        "type": "array",
+                        "maxItems": 300,
+                        "items": {"oneOf": [console_entry_schema(), network_entry_schema()]}
+                    }),
+                ),
+                (
+                    "console_retained",
+                    json!({"type": "integer", "minimum": 0, "maximum": 200}),
+                ),
+                (
+                    "console_count",
+                    json!({"type": "integer", "minimum": 0, "maximum": 200}),
+                ),
+                ("console_truncated", json!({"type": "boolean"})),
+                (
+                    "console",
+                    json!({"type": "array", "maxItems": 200, "items": console_entry_schema()}),
+                ),
+                (
+                    "network_retained",
+                    json!({"type": "integer", "minimum": 0, "maximum": 300}),
+                ),
+                (
+                    "network_count",
+                    json!({"type": "integer", "minimum": 0, "maximum": 300}),
+                ),
+                ("network_truncated", json!({"type": "boolean"})),
+                (
+                    "network",
+                    json!({"type": "array", "maxItems": 300, "items": network_entry_schema()}),
+                ),
                 (
                     "browser_id",
                     json!({"type": "string", "minLength": 1, "maxLength": 128}),
@@ -206,6 +338,12 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
         "browser_act" => {
             let mut fields = common_fields();
             fields.extend([
+                ("requested_count", bounded_count(32)),
+                ("completed_count", json!({"type": "integer", "minimum": 0, "maximum": 32, "description": "Known completed operations, even when aggregate execution_state is outcome_unknown. Missing after transport loss means progress is unknown."})),
+                ("stopped_at_index", json!({"type": "integer", "minimum": 0, "maximum": 31, "description": "Zero-based stopped operation. A post-effect document change stops at the completed operation's index."})),
+                ("remaining_count", json!({"type": "integer", "minimum": 0, "maximum": 32, "description": "Definitely unstarted operations, including a rejected operation but excluding an uncertain operation. Never implies permission to retry."})),
+                ("needs_snapshot", json!({"type": "boolean"})),
+                ("stopped_execution_state", json!({"type": "string", "enum": ["not_started", "completed", "outcome_unknown"]})),
                 (
                     "browser_id",
                     json!({"type": "string", "minLength": 1, "maxLength": 128}),
@@ -220,6 +358,7 @@ pub fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
                 ("title", json!({"type": "string", "maxLength": 256})),
                 ("url", json!({"type": "string", "maxLength": 2048})),
+                ("stability", stability_schema()),
             ]);
             let mut schema = wrapped_output_schema(fields);
             schema["properties"]["output"]["additionalProperties"] = json!(false);

@@ -29,8 +29,151 @@ fn mcp_gateway_tool_call_params_do_not_retain_outer_meta() {
     }
 }
 
+#[test]
+fn mcp_tool_action_audit_ids_keep_successful_business_session_internal_and_bounded() {
+    let mut correlation = crate::tool_runtime::ToolCallCorrelation::default();
+    correlation.business_session_id = Some("wc_sess_AAAAAAAAAAAAAAAA".to_string());
+    let ids = mcp_tool_action_audit_ids(true, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None)
+        .expect("successful bounded ids");
+    assert_eq!(ids["business_session_id"], "wc_sess_AAAAAAAAAAAAAAAA");
+    assert_eq!(ids["goal_id"], "wc_goal_BBBBBBBBBBBBBBBB");
+    assert_eq!(ids.as_object().unwrap().len(), 2);
+    assert!(
+        mcp_tool_action_audit_ids(false, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None,)
+            .is_none()
+    );
+
+    correlation.business_session_id = None;
+    assert_eq!(
+        mcp_tool_action_audit_ids(true, Some("wc_goal_BBBBBBBBBBBBBBBB"), &correlation, None,),
+        Some(json!({"goal_id": "wc_goal_BBBBBBBBBBBBBBBB"}))
+    );
+    assert!(mcp_tool_action_audit_ids(true, None, &correlation, None).is_none());
+}
+
+#[test]
+fn mcp_job_audit_correlation_keeps_only_stable_job_identity() {
+    let handoff = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "promoted_to_job": true,
+                    "job_id": "wc_job_background_123",
+                    "observation_token": "opaque-token-must-not-be-recorded"
+                }
+            }
+        }
+    });
+    let correlated = mcp_tool_job_audit_correlation(Some("cargo_test"), &handoff);
+    assert_eq!(
+        correlated.async_job_id.as_deref(),
+        Some("wc_job_background_123")
+    );
+    assert!(correlated.observed_job_ids.is_empty());
+
+    let observed = json!({
+        "result": {
+            "structuredContent": {
+                "success": true,
+                "output": {
+                    "items": [
+                        {"job_id": "wc_job_background_123", "project": "agent:special:demo", "observation_token": "one"},
+                        {"job_id": "wc_job_second_456", "project": "agent:special:demo", "observation_token": "two"},
+                        {"job_id": "wc_job_background_123", "project": "agent:special:demo", "observation_token": "duplicate"},
+                        {"job_id": "../unsafe"}
+                    ]
+                }
+            }
+        }
+    });
+    let correlated = mcp_tool_job_audit_correlation(Some("observe_jobs"), &observed);
+    assert_eq!(
+        correlated.observed_job_ids,
+        vec![
+            "wc_job_background_123".to_string(),
+            "wc_job_second_456".to_string()
+        ]
+    );
+    assert!(correlated.async_job_id.is_none());
+    assert_eq!(
+        correlated.resolved_project.as_deref(),
+        Some("agent:special:demo")
+    );
+
+    let mixed_projects = json!({
+        "result": {"structuredContent": {"success": true, "output": {"items": [
+            {"job_id": "wc_job_background_123", "project": "agent:special:demo"},
+            {"job_id": "wc_job_second_456", "project": "agent:special:other"}
+        ]}}}
+    });
+    assert!(
+        mcp_tool_job_audit_correlation(Some("observe_jobs"), &mixed_projects)
+            .resolved_project
+            .is_none(),
+        "a multi-Project observe_jobs call must not be assigned to one Project"
+    );
+
+    let ids = mcp_tool_action_audit_ids(
+        true,
+        None,
+        &crate::tool_runtime::ToolCallCorrelation::default(),
+        Some(&correlated),
+    )
+    .unwrap();
+    assert_eq!(
+        ids,
+        json!({"observed_job_ids":["wc_job_background_123","wc_job_second_456"]})
+    );
+    assert!(!ids.to_string().contains("token"));
+}
+
+#[test]
+fn work_result_app_internal_tools_do_not_become_window_activity() {
+    for tool in [
+        "present_work_result",
+        "work_result_state",
+        "work_result_activity_detail",
+        "work_result_send_message",
+        "changes_file_diff",
+    ] {
+        assert!(work_result_app_internal_tool(Some(tool)), "{tool}");
+    }
+    for tool in [
+        "runtime_status",
+        "current_window_activity",
+        "observe_jobs",
+        "read_files",
+    ] {
+        assert!(!work_result_app_internal_tool(Some(tool)), "{tool}");
+    }
+    assert!(!work_result_app_internal_tool(None));
+}
+
 fn test_runtime() -> ToolRuntime {
     ToolRuntime::new_for_tests()
+}
+
+/// Build a runtime with an explicit MCP startup snapshot, so tests assert the
+/// frozen values instead of holding process-global env guards across requests.
+fn test_runtime_with_mcp_snapshot(
+    compact_schemas: bool,
+    apps_enabled: bool,
+    text_json_compat_enabled: bool,
+) -> ToolRuntime {
+    ToolRuntime::new(
+        std::sync::Arc::new(crate::runner_http::RunnerRegistry::default()),
+        std::sync::Arc::new(crate::tool_runtime::RuntimeInfo {
+            mcp_compact_schemas: compact_schemas,
+            mcp_apps_enabled: apps_enabled,
+            mcp_text_json_compat_enabled: text_json_compat_enabled,
+            ..Default::default()
+        }),
+    )
+}
+
+fn test_runtime_with_mcp_settings(compact_schemas: bool, apps_enabled: bool) -> ToolRuntime {
+    test_runtime_with_mcp_snapshot(compact_schemas, apps_enabled, false)
 }
 
 fn test_runtime_with_public_url(public_url: &str) -> ToolRuntime {
@@ -155,6 +298,8 @@ mod plugin_check;
 mod plugin_tools;
 #[path = "mcp_tests/protocol.rs"]
 mod protocol;
+#[path = "mcp_tests/request_policy.rs"]
+mod request_policy;
 #[path = "mcp_tests/response.rs"]
 mod response_tests;
 #[path = "mcp_tests/result_app.rs"]
@@ -278,4 +423,16 @@ async fn oauth_mcp_request(
         .map(str::to_string);
     let body = resp.take_json::<Value>().await.unwrap();
     (status, body, challenge)
+}
+
+#[test]
+fn readiness_audit_correlation_retains_exact_jobs_without_guessing_project() {
+    let body = json!({"result":{"structuredContent":{"success":true,"output":{
+        "wait_state":"ready", "ready":[{"job_id":"wc_job_A","status":"completed","outcome":"succeeded"}],
+        "pending_job_ids":["wc_job_B"], "project":"untrusted-guess"
+    }}}});
+    let correlation = mcp_tool_job_audit_correlation(Some("wait_for_job_readiness"), &body);
+    assert_eq!(correlation.observed_job_ids, vec!["wc_job_A", "wc_job_B"]);
+    assert!(correlation.resolved_project.is_none());
+    assert!(correlation.async_job_id.is_none());
 }

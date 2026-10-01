@@ -270,6 +270,9 @@ async fn unauthorized_registration_is_existence_hiding_and_session_window_are_no
 #[tokio::test]
 async fn keyed_replay_reports_current_exact_carrier_capability_only_for_its_wait() {
     let (_temp, runtime, _db, controller) = attention_runtime_with_controller().await;
+    let runtime = runtime.with_model_workflow_policy(
+        crate::model_workflow::ModelWorkflowPolicy::from_values(None, Some("unattended")).unwrap(),
+    );
     let auth = shared_key_auth_context(&"7".repeat(64));
     let (job_id, _request) =
         start_owned_job(&runtime, "e3-carrier", "project-carrier", &auth).await;
@@ -388,11 +391,12 @@ async fn presentation_reauthorizes_exact_wait_and_exposes_no_ambient_authority_s
     assert!(!denied.success);
     assert_eq!(denied.output["error_kind"], "job_terminal_wait_not_found");
 
-    let spec = crate::tool_runtime::registered_tool_specs()
-        .into_iter()
-        .find(|spec| spec.name == "present_job_terminal_continuation")
-        .unwrap();
-    assert_eq!(spec.input_schema["required"], json!(["wait_id"]));
+    assert!(!crate::tool_runtime::registered_tool_specs()
+        .iter()
+        .any(|spec| spec.name == "present_job_terminal_continuation"));
+    let schema =
+        webcodex_tool_contracts::input_schema_for_tool("present_job_terminal_continuation");
+    assert_eq!(schema["required"], json!(["wait_id"]));
     for forbidden in [
         "job_id",
         "session_id",
@@ -401,13 +405,16 @@ async fn presentation_reauthorizes_exact_wait_and_exposes_no_ambient_authority_s
         "principal_digest",
         "project",
     ] {
-        assert!(spec.input_schema["properties"].get(forbidden).is_none());
+        assert!(schema["properties"].get(forbidden).is_none());
     }
 }
 
 #[tokio::test]
 async fn app_binding_uses_hashed_host_sideband_only_and_never_returns_raw_identity_or_fence() {
     let (_temp, runtime, db, _controller) = attention_runtime_with_controller().await;
+    let runtime = runtime.with_model_workflow_policy(
+        crate::model_workflow::ModelWorkflowPolicy::from_values(None, Some("unattended")).unwrap(),
+    );
     let auth = shared_key_auth_context(&"6".repeat(64));
     let (job_id, _request) =
         start_owned_job(&runtime, "e3-sideband", "project-sideband", &auth).await;
@@ -567,4 +574,130 @@ async fn registration_concurrent_with_terminalization_has_exactly_one_triggered_
         .unwrap();
     assert_eq!(stored.state, JobTerminalWaitState::Triggered);
     assert_eq!(stored.delivery_state, JobTerminalDeliveryState::Pending);
+}
+
+#[tokio::test]
+async fn readiness_cancellation_and_server_restart_need_no_persistent_wait_recovery() {
+    use webcodex_tool_contracts::tool_call::JobReadinessMode::Any;
+    let (temp, runtime, db) = attention_runtime().await;
+    let auth = shared_key_auth_context(&"a".repeat(64));
+    let (id, request) = start_owned_job(&runtime, "readiness-restart", "project-r", &auth).await;
+    {
+        let wait = runtime.wait_for_job_readiness(vec![id.clone()], Any, 45, Some(&auth));
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+    }
+    complete_job(&runtime, "readiness-restart", &request, Some(1)).await;
+    let path = temp.path().join("job-terminal-attention.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM wc_job_terminal_waits", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 0);
+    drop(conn);
+    drop(runtime);
+    drop(db);
+    // Reopen actual retained Job receipts with a fresh registry, not wait recovery.
+    let db = Arc::new(crate::Database::open(&path).unwrap());
+    let controller = JobTerminalContinuationController::new(db.clone());
+    let registry = Arc::new(
+        crate::job_receipts::production_registry_with_terminal_attention(db, controller).await,
+    );
+    let restarted = ToolRuntime::new(registry, Arc::new(RuntimeInfo::default()));
+    let result = restarted
+        .wait_for_job_readiness(vec![id], Any, 1, Some(&auth))
+        .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["wait_state"], "ready");
+    assert_eq!(result.output["waited_ms"], 0);
+}
+
+#[tokio::test]
+async fn readiness_activity_project_comes_only_from_exact_authorized_job_provenance() {
+    let (_temp, runtime, _db) = attention_runtime().await;
+    let owner = shared_key_auth_context(&"c".repeat(64));
+    let other = shared_key_auth_context(&"d".repeat(64));
+    let (first, first_request) = start_owned_job(&runtime, "ready-project-a", "one", &owner).await;
+
+    assert_eq!(
+        runtime
+            .common_job_activity_project_for_auth(std::slice::from_ref(&first), Some(&owner))
+            .await
+            .as_deref(),
+        Some("agent:ready-project-a:one")
+    );
+    complete_job(&runtime, "ready-project-a", &first_request, Some(1)).await;
+    let mut correlation = super::super::window_activity::ToolCallCorrelation::default();
+    let dispatched = runtime
+        .dispatch_job_tool(
+            ToolCall::WaitForJobReadiness {
+                job_ids: vec![first.clone()],
+                mode: webcodex_tool_contracts::tool_call::JobReadinessMode::Any,
+                wait_secs: 1,
+            },
+            Some(&owner),
+            None,
+            &mut correlation,
+        )
+        .await;
+    assert!(dispatched.success, "{:?}", dispatched.error);
+    assert_eq!(dispatched.output["wait_state"], "ready");
+    assert_eq!(
+        correlation.resolved_project.as_deref(),
+        Some("agent:ready-project-a:one")
+    );
+    assert!(runtime
+        .common_job_activity_project_for_auth(std::slice::from_ref(&first), Some(&other))
+        .await
+        .is_none());
+
+    let (second, _) = start_owned_job(&runtime, "ready-project-b", "two", &owner).await;
+    assert!(
+        runtime
+            .common_job_activity_project_for_auth(&[first.clone(), second], Some(&owner))
+            .await
+            .is_none(),
+        "mixed-Project wait sets must remain unanchored"
+    );
+    assert!(
+        runtime
+            .common_job_activity_project_for_auth(
+                &[first, "wc_job_missing".to_string()],
+                Some(&owner)
+            )
+            .await
+            .is_none(),
+        "unknown Job identity must never produce a Project anchor"
+    );
+}
+
+#[tokio::test]
+async fn readiness_mixed_visibility_hides_the_whole_set_even_if_visible_job_is_terminal() {
+    use webcodex_tool_contracts::tool_call::JobReadinessMode::{All, Any};
+    let (_temp, runtime, _db) = attention_runtime().await;
+    let owner = shared_key_auth_context(&"a".repeat(64));
+    let other = shared_key_auth_context(&"b".repeat(64));
+    let (visible, request) = start_owned_job(&runtime, "ready-visible", "one", &owner).await;
+    let (hidden, _) = start_owned_job(&runtime, "ready-hidden", "two", &other).await;
+    complete_job(&runtime, "ready-visible", &request, Some(1)).await;
+    for mode in [Any, All] {
+        for invalid in [&hidden, "wc_job_missing", "invalid/job/id"] {
+            let result = runtime
+                .wait_for_job_readiness(
+                    vec![visible.clone(), invalid.to_string()],
+                    mode,
+                    45,
+                    Some(&owner),
+                )
+                .await;
+            assert!(!result.success);
+            assert!(result.output.is_null());
+            assert_eq!(
+                result.error.as_deref(),
+                Some("Job readiness set is unavailable or identity-invalid")
+            );
+        }
+    }
 }

@@ -7,6 +7,23 @@ use crate::webcodex_runner::{
     handle_prepare_managed_worktree, handle_project_lifecycle_op, handle_project_op,
     handle_resolve_or_register_project,
 };
+/// Create a test temp directory on the repository build filesystem.
+///
+/// Some hardened hosts mount the system temp directory with `noexec`. Tests
+/// that intentionally create and execute fake binaries/scripts must not assume
+/// `tempfile::tempdir()` is executable. Keep ordinary data-only temp dirs on
+/// the system temp filesystem; use this helper only for executable fixtures.
+pub(crate) fn executable_tempdir() -> tempfile::TempDir {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target")
+        .join("test-executables");
+    std::fs::create_dir_all(&root).expect("create executable test temp root");
+    tempfile::Builder::new()
+        .prefix("webcodex-runner-exec-")
+        .tempdir_in(root)
+        .expect("create executable test temp dir")
+}
+
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -15,47 +32,9 @@ pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// RAII restore for environment variables mutated by tests: restores the
-/// previous value (or absence) on drop, even when the test panics, so a
-/// failure cannot leak env state into later tests.
-pub(crate) struct EnvGuard {
-    restored: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-impl EnvGuard {
-    pub(crate) fn new() -> Self {
-        EnvGuard {
-            restored: Vec::new(),
-        }
-    }
-
-    pub(crate) fn set(mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        self.capture(name);
-        std::env::set_var(name, value.as_ref());
-        self
-    }
-
-    pub(crate) fn remove(mut self, name: &'static str) -> Self {
-        self.capture(name);
-        std::env::remove_var(name);
-        self
-    }
-
-    fn capture(&mut self, name: &'static str) {
-        self.restored.push((name, std::env::var_os(name)));
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in self.restored.drain(..).rev() {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
+#[path = "main_tests/isolated_env.rs"]
+mod isolated_env;
+pub(crate) use isolated_env::IsolatedEnv;
 
 /// Policy for tests that exercise shell/profile behavior inside a temp dir
 /// rather than the filesystem boundary itself. `RunnerPolicy::default()` is
@@ -367,6 +346,7 @@ fn json_file_op_request(
     payload: serde_json::Value,
 ) -> RunnerRequest {
     RunnerRequest {
+        login: false,
         shell: None,
         request_id: format!("req-{kind}"),
         client_id: "agent-1".to_string(),
@@ -627,7 +607,7 @@ fn shell_tree_helper() -> PathBuf {
         .get_or_init(|| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("src/webcodex_runner/validation/validation_tree_helper.rs");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = executable_tempdir();
             let output = temp
                 .path()
                 .join(format!("shell-tree-helper{}", std::env::consts::EXE_SUFFIX));
@@ -859,6 +839,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
     // fixture. This test only verifies PowerShell native-exit propagation; a freshly
     // generated EXE can be delayed by Windows malware scanning under parallel CI and
     // would turn that unrelated startup latency into a false shell timeout.
+    // Allow time for PowerShell startup on a busy Windows CI host as well.
     let command_processor = std::env::var_os("ComSpec")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -876,7 +857,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
         Some(&cwd),
         &command,
         None,
-        10,
+        30,
         None,
     );
     assert_eq!(result.exit_code, Some(3), "{result:?}");
@@ -886,7 +867,6 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
 #[cfg(windows)]
 #[test]
 fn shell_job_unicode_stdout_stderr_env_and_cwd() {
-    let _guard = test_env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let cfg = test_config(tmp.path().join("config/project-registry"));
     let unicode_cwd = tmp.path().join("unicode cwd 测试");
@@ -910,40 +890,42 @@ fn shell_job_unicode_stdout_stderr_env_and_cwd() {
     assert_eq!(result.stderr.as_deref(), Some("err 測試"));
 
     // Unicode environment value inherited from the parent process.
-    let _env = EnvGuard::new().set("WEBCODEX_UNICODE_ENV", "值 测试");
-    let result = run_shell(
-        &cfg.policy,
-        &ShellConfig::default(),
-        Some(&cwd),
-        &shell_env_var("WEBCODEX_UNICODE_ENV"),
-        None,
-        10,
-        None,
-    );
-    assert_eq!(result.exit_code, Some(0), "{result:?}");
-    assert_eq!(result.stdout.as_deref(), Some("值 测试"));
+    IsolatedEnv::new()
+        .set("WEBCODEX_UNICODE_ENV", "值 测试")
+        .run("inherited", || {
+            let result = run_shell(
+                &cfg.policy,
+                &ShellConfig::default(),
+                Some(&cwd),
+                &shell_env_var("WEBCODEX_UNICODE_ENV"),
+                None,
+                10,
+                None,
+            );
+            assert_eq!(result.exit_code, Some(0), "{result:?}");
+            assert_eq!(result.stdout.as_deref(), Some("值 测试"));
 
-    // Unicode cwd: the shell reports its working directory verbatim.
-    let result = run_shell(
-        &cfg.policy,
-        &ShellConfig::default(),
-        Some(&cwd),
-        "[Console]::Out.Write((Get-Location).Path)",
-        None,
-        10,
-        None,
-    );
-    assert_eq!(result.exit_code, Some(0), "{result:?}");
-    assert!(
-        result
-            .stdout
-            .as_deref()
-            .unwrap_or_default()
-            .contains("测试"),
-        "{result:?}"
-    );
+            // Unicode cwd: the shell reports its working directory verbatim.
+            let result = run_shell(
+                &cfg.policy,
+                &ShellConfig::default(),
+                Some(&cwd),
+                "[Console]::Out.Write((Get-Location).Path)",
+                None,
+                10,
+                None,
+            );
+            assert_eq!(result.exit_code, Some(0), "{result:?}");
+            assert!(
+                result
+                    .stdout
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("测试"),
+                "{result:?}"
+            );
+        });
 }
-
 #[cfg(windows)]
 #[test]
 fn prepared_profile_unicode_env_round_trip_and_unicode_init_path() {
@@ -1048,6 +1030,7 @@ fn project_policy(root: &Path) -> RunnerPolicy {
 
 fn project_request(kind: &str, payload: serde_json::Value) -> RunnerRequest {
     RunnerRequest {
+        login: false,
         shell: None,
         request_id: format!("req-{}", kind),
         client_id: "oe".to_string(),
@@ -1196,6 +1179,26 @@ fn managed_worktree_request(
     )
 }
 
+fn managed_worktree_request_with_source_identity(
+    source: &Path,
+    base_ref: serde_json::Value,
+    operation_id: &str,
+    source_project_id: &str,
+    source_root_fingerprint: &str,
+) -> RunnerRequest {
+    project_request(
+        "prepare_managed_worktree",
+        serde_json::json!({
+            "path": source.to_string_lossy(),
+            "base_ref": base_ref,
+            "operation_id": operation_id,
+            "resume_project_id": null,
+            "expected_source_project_id": source_project_id,
+            "expected_source_root_fingerprint": source_root_fingerprint,
+        }),
+    )
+}
+
 #[test]
 fn project_root_fingerprint_uses_platform_path_identity_rules() {
     #[cfg(windows)]
@@ -1239,6 +1242,114 @@ fn managed_worktree_network_source_requires_runner_authority_before_resolution()
     let result = handle_prepare_managed_worktree(&policy, &registry, &request);
     assert_eq!(project_err(result), "path_outside_allowed_roots");
     assert!(!registry.exists());
+}
+
+#[test]
+fn managed_worktree_uses_authorized_namespace_and_keeps_follow_up_cwd_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let allowed = tmp.path().join("allowed");
+    let source = allowed.join("repo");
+    let arbitrary = tmp.path().join("arbitrary");
+    let registry = tmp.path().join("project-registry");
+    std::fs::create_dir_all(&allowed).unwrap();
+    seed_managed_worktree_repo(&source);
+    std::fs::create_dir(&arbitrary).unwrap();
+    register_managed_source_project(&registry, &source);
+
+    let policy = project_policy(&allowed);
+    let created = project_ok(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request(
+            &source,
+            serde_json::Value::Null,
+            "10101010-1010-4010-8010-101010101010",
+            None,
+        ),
+    ));
+    let worktree = PathBuf::from(created["path"].as_str().unwrap());
+    let expected_namespace = allowed.join(".webcodex-worktrees").canonicalize().unwrap();
+    assert_eq!(
+        worktree.parent().unwrap().canonicalize().unwrap(),
+        expected_namespace
+    );
+    assert_ne!(
+        worktree.canonicalize().unwrap(),
+        source.canonicalize().unwrap()
+    );
+    crate::webcodex_runner::shell::cwd_allowed(&policy, &worktree)
+        .expect("managed Project cwd must remain inside ordinary Runner authority");
+
+    let denied = project_error_value(handle_resolve_or_register_project(
+        &policy,
+        &registry,
+        &project_request(
+            "resolve_or_register_project",
+            serde_json::json!({"path": arbitrary.to_string_lossy()}),
+        ),
+    ));
+    assert_eq!(denied["error_code"], "path_outside_allowed_roots");
+    assert_eq!(
+        load_runner_project_summaries_from_dir(&registry).len(),
+        2,
+        "the denied arbitrary sibling must not become a Project"
+    );
+}
+
+#[test]
+fn managed_worktree_does_not_escape_an_exact_source_allowed_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("repo");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+
+    let policy = project_policy(&source);
+    let error = project_error_value(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request(
+            &source,
+            serde_json::Value::Null,
+            "11111111-1111-4111-8111-111111111111",
+            None,
+        ),
+    ));
+    assert_eq!(error["error_code"], "managed_worktree_root_unavailable");
+    assert_eq!(error["state_changed"], false);
+    assert!(
+        !tmp.path().join(".webcodex-worktrees").exists(),
+        "managed bootstrap must not create a sibling outside allowed_roots"
+    );
+}
+#[test]
+fn managed_worktree_expected_source_identity_is_revalidated_before_creation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(&source);
+    let mismatched_fingerprint = format!("wc_projroot_{}", "f".repeat(64));
+
+    let error = project_error_value(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request_with_source_identity(
+            &source,
+            serde_json::Value::Null,
+            "20202020-2020-4020-8020-202020202020",
+            "source",
+            &mismatched_fingerprint,
+        ),
+    ));
+    assert_eq!(
+        error["error_code"],
+        "managed_worktree_source_identity_changed"
+    );
+    assert_eq!(error["state_changed"], false);
+    assert_eq!(error["source_project_id"], "source");
+    assert!(!tmp.path().join(".webcodex-worktrees").exists());
 }
 
 #[test]
@@ -1434,6 +1545,44 @@ fn managed_worktree_explicit_ref_preserves_dirty_source_and_resume_survives_sour
     assert_eq!(resumed["outcome"], "managed_worktree_recovered");
     assert_eq!(resumed["registered"], false);
     assert_eq!(load_runner_project_summaries_from_dir(&registry).len(), 2);
+}
+
+#[test]
+fn managed_worktree_invalid_and_missing_base_refs_fail_deterministically() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let registry = tmp.path().join("project-registry");
+    seed_managed_worktree_repo(&source);
+    register_managed_source_project(&registry, &source);
+    let policy = project_policy(&source);
+
+    let invalid = project_error_value(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request(
+            &source,
+            serde_json::json!(42),
+            "30303030-3030-4030-8030-303030303030",
+            None,
+        ),
+    ));
+    assert_eq!(invalid["error_code"], "invalid_base_ref");
+    assert_eq!(invalid["state_changed"], false);
+
+    let missing = project_error_value(handle_prepare_managed_worktree(
+        &policy,
+        &registry,
+        &managed_worktree_request(
+            &source,
+            serde_json::json!("refs/heads/does-not-exist"),
+            "40404040-4040-4040-8040-404040404040",
+            None,
+        ),
+    ));
+    assert_eq!(missing["error_code"], "base_ref_resolution_failed");
+    assert_eq!(missing["state_changed"], false);
+    assert_eq!(missing["base_ref"], "refs/heads/does-not-exist");
+    assert!(!tmp.path().join(".webcodex-worktrees").exists());
 }
 
 #[test]

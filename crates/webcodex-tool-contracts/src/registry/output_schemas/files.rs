@@ -224,13 +224,11 @@ fn search_project_texts_output_schema() -> Value {
         "required": ["result_mode", "total_matches"],
         "description": "Sparse model-facing form for complete rg count success. total_matches is authoritative; optional files retain bounded per-path grouping and redundant count bookkeeping is omitted."
     });
+    let search_success_sparse = json!({
+        "anyOf": [search_success_sparse_matches, search_success_sparse_files, search_success_sparse_count]
+    });
     let search_success = json!({
-        "anyOf": [
-            search_success_full,
-            search_success_sparse_matches,
-            search_success_sparse_files,
-            search_success_sparse_count
-        ]
+        "anyOf": [search_success_full, search_success_sparse.clone()]
     });
     let search_failure = json!({
         "type": "object",
@@ -319,7 +317,7 @@ fn search_project_texts_output_schema() -> Value {
         "required": ["index", "success", "output", "error"],
         "allOf": [{
             "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
-            "then": {"properties": {"output": search_success, "error": {"type": "null"}}},
+            "then": {"properties": {"output": search_success.clone(), "error": {"type": "null"}}},
             "else": {"properties": {"output": search_failure, "error": {"type": "string"}}}
         }]
     });
@@ -342,6 +340,7 @@ fn search_project_texts_output_schema() -> Value {
                 "description": "Optional bounded summaries for completed queries at or after the omitted suffix boundary. These facts are supplementary UX only; suggested_call remains the canonical whole-query continuation and starts from the same omitted query."
             },
             "suggested_call": suggested_tool_call_schema(
+                webcodex_core::runtime_contract::GeneratedFollowUpKind::MechanicallyFollowable,
                 "search_project_texts",
                 crate::input_schema_for_tool("search_project_texts"),
                 "Parser-ready whole-query suffix rerun when the complete call itself fits the bounded model result. If it cannot fit, Runtime keeps truncation truthful and exposes no raw cursor or oversized fake call. Zero-progress soft-budget results may raise max_result_bytes; hard-cap zero progress exposes no fake next call."
@@ -355,16 +354,13 @@ fn search_project_texts_output_schema() -> Value {
         ]
     });
     let sparse_success_item = json!({
-        "allOf": [
-            item_schema,
-            {
-                "properties": {
-                    "success": {"const": true},
-                    "error": {"type": "null"}
-                },
-                "required": ["success", "error"]
-            }
-        ]
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "index": {"type": "integer", "minimum": 0, "maximum": 7},
+            "output": search_success_sparse
+        },
+        "required": ["index", "output"]
     });
     let batch_output_sparse = json!({
         "type": "object",
@@ -375,7 +371,7 @@ fn search_project_texts_output_schema() -> Value {
             "permission": permission_decision_schema()
         },
         "required": ["items"],
-        "description": "Sparse model-facing batch form used only when every returned query succeeded and the outer batch was complete. Omitted counts and continuation fields therefore mean all items succeeded and no outer truncation occurred."
+        "description": "Sparse model-facing batch form used only when every requested query succeeded with complete rg output and the outer batch was complete. Omitted item success/error, counts and continuation fields therefore mean all items succeeded and no outer truncation occurred."
     });
     let batch_output = json!({
         "anyOf": [batch_output_full, batch_output_sparse]
@@ -555,6 +551,7 @@ fn read_files_output_schema() -> Value {
             "output_truncated": {"type": "boolean"},
             "truncation_reason": {"type": "string", "enum": ["batch_response_budget", "hard_result_cap"]},
             "suggested_call": suggested_tool_call_schema(
+                webcodex_core::runtime_contract::GeneratedFollowUpKind::MechanicallyFollowable,
                 "read_files", suggested_read_files_arguments_schema(),
                 "One parser-ready follow-up: unread returned ranges are fenced to their observed read_revision, followed by unreturned original items. Follow it directly; Runtime rejects a continued item if its file snapshot changed. A zero-progress request may instead raise max_result_bytes; at the hard cap no fake call is offered.",
             ),
@@ -572,11 +569,9 @@ fn read_files_output_schema() -> Value {
         "properties": {
             "index": {"type": "integer", "minimum": 0, "maximum": 7},
             "path": schema_type("string", "Project-relative input path."),
-            "success": {"type": "boolean", "const": true},
-            "output": read_success_sparse,
-            "error": {"type": "null"}
+            "output": read_success_sparse
         },
-        "required": ["index", "path", "success", "output", "error"]
+        "required": ["index", "path", "output"]
     });
     let batch_output_sparse = json!({
         "type": "object",
@@ -587,7 +582,7 @@ fn read_files_output_schema() -> Value {
             "permission": permission_decision_schema()
         },
         "required": ["items"],
-        "description": "Sparse model-facing batch form used only when every requested item succeeded as a complete default full-file read and the batch itself was not truncated. Omitted outer counts/defaults are therefore implied."
+        "description": "Sparse model-facing batch form used only when every requested item succeeded as a complete default full-file read and the batch itself was not truncated. Omitted item success/error and outer counts/defaults are therefore implied."
     });
     let batch_output = json!({
         "anyOf": [batch_output_full, batch_output_sparse]

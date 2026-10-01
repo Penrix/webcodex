@@ -3,6 +3,8 @@ use crate::runner_protocol::{
     RunnerPolicySummary, RunnerResultPayload, ShellCommandExecutionState,
 };
 use response::{mcp_runtime_tool_result_fallback, McpToolResultPresentation};
+#[path = "structured_failure/client_contract.rs"]
+mod client_contract;
 use webcodex_core::mcp_gateway::{
     McpGatewayContent, McpGatewayProvider, McpGatewayRequest, McpGatewayResponse,
     McpGatewayResponsePayload, McpGatewayTool, McpGatewayToolResult,
@@ -92,7 +94,9 @@ async fn http_client_presentation_matrix_preserves_native_failure() {
             let (status, mut body) = http_call(
                 &service,
                 json!({
-                    "name": "show_changes", "arguments": {"project": "agent:missing:missing"},
+                    "name": "call_runtime_tool", "arguments": {
+                        "tool": "show_changes", "arguments": {"project": "agent:missing:missing"}
+                    },
                 }),
                 meta,
                 modern,
@@ -125,8 +129,8 @@ async fn http_openai_protocol_errors_remain_jsonrpc_errors() {
     ));
     for modern in [false, true] {
         for params in [
-            json!({"name": "show_changes", "arguments": {"project": 42}}),
-            json!({"name": "show_changes", "arguments": []}),
+            json!({"name": "call_runtime_tool", "arguments": {"tool": "show_changes", "arguments": {"project": 42}}}),
+            json!({"name": "call_runtime_tool", "arguments": {"tool": "show_changes", "arguments": []}}),
             // A malformed envelope must still fail McpToolCallParams deserialization.
             json!({"name": 42, "arguments": {}}),
         ] {
@@ -175,11 +179,12 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
                 json!({"execution_state": "outcome_unknown", "recovery": "inspect state"}),
             )
         };
-        let expected = mcp_runtime_tool_result_fallback(failed(), policy);
+        let expected = mcp_runtime_tool_result_fallback(failed(), false, policy);
         assert_eq!(
             mcp_artifact_export_tool_result(
                 failed(),
                 McpArtifactExportCallerBinding::Bootstrap,
+                false,
                 policy
             ),
             expected
@@ -190,7 +195,14 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
             "read_project_artifact",
         ] {
             assert_eq!(
-                mcp_runtime_tool_result_with_snapshot_resource(tool, true, failed(), None, policy),
+                mcp_runtime_tool_result_with_snapshot_resource(
+                    tool,
+                    true,
+                    failed(),
+                    None,
+                    false,
+                    policy,
+                ),
                 expected
             );
             let invalid_image = mcp_runtime_tool_result_with_snapshot_resource(
@@ -198,6 +210,7 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
                 true,
                 ToolResult::ok(json!({})),
                 None,
+                false,
                 policy,
             );
             assert_eq!(invalid_image["structuredContent"]["success"], false);
@@ -209,6 +222,7 @@ fn resource_failure_fallbacks_use_canonical_presentation_policy() {
         let invalid_export = mcp_artifact_export_tool_result(
             ToolResult::ok(json!({})),
             McpArtifactExportCallerBinding::Bootstrap,
+            false,
             policy,
         );
         assert_eq!(invalid_export["structuredContent"]["success"], false);
@@ -231,7 +245,7 @@ async fn gateway_and_app_canonical_failures_use_request_presentation() {
             json!({"project": "agent:missing:missing"}),
         ),
         adaptive_runtime_gateway_params("unknown_target", json!({})),
-        json!({"name": "goal_plan_state", "arguments": {"goal_id": "wc_goal_AAAAAAAAAAAAAAAA"}}),
+        json!({"name": "goal_plan_sync", "arguments": {"goal_id": "wc_goal_AAAAAAAAAAAAAAAA"}}),
         json!({"name": "agent_continuation_state", "arguments": {
             "agent_id": "wc_dagent_AAAAAAAAAAAAAAAA", "endpoint_id": "wc_endpoint_AAAAAAAAAAAAAAAA",
             "expected_controller_generation": 1, "binding_id": "wc_host_binding_AAAAAAAAAAAAAAAAAAAAAA"
@@ -275,6 +289,7 @@ async fn register_failure_runner(runtime: &ToolRuntime) {
         .runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 client_id: "failure-runner".into(),
                 runner_instance_id: "inst".into(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -359,7 +374,7 @@ async fn wait_for_failure_request(runtime: &ToolRuntime) -> crate::runner_protoc
 
 async fn complete_failure_request(runtime: &ToolRuntime, tool: &str) {
     let request = wait_for_failure_request(runtime).await;
-    let edit = tool == "apply_text_edits";
+    let edit = tool == "edit_project_files";
     assert_eq!(
         request.kind,
         if edit {
@@ -623,15 +638,39 @@ async fn http_mcp_passthrough_preserves_mixed_image_content_order() {
     }
 }
 
+async fn seed_failure_edit_revision(runtime: &ToolRuntime) -> u64 {
+    let resolved = runtime
+        .resolve_project_input("agent:failure-runner:probe")
+        .await
+        .unwrap();
+    let runner = runtime
+        .runner_registry
+        .get_runner_view(&resolved.config.client_id)
+        .await
+        .expect("failure Runner");
+    runtime.read_revisions.observe(
+        crate::tool_runtime::ReadRevisionTarget {
+            project_id: resolved.resolved_id,
+            path: "probe.txt".to_string(),
+            client_id: resolved.config.client_id,
+            runner_instance_id: runner.runner_instance_id,
+            project_root: resolved.config.path,
+            root_fingerprint: resolved.root_fingerprint,
+        },
+        "a".repeat(64),
+    )
+}
+
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn http_apply_text_edits_and_process_failures_preserve_canonical_output() {
+async fn http_edit_project_files_and_process_failures_preserve_canonical_output() {
     let _env = crate::auth::AuthEnvGuard::new();
     _env.enable_direct_shared_key();
     _env.disable_open_anonymous();
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
     register_failure_runner(&runtime).await;
+    let edit_revision = seed_failure_edit_revision(&runtime).await;
     let service = Service::new(build_test_router(
         test_config(Some("secret")),
         db,
@@ -639,8 +678,8 @@ async fn http_apply_text_edits_and_process_failures_preserve_canonical_output() 
     ));
     for (tool, arguments) in [
         (
-            "apply_text_edits",
-            json!({"project": "agent:failure-runner:probe", "changes": [{"kind": "edit", "path": "probe.txt", "edits": [{"kind": "replace_exact", "old_text": "dup", "new_text": "replacement"}]}]}),
+            "edit_project_files",
+            json!({"project": "agent:failure-runner:probe", "changes": [{"kind": "edit", "path": "probe.txt", "expected_read_revision": edit_revision, "edits": [{"kind": "replace_exact", "old_text": "dup", "new_text": "replacement"}]}]}),
         ),
         (
             "run_process",
@@ -661,19 +700,21 @@ async fn http_apply_text_edits_and_process_failures_preserve_canonical_output() 
             let (status, mut body) = response;
             assert_eq!(status, StatusCode::OK, "{body}");
             let output = assert_failure(&body, client != "openai-mcp");
-            if tool == "apply_text_edits" {
+            if tool == "edit_project_files" {
                 assert_eq!(output["error_kind"], "multiple_matches");
                 assert_eq!(output["state_changed"], false);
                 assert_eq!(output["execution_state"], "not_started");
                 assert_eq!(output["match_count"], 2);
                 assert_eq!(
                     output["candidate_ranges"],
-                    json!([{"start_line": 10, "end_line": 10}, {"start_line": 20, "end_line": 20}])
+                    json!([
+                        {"occurrence": 1, "start_line": 10, "end_line": 10},
+                        {"occurrence": 2, "start_line": 20, "end_line": 20}
+                    ])
                 );
-                assert_eq!(output["recovery"]["tool"], "read_files");
-                assert_eq!(
-                    output["recovery"]["arguments"]["items"][0]["path"],
-                    "probe.txt"
+                assert!(
+                    output.get("recovery").is_none(),
+                    "same guarded snapshot can retry by occurrence/range without rereading"
                 );
             } else {
                 assert_eq!(output["execution_state"], "completed");
@@ -691,5 +732,69 @@ async fn http_apply_text_edits_and_process_failures_preserve_canonical_output() 
                 baseline = Some(body);
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn http_mcp_execution_compaction_keeps_sparse_serialization() {
+    for tool in ["run_process", "run_shell"] {
+        let (_tmp, db) = test_db();
+        let runtime = Arc::new(test_runtime());
+        register_failure_runner(&runtime).await;
+        let service = Service::new(build_test_router(
+            test_config(Some("secret")),
+            db,
+            runtime.clone(),
+        ));
+        let runner = async {
+            let request = wait_for_failure_request(&runtime).await;
+            assert_eq!(request.process.is_some(), tool == "run_process");
+            runtime
+                .runner_registry
+                .complete(RunnerResultPayload {
+                    result: RunnerResultRequest {
+                        client_id: "failure-runner".into(),
+                        runner_instance_id: "inst".into(),
+                        request_id: request.request_id,
+                        exit_code: Some(0),
+                        stdout: Some("output witness".into()),
+                        stderr: Some(String::new()),
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        duration_ms: Some(1),
+                        error: None,
+                    },
+                    command_execution_state: Some(ShellCommandExecutionState::Completed),
+                    mcp_gateway: None,
+                    plugin_gateway: None,
+                    coding_agent: None,
+                })
+                .await
+                .unwrap();
+        };
+        let ((status, body), ()) = tokio::join!(
+            http_call(
+                &service,
+                json!({"name":tool, "arguments": if tool == "run_process" {
+                    json!({"project":"agent:failure-runner:probe", "executable":"probe", "args":[], "timeout_secs":30, "sync_wait_secs":30})
+                } else {
+                    json!({"project":"agent:failure-runner:probe", "command":"printf witness", "timeout_secs":30, "sync_wait_secs":30})
+                }}),
+                client_meta("generic-test-client", "2"),
+                true,
+            ),
+            runner
+        );
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let result = &body["result"]["structuredContent"];
+        assert_eq!(result["success"], true, "{body}");
+        assert!(result["output"].get("execution_state").is_none());
+        assert!(result["output"].get("command_completed").is_none());
+        assert_eq!(result["output"]["stdout_tail"], "output witness");
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+            result,
+            &crate::tool_runtime::registry::output_schema_for_tool(tool),
+        )
+        .unwrap();
     }
 }

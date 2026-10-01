@@ -30,9 +30,12 @@ mod json_digest;
 mod json_measurement;
 mod mcp;
 mod mcp_gateway;
+mod mcp_host;
 mod model_surface;
+mod model_workflow;
 pub(crate) use webcodex_store::models;
 mod oauth_http;
+#[cfg(feature = "legacy-gpt-actions")]
 mod openapi;
 mod pairing_http;
 mod plugin_gateway;
@@ -46,6 +49,8 @@ mod runner_tokens_http;
 mod runner_ws;
 mod runtime_console_http;
 mod runtime_http;
+mod upgrade_http;
+mod upgrade_maintenance_store;
 pub(crate) use webcodex_store::ServerInstanceGuard;
 mod server_listener;
 mod server_shutdown;
@@ -60,9 +65,10 @@ mod workspace_activity_store;
 
 #[cfg(test)]
 pub(crate) use webcodex_admin as admin_cli;
+pub(crate) use webcodex_build_info as build_info;
 pub(crate) use webcodex_core::{
-    apply_edits_shared, apply_patch_shared, artifact_policy, build_info, lsp_bridge,
-    runner_protocol, sensitive_paths,
+    apply_edits_shared, apply_patch_shared, artifact_policy, lsp_bridge, runner_protocol,
+    sensitive_paths,
 };
 pub(crate) use webcodex_runner_config as runner_config;
 pub(crate) use webcodex_workspace::project_overview;
@@ -76,6 +82,7 @@ pub(crate) use config::parse_env_file_line;
 pub use config::Config;
 pub use config::OAuth2Config;
 pub use db::{Database, RotateResult};
+#[cfg(feature = "legacy-gpt-actions")]
 pub(crate) use openapi::openapi_json;
 pub(crate) use runner_http::{
     runner_job_update, runner_offline, runner_persistent_shell_result, runner_poll,
@@ -86,7 +93,29 @@ pub use startup::{
     is_project_command, run_project_command, run_regular_server_tunnel, CliCommandOutput,
     RegularServerTunnelOptions,
 };
+pub async fn run_regular_server_tunnel_with_stop(
+    options: RegularServerTunnelOptions,
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut service_log = webcodex_environment::service::ServiceLogGuard::from_managed_env(
+        webcodex_environment::service::Component::Tunnel,
+    )?;
+    let result = startup::run_regular_server_tunnel_with_stop(options, stop).await;
+    #[cfg(target_os = "macos")]
+    if result.is_ok() {
+        if let Some(log) = service_log.as_mut() {
+            log.stopped()?;
+        }
+    }
+    result
+}
 pub use webcodex_store::models::{ActionEventRecord, ActionSessionRecord};
+
+#[handler]
+async fn healthz(res: &mut Response) {
+    res.status_code(StatusCode::OK);
+}
 
 // ============================================================================
 // Main
@@ -124,6 +153,9 @@ where
             code: 0,
             stdout: "Usage: webcodex-server [OPTIONS]\n\nRun the WebCodex server runtime.\n\nOptions:\n      --stop-on-stdin-eof  Stop when the invoking parent closes stdin\n  -h, --help               Print help and exit\n  -V, --version            Print version and exit\n".to_string(),
             stderr: String::new(),
+        },
+        [arg] if arg == "--build-info-json" => ServerBinaryAction::Exit {
+            code: 0, stdout: build_info::build_info_json("webcodex-server"), stderr: String::new(),
         },
         [arg] if matches!(arg.as_str(), "--version" | "-V") => ServerBinaryAction::Exit {
             code: 0,
@@ -182,6 +214,13 @@ pub fn prepare_server_process_environment() -> Result<(), String> {
         .map_err(|_| "Server process environment was prepared concurrently".to_string())
 }
 
+/// Loads one validated service-owned environment at process startup. Tunnel
+/// services use this on platforms that do not support EnvironmentFile.
+pub fn load_service_environment_file(path: &std::path::Path) -> Result<(), String> {
+    webcodex_environment::runtime_entry::validate_service_env_file(path)?;
+    config::load_env_file(path).map(|_| ())
+}
+
 pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     run_server_with_parent_liveness(false).await
 }
@@ -190,6 +229,19 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 pub async fn run_server_with_parent_liveness(
     stop_on_stdin_eof: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_server_with_shutdown(stop_on_stdin_eof, std::future::pending()).await
+}
+
+#[doc(hidden)]
+pub async fn run_server_with_shutdown(
+    stop_on_stdin_eof: bool,
+    service_stop: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    let mut service_log = webcodex_environment::service::ServiceLogGuard::from_managed_env(
+        webcodex_environment::service::Component::Server,
+    )
+    .map_err(std::io::Error::other)?;
     let env_loads = match PREPARED_SERVER_ENV_LOADS.get() {
         Some(prepared) => prepared.clone(),
         None => load_startup_env_files().map_err(std::io::Error::other)?,
@@ -207,6 +259,9 @@ pub async fn run_server_with_parent_liveness(
         );
     }
     let config = Config::from_env();
+    let mcp_host_policy = mcp_host::McpHostConfig::from_env().runtime_policy();
+    let model_workflow_policy =
+        model_workflow::ModelWorkflowPolicy::from_env().map_err(std::io::Error::other)?;
     let (acceptor, listener_mode, listener_addr) = server_listener::server_acceptor(&config.addr)
         .await
         .map_err(std::io::Error::other)?;
@@ -220,6 +275,22 @@ Use `webcodex server init` to generate a bootstrap/admin key, or set WEBCODEX_AL
 only for local/trusted-network demos."
         );
         tracing::warn!("Anonymous API access is rejected by default in production mode.");
+    }
+    if auth::shared_key_enabled() && auth::shared_key_requires_remote_opt_in(&config) {
+        if auth::shared_key_remote_enabled() {
+            tracing::warn!(
+                "Direct shared-key auth is exposed to remote callers: the server bind or \
+WEBCODEX_PUBLIC_URL crosses a remote boundary and WEBCODEX_SHARED_KEY_REMOTE_ENABLED=true is set. \
+Anyone holding the shared key gets full shared-key access from the network."
+            );
+        } else {
+            tracing::warn!(
+                "Direct shared-key auth is configured (WEBCODEX_SHARED_KEY_ENABLED=true) but \
+DISABLED: the server bind or WEBCODEX_PUBLIC_URL crosses a remote boundary and \
+WEBCODEX_SHARED_KEY_REMOTE_ENABLED is not set. Set WEBCODEX_SHARED_KEY_REMOTE_ENABLED=true to \
+explicitly allow remote shared-key auth."
+            );
+        }
     }
     let build_info = build_info::current();
     tracing::info!(
@@ -266,13 +337,19 @@ only for local/trusted-network demos."
     let authorize_session_store = Arc::new(oauth_http::AuthorizeSessionStore::new());
     let job_terminal_continuations =
         job_terminal_attention::JobTerminalContinuationController::new(db.clone());
-    let runner_registry = Arc::new(
-        job_receipts::production_registry_with_terminal_attention(
-            db.clone(),
-            job_terminal_continuations.clone(),
-        )
-        .await,
-    );
+    let mut registry = job_receipts::production_registry_with_terminal_attention(
+        db.clone(),
+        job_terminal_continuations.clone(),
+    )
+    .await;
+    registry
+        .attach_maintenance_store(Arc::new(
+            upgrade_maintenance_store::FileMaintenanceStore::new(&config.data_dir)
+                .map_err(std::io::Error::other)?,
+        ))
+        .await
+        .map_err(std::io::Error::other)?;
+    let runner_registry = Arc::new(registry);
     // Root HTTP admission consults this process-local state before any
     // side-effecting handler can run. It closes the small race between the
     // authoritative drain transition and Salvo consuming its stop command.
@@ -285,6 +362,8 @@ only for local/trusted-network demos."
     let runtime_state_dir = config.runtime_state_dir();
     let mut tool_runtime_builder =
         tool_runtime::ToolRuntime::new(runner_registry.clone(), runtime_info.clone())
+            .with_mcp_host_policy(mcp_host_policy)
+            .with_model_workflow_policy(model_workflow_policy)
             .with_window_activity_database(db.clone())
             .with_memory_database(db.clone())
             .with_project_reference_database(db.clone())
@@ -355,6 +434,13 @@ only for local/trusted-network demos."
         }
     }
 
+    #[cfg(feature = "legacy-gpt-actions")]
+    let legacy_gpt_action_router =
+        Router::with_path(route_metadata::api_path(RouteId::GptActionsInvoke))
+            .post(runtime_http::gpt_action_invoke);
+    #[cfg(not(feature = "legacy-gpt-actions"))]
+    let legacy_gpt_action_router = Router::new();
+
     let authed_api_router = Router::new()
         .hoop(AuthMiddleware)
         .push(runtime_console_http::routes())
@@ -367,10 +453,7 @@ only for local/trusted-network demos."
             Router::with_path(route_metadata::api_path(RouteId::ToolsCall))
                 .post(runtime_http::tools_call),
         )
-        .push(
-            Router::with_path(route_metadata::api_path(RouteId::GptActionsInvoke))
-                .post(runtime_http::gpt_action_invoke),
-        )
+        .push(legacy_gpt_action_router)
         .push(
             Router::with_path(route_metadata::api_path(RouteId::ArtifactsImport))
                 .post(runtime_http::import_conversation_files_to_project),
@@ -382,6 +465,10 @@ only for local/trusted-network demos."
         .push(
             Router::with_path(route_metadata::api_path(RouteId::RuntimeStatus))
                 .post(runtime_http::runtime_status),
+        )
+        .push(
+            Router::with_path(route_metadata::api_path(RouteId::RuntimeUpgradeMaintenance))
+                .post(upgrade_http::maintenance),
         )
         // Phase 2e-3: first-party OAuth client management API. Behind
         // AuthMiddleware; route policy is FirstPartyOnly so OAuth2 access
@@ -528,14 +615,30 @@ only for local/trusted-network demos."
                 .post(pairing_http::pairing_enroll),
         )
         .push(
-            authed_api_router.push(
-                Router::with_path(route_metadata::api_path(RouteId::PairingCreate))
-                    .post(pairing_http::pairing_create),
-            ),
+            authed_api_router
+                .push(
+                    Router::with_path(route_metadata::api_path(RouteId::PairingCreate))
+                        .post(pairing_http::pairing_create),
+                )
+                .push(
+                    Router::with_path(route_metadata::api_path(
+                        RouteId::RunnerCapabilityAuthorization,
+                    ))
+                    .post(pairing_http::runner_capability_authorization),
+                )
+                .push(
+                    Router::with_path(route_metadata::api_path(RouteId::PairingRunnerCapabilities))
+                        .post(pairing_http::grant_runner_capabilities),
+                ),
         );
 
-    let openapi_router =
+    let health_router = Router::with_path(route_metadata::root_path(RouteId::Healthz)).get(healthz);
+
+    #[cfg(feature = "legacy-gpt-actions")]
+    let legacy_openapi_router =
         Router::with_path(route_metadata::root_path(RouteId::OpenApiDocument)).get(openapi_json);
+    #[cfg(not(feature = "legacy-gpt-actions"))]
+    let legacy_openapi_router = Router::new();
 
     let runtime_root = RouteId::RuntimeWebRoot;
     let runtime_console_router = Router::with_path(route_metadata::root_path(runtime_root))
@@ -596,7 +699,8 @@ only for local/trusted-network demos."
         .hoop(affix_state::inject(console_asset_source))
         .hoop(cors.into_handler())
         .push(api_router)
-        .push(openapi_router)
+        .push(health_router)
+        .push(legacy_openapi_router)
         .push(runtime_console_router)
         .push(admin_router)
         // OAuth2 token, revocation, and discovery endpoints — public, no
@@ -691,12 +795,12 @@ only for local/trusted-network demos."
         "tool_request_trace"
     );
     tracing::info!(
-        mcp_compact_schemas = crate::model_surface::effective_mcp_compact_schemas(
-            crate::config::mcp_compact_schemas_override(),
-        ),
+        mcp_compact_schemas = runtime_info.mcp_compact_schemas,
         "mcp_compact_schemas"
     );
-    tracing::info!("OpenAPI (GPT Actions): {}/openapi.json", base);
+    tracing::info!("Health: {}/healthz", base);
+    #[cfg(feature = "legacy-gpt-actions")]
+    tracing::info!("Legacy GPT Actions OpenAPI: {}/openapi.json", base);
     tracing::info!("Runtime console: {}/runtime", base);
     tracing::info!("Runtime status: {}/api/runtime/status", base);
     tracing::info!("Runner WebSocket: {}/api/agents/ws", base);
@@ -725,14 +829,33 @@ only for local/trusted-network demos."
             runner_http::recovery_timeout_sweep(&sweep_registry).await;
         }
     });
+    #[cfg(target_os = "macos")]
+    if let Some(log) = service_log.as_ref() {
+        log.ready().map_err(std::io::Error::other)?;
+    }
+    #[cfg(windows)]
+    if let Some(log) = webcodex_environment::service::ServiceLog::from_managed_env()
+        .map_err(std::io::Error::other)?
+    {
+        log.record(
+            webcodex_environment::service::Component::Server,
+            webcodex_environment::service::ServiceLogEvent::Ready,
+        )
+        .map_err(std::io::Error::other)?;
+    }
     server_shutdown::serve_until_termination(
         Server::new(acceptor),
         router,
         shutdown_coordinator,
         std::time::Duration::from_secs(SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SECS),
         stop_on_stdin_eof,
+        service_stop,
     )
     .await?;
+    #[cfg(target_os = "macos")]
+    if let Some(log) = service_log.as_mut() {
+        log.stopped().map_err(std::io::Error::other)?;
+    }
     Ok(())
 }
 

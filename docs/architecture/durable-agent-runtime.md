@@ -150,7 +150,7 @@ Runtime Console, explicit activation, and push `ContinuationAdapter` behavior re
 These invariants, the natural-conversation slice, and the durable A3 ownership
 substrate support asynchronous Agent work without introducing a scheduler.
 
-## Durable Goal workflow — G4
+## Durable Goal workflow — G4/G6/G7
 
 Goal is high-level **durable workflow/progress truth**: fixed bounded completion
 intent and mechanical milestones, an explicit controller routing identity, and an
@@ -160,25 +160,58 @@ TaskAttempt remains the owner of concrete execution. None replaces another.
 
 The workflow is WebCodex-owned, not a repository convention. The startup brief's
 `webcodex.workflow.model_protocol`, canonical tool descriptions, and
-`single_window_goal_workflow` recommended flow direct substantial multi-step or
-cross-turn development, fixes, refactoring, troubleshooting, deployment and
-migration into a new or reused durable Goal. Tiny one-step lookups and trivial
-edits do not mechanically create one. Repository `AGENTS.md` continues to express
-repository-specific rules; it does not decide whether Goal workflow exists.
+`single_window_goal_workflow` recommended flow direct ordinary substantial
+multi-step or cross-turn development, fixes, refactoring, troubleshooting,
+deployment and migration through one canonical Goal lifecycle. On explicit exact
+Workflow Session re-entry, `work_on_project` may return owner-scoped sparse
+`goal_context` for active Goals already correlated to that Session. One candidate
+can be explicitly re-read/reused; multiple candidates remain a bounded explicit
+choice. The projection never auto-selects, binds, or completes a Goal and never
+infers identity from Project, Window, title, recency, or Session correlation itself.
+Unavailable evidence is not proof of zero active Goals. With no reusable active Goal
+context, ordinary new substantial work uses the canonical atomic Goal admission.
+Tiny one-step lookups and trivial edits do not mechanically create one. Repository
+`AGENTS.md` continues to express repository-specific rules; it does not decide
+whether Goal workflow exists. Existing exact Goals can still be composed explicitly
+through the lower-level Goal primitives; admission never heuristically selects a
+recent Goal.
 
 ```text
-substantial work
-  -> create/reuse Goal with completion_conditions and steps
-  -> explicitly associate current Workflow Session
+ordinary new substantial work
+  -> work_on_project -> exact Workflow Session
+  -> prepare_goal_workflow(session_id, completion_conditions, steps, controller_agent_id?)
+       # one durable admission: new Goal + exact Session correlation
   -> present_goal_plan
   -> work; checkpoint at recovery-worthy boundaries
   -> fresh verification/review
   -> complete remaining plan steps; explicitly update_goal(completed)
 
+normal exact-Session continuation
+  -> work_on_project(session_id=exact)
+  -> optional sparse goal_context
+       # 1 active Goal: explicitly get_goal / present_goal_plan and reuse it
+       # >1 active Goals: explicitly choose; no latest/Window/Project inference
+
 optional automatic continuation
-  -> reuse exact already-callable durable Agent, or explicitly establish one
-  -> set that Agent as Goal controller; retain its Agent Continuation card
+  -> reuse one exact explicit durable controller Agent
+  -> if its carrier is not ready, use the separate agent_continuation_setup flow
 ```
+
+`prepare_goal_workflow` is deliberately Host-neutral. ToolRuntime first calls the
+existing exact Session authorization path, which rechecks the immutable Session
+creation-authority fingerprint and any bound Project authorization. Only after that
+succeeds does the Store enter one `BEGIN IMMEDIATE` transaction. The transaction
+validates the bounded Goal input and optional exact owned controller, checks the
+composition-specific keyed replay identity, allocates and inserts the Goal at
+`revision = 1`, inserts exactly one `workflow_session` correlation without a synthetic
+revision bump, records the prepare idempotency fact, then commits. Any failure rolls
+back all three durable writes. Exact same-key replay returns that same admitted Goal
+without mutation; changed reuse fails closed.
+
+That transaction contains no MCP, MCP Apps, `ClientWindow`, iframe, Endpoint, Host
+binding, `ui/message`, Wake, or presentation state. `present_goal_plan` and Agent
+Continuation are separate adapters after durable admission; neither App mount nor
+`production_auto_resume_available` is part of prepare success.
 
 A single `wc_dagent_*` can simultaneously be a callable Task assignee and controller
 of one or more Goals. There is no Worker/Goal Agent type, role enum, second identity,
@@ -256,25 +289,38 @@ coding tools, and no Goal lifecycle is inferred from Session closeout.
 
 ### Goal Plan progress projection and inactivity detector
 
-The sole current Goal Plan resource is `ui://webcodex/goal-plan/v3`; its sole current
-wire version is **2**. Older pre-production Goal resource aliases are not served.
+The sole current Goal Plan resource is `ui://webcodex/goal-plan/v6`; its sole current
+wire version is **3**. Older pre-production Goal resource aliases are not served.
+Goal Plan deliberately advances its canonical resource URI whenever its shipped View
+or App-tool wire changes: production Hosts may retain a same-URI View across Server
+deploys, so resource identity—not an assumed refresh—is the cache/version fence.
 `present_goal_plan` is the only model-visible App-bound presentation tool.
-`goal_plan_state` is an exact owner-authorized read, polled about every three seconds.
+`goal_plan_sync` is the single App-only effectful observation/synchronization primitive.
+It accepts only `goal_id`, re-authorizes on every call, may commit one authoritative
+stall Attention/Wake under the existing fences, and returns the final post-reconciliation
+projection in the same RPC.
 The card projects title, lifecycle/revision, controller identity, step counts,
-bounded steps/current step, checkpoint summary/time and derived activity. It omits
+bounded steps/current step, checkpoint summary/time, derived activity, and bounded
+continuity observation. Continuity separates current production carrier readiness
+and the exact current Goal-stall Wake lifecycle from bounded continuation outcome
+evidence. While a current Wake exists, Host delivery and fresh-turn proof describe
+that Wake. After exact consume followed by newer meaningful work, the current state
+returns to ready/stalled with no current Wake, while Host delivery, fresh-turn proof,
+and the bounded timeline retain the most recent confirmed resume. It omits
 objective/conditions, Task bodies/results, private Project paths, correlation
 identities, Session ledger, Endpoint bindings, tokens/fences, stdout/stderr and full
 history. The presentation envelope is bounded to 40 KiB including metadata.
 
-Both `goal_plan_state` and the narrow `goal_plan_recheck_attention` are globally
-ModelHidden and App-only on an eligible Stateless MCP 2026 surface. A kernel
-capability gate is the final backstop for non-App transports. Both remain
-**Transport / NonMeaningful**: polling records that the Window was seen, never that
-business work advanced. A successful Goal Plan poll records only its exact Goal
+`goal_plan_sync` is globally ModelHidden and App-only on an eligible Stateless
+MCP 2026 surface. Its public contract is intentionally **effectful**
+(`Mutate / WorkflowManage / DesiredState`), never disguised as a pure read; a
+kernel capability gate remains the final backstop for non-App transports. It is still
+**Transport / NonMeaningful**: synchronization records that the Window was seen,
+never that business work advanced. A successful sync records only its exact Goal
 selector in the existing ActionAudit identity projection; it cannot make another
-Goal's card appear alive. The detector accepts **only `goal_id`**. Window context is
-trusted Host/runtime sideband; client timestamps, Session/controller selections,
-claimed active-request counts and claimed coverage are not accepted.
+Goal's card appear alive. Window context is trusted Host/runtime sideband; client
+timestamps, Session/controller selections, claimed active-request counts and claimed
+coverage are not accepted.
 
 The existing Window activity registry and ActionAudit ledger remain the only
 observation machinery. Meaningful completion rows and the newest observation are
@@ -287,8 +333,8 @@ and terminal `not_applicable`. Running meaningful requests keep activity active.
 Five minutes of known quiet can warrant attention, but **stalled is not offline**:
 Host scheduling, inference, user work or other connectors may explain the interval.
 
-`attention_needed` alone is not auto-resume eligibility. On the App's detector
-request the Server independently rechecks all of the following:
+`attention_needed` alone is not auto-resume eligibility. During the same
+`goal_plan_sync` request the Server independently rechecks all of the following:
 
 - owned active Goal, exact explicit owned controller Agent, and current
   communication read/manage, runtime read, Session collaborate and Project read;
@@ -298,8 +344,10 @@ request the Server independently rechecks all of the following:
 - complete authoritative observation; no active meaningful request under the
   principal, including a request that started while asynchronous checks ran;
 - last meaningful completion at least **300,000 ms** ago; a successful exact-Goal
-  card poll at least **1,000 ms** later than that completion, no future timestamp,
-  and no more than **15,000 ms** old at the transaction's current-time sample;
+  card observation at least **1,000 ms** later than that completion, no future
+  timestamp, and within the Server-owned **75,000 ms observation lease**. The lease
+  covers the App's 60s hidden/background cadence plus 15s scheduling slack; browser
+  timestamps are never accepted;
 - still-active exact Session and creation-authority fingerprint, matching Goal
   revision/controller/correlation and unchanged durable meaningful-work anchor.
 
@@ -314,9 +362,19 @@ runs under either lock. The transaction recomputes persisted evidence rather tha
 trusting a browser clock or a stale async snapshot. A closed/disappeared card or
 unobserved Window never triggers an automatic turn.
 
+A missing outer `recording_session_id` remains durable forensic truth in ActionAudit.
+It is not, however, a Goal-liveness coverage hole when that exact successful MCP
+action already carries canonical business-Session evidence for the same Goal Session
+and Project: the typed ToolCall has independently passed business Session authority
+and lifecycle checks, and MCP persists only that exact `business_session_id` as a
+bounded internal audit id. Different/missing Session evidence, Project mismatch,
+malformed audit ids, and unrecorded calls remain fail-closed. ClientWindow/_meta is
+used only to correlate the observation; it never selects or authorizes a Session,
+and this does not create a sticky recorder or backfill the Session ledger.
+
 ### Narrow Goal workflow stall attention and fresh-turn recovery
 
-A successful recheck atomically creates one `goal_workflow_stalled` Event and one
+An eligible sync atomically creates one `goal_workflow_stalled` Event and one
 ordinary pending `attention_event` Wake for the exact controller. The Event binds
 Goal, selected Agent, exact correlated Workflow Session, canonical hashed Window,
 observation principal, Goal revision and observed timing. It contains no copied
@@ -335,7 +393,7 @@ Event/Wake corruption fails closed. No sliding deadline or consume/dispatch acti
 resets the epoch.
 
 ```text
-Goal Plan poll -> selector-only detector request -> authoritative fenced recheck
+Goal Plan sync -> authoritative observation + fenced reconciliation in one RPC
  -> atomic goal_workflow_stalled Event + controller Wake
  -> existing AgentContinuationController / Agent Continuation MCP App
  -> existing claim + prepare + dispatch fence -> ui/message
@@ -363,7 +421,7 @@ ANY/ALL Wait precedence and Host delivery uncertainty remain independent.
 See [Goal workflow continuity dogfood](../agent/goal-workflow-continuity-dogfood.md)
 for deterministic coverage and the distinct manual production-Host boundary.
 
-**G3 — production Host continuation adapter.** G3 is now implemented for explicit Durable Agent Endpoints, independently of Goal. The public `present_agent_continuation` entry requires exact `agent_id`, `endpoint_id`, and `expected_controller_generation`; it does not infer a target from Goal, Workflow Session, Project, ClientWindow, credential, recent Agent, recent Task, or any other ambient state. The associated App bridge is available only on an App-enabled Stateless MCP 2026 request, where its hidden tools are projected with `ui.visibility = ["app"]`; they remain absent from the ordinary model universe, legacy MCP, REST/generic runtime, and Adaptive gateway targets, with a kernel protocol-capability gate as the final backstop.
+**G3 — production Host continuation adapter.** G3 is now implemented for explicit Durable Agent Endpoints, independently of Goal. The public `present_agent_continuation` entry requires either a server-issued `agent_continuation_ref` for one exact generation or the explicit `agent_id`, `endpoint_id`, and `expected_controller_generation` tuple; it does not infer a target from Goal, Workflow Session, Project, ClientWindow, credential, recent Agent, recent Task, or any other ambient state. The ref grants no authority and never retargets after Endpoint replacement. The associated App bridge is available only on an App-enabled Stateless MCP 2026 request, where its hidden tools are projected with `ui.visibility = ["app"]`; they remain absent from the ordinary model universe, legacy MCP, REST/generic runtime, and Adaptive gateway targets, with a kernel protocol-capability gate as the final backstop.
 
 The durable lifecycle remains exactly the pre-existing Agent Endpoint / Wake / Wake Delivery Attempt lifecycle. The App View is only a live Host controller/carrier: `bind` establishes one current process-local View fence, `state` heartbeats and renews the exact Endpoint, `wake_acquire` delegates to the existing claim path, `wake_prepare` crosses the existing durable dispatch fence and revalidates exact binding, and `wake_finish` records only accepted/unknown Host dispatch outcome. Claim fence and binding secret are not durable/model-visible truth; the automatic message carries the exact consume token only through App-private MCP result metadata, not ordinary structured model content or audit/trace payloads. `dispatch_prepared`, `dispatch_accepted`, and `dispatch_unknown` are bounded Host observations, not new authoritative Wake states. Only exact durable `consume_agent_wake` establishes `continuation_consumed`.
 
@@ -722,8 +780,18 @@ backend-response uncertainty.
 ### A4b — TaskAttempt -> Agent Endpoint continuation (implemented)
 
 A4b is implemented through `start_agent_task_endpoint_continuation`. The model supplies
-only the exact `task_id`, `attempt_id`, `assignee_agent_id`, `attempt_fence`, and
-`attempt_controller_generation`; startup never selects an Endpoint. The Store records
+either a server-issued `attempt_ref` or the exact `task_id`, `attempt_id`,
+`assignee_agent_id`, `attempt_fence`, and `attempt_controller_generation`. The ref is a
+communication-principal index pinned to that tuple, including the fence and controller
+generation. It is not a credential. Lookup runs only for the caller, then the existing
+owner, lease, fence, and generation checks run again. A later takeover, expiry,
+replacement, or controller generation change leaves the old ref pinned to the old tuple.
+Endpoint continuation, heartbeat, completion, and CodingAgent dispatch all accept this
+same `attempt_ref` or the full explicit tuple, never a mixture. `start_agent_task_coding_run`
+still requires an explicit Project and provider; resolving the ref does not bypass its
+Project/provider authorization, current Attempt checks, immutable binding intent, or
+outcome-unknown replay fence. Active-turn Wake/consume proof and completion keys remain
+separate inputs, not part of the selector. Startup never selects an Endpoint. The Store records
 one concrete `wc_agent_task_endpoint_executions` row plus one durable
 `agent_task_attempt` Wake. Its Endpoint id/generation are nullable until an existing
 wake-capable carrier later claims the Wake. Attempt controller generation remains
@@ -937,6 +1005,26 @@ associate the selected Tasks to the Goal; register the Goal-scoped `any` or `all
 those exact 1..8 Task ids; **only then** start worker execution. On resume, consume the exact
 Wake, read the Wait, read the Goal, re-read every source Task, and explicitly decide the
 next Goal action. Do not dispatch workers first and try to add the rendezvous afterward.
+
+Production auto-resume availability is carrier readiness, not a guarantee of unattended
+or zero-click continuation. An approval-gated Host should coalesce worker events behind a
+meaningful durable checkpoint and request at most one follow-up approval for that
+checkpoint, rather than prompting once per worker event. That coalescing must preserve
+each Agent's identity and the authoritative Task, Attempt, Goal, privacy, and dispatch-fence
+boundaries.
+
+An execution Host dispatch may use `ui/message` only for the exact current
+`agent_task_attempt` Wake, its authoritative TaskAttempt, and current Attempt controller
+fence. Controller-attention (`attention_event`) and Wait (`agent_wait_events`) Wakes are
+separate controller-routed sources: each dispatch must match that Wake's exact identity,
+target Agent, current carrier/controller generation, and dispatch-fence identity; neither
+source borrows or merges an execution Attempt's authority. For every Wake source, a
+`delivery_unknown` outcome must be reconciled against that same exact Wake/source,
+Agent, carrier/controller-generation, and dispatch-fence identity rather than triggering a blind
+second Host send. After a resumed turn consumes the Wake, it must re-read the authoritative
+source (the TaskAttempt for execution Wakes) and current checkpoint before continuing;
+neither Host delivery nor Wake consumption completes an Attempt or proves that reported
+work succeeded.
 
 Natural future source kinds include `deadline_reached`, Job terminal state,
 Plugin/external completion, and human approval. They should be added only when each has an

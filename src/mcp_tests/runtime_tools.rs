@@ -4,15 +4,10 @@ use super::*;
 // runtime_status via MCP tools/list and tools/call
 // =========================================================================
 
-// An explicit compact-schema=false override keeps full outputSchema projection.
-// Serialize it with process-global env tests so a concurrent override cannot
-// change the observed contract.
-#[allow(clippy::await_holding_lock)]
+// An explicit compact-schema=false snapshot keeps full outputSchema projection.
 #[tokio::test]
 async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux_flags() {
-    let mut env = crate::test_support::TestEnvGuard::new();
-    env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
-    let runtime = test_runtime();
+    let runtime = test_runtime_with_mcp_settings(false, true);
     let outcome = handle_mcp_request(
         &runtime,
         rpc("tools/list", Some(Value::from(10)), json!({})),
@@ -43,13 +38,15 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
         "exact git base",
         "fresh workflow session",
         "exact resume",
-        "primary result stays compact",
-        "context_request",
+        "do not immediately reread",
+        "reuse successful workspace",
+        "_wc.context",
         "project.instructions",
         "webcodex.workflow",
         "skills",
         "plugin",
-        "without bypassing project authority",
+        "project authority",
+        "reauthorizes project",
     ] {
         assert!(
             normalized_description.contains(phrase),
@@ -84,13 +81,13 @@ async fn mcp_tools_list_exposes_canonical_coding_bootstrap_and_runtime_status_ux
     ] {
         assert!(work_props.contains_key(field), "MCP schema missing {field}");
     }
-    assert_eq!(work_props["guidance_profile"]["default"], "direct");
+    assert!(work_props["guidance_profile"].get("default").is_none());
     assert_eq!(
         work_props["guidance_profile"]["enum"],
         if cfg!(feature = "experimental-code-mode") {
-            json!(["direct", "code_mode"])
+            json!(["direct", "host_code_mode", "code_mode"])
         } else {
-            json!(["direct"])
+            json!(["direct", "host_code_mode"])
         }
     );
     assert_eq!(work_props["include_extension_catalog"]["default"], true);
@@ -252,8 +249,8 @@ async fn mcp_tools_call_show_changes_returns_structured_tool_error() {
             "tools/call",
             Some(Value::from(14)),
             json!({
-                "name": "show_changes",
-                "arguments": {"project": "agent:nope:nope"}
+                "name": "call_runtime_tool",
+                "arguments": {"tool": "show_changes", "arguments": {"project": "agent:nope:nope"}}
             }),
         ),
         None,
@@ -283,6 +280,10 @@ fn mcp_suggested_call_output_schema_tracks_adaptive_route() {
         .expect("Adaptive work_on_project");
     let adaptive_call =
         &adaptive_work["outputSchema"]["properties"]["output"]["properties"]["suggested_call"];
+    assert_eq!(
+        adaptive_call["properties"]["follow_up_kind"]["const"],
+        "fallback_recovery"
+    );
     assert_eq!(
         adaptive_call["properties"]["tool"]["const"],
         crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
@@ -345,6 +346,7 @@ async fn adaptive_mcp_work_on_project_recovery_is_immediately_gateway_callable()
         other => panic!("expected MCP tool result, got {other:?}"),
     };
     let suggested = &value["result"]["structuredContent"]["output"]["suggested_call"];
+    assert_eq!(suggested["follow_up_kind"], "fallback_recovery");
     assert_eq!(
         suggested["tool"],
         crate::mcp::tools::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
@@ -375,4 +377,126 @@ async fn adaptive_mcp_work_on_project_recovery_is_immediately_gateway_callable()
         other => panic!("projected recovery must pass MCP gateway admission: {other:?}"),
     };
     assert_eq!(recovery["result"]["structuredContent"]["success"], true);
+}
+
+#[tokio::test]
+async fn mcp_runtime_status_defaults_sparse_preserves_explicit_full_and_gateway_parity() {
+    let runtime = test_runtime();
+    for gateway in [false, true] {
+        for (arguments, sparse) in [
+            (json!({}), true),
+            (Value::Null, true),
+            (json!({"compact": true}), true),
+            (json!({"compact": false}), false),
+            (json!({"compact": false, "summary_only": true}), true),
+        ] {
+            let params = if gateway {
+                adaptive_runtime_gateway_params("runtime_status", arguments)
+            } else {
+                json!({"name": "runtime_status", "arguments": arguments})
+            };
+            let McpOutcome::Ok(value) =
+                handle_mcp_request(&runtime, rpc("tools/call", Some(json!(1)), params), None).await
+            else {
+                panic!("status call")
+            };
+            let output = &value["result"]["structuredContent"]["output"];
+            assert_eq!(value["result"]["structuredContent"]["success"], true);
+            assert_eq!(output.get("authority").is_none(), sparse);
+            assert_eq!(output.get("mcp_host").is_some(), sparse);
+            if !sparse {
+                for field in [
+                    "effective_config",
+                    "session_store",
+                    "quic",
+                    "version_compatibility",
+                    "connection_layers",
+                    "tools",
+                ] {
+                    assert!(output.get(field).is_some(), "{field}");
+                }
+            }
+        }
+    }
+    let McpOutcome::Ok(manifest) = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(2)),
+            mcp_2026_params(json!({
+                "name": "tool_manifest",
+                "arguments": {"tool_name": "runtime_status"}
+            })),
+        ),
+        None,
+    )
+    .await
+    else {
+        panic!("runtime_status manifest")
+    };
+    let manifest_output = &manifest["result"]["structuredContent"]["output"];
+    assert_eq!(manifest_output["name"], "runtime_status");
+    assert_eq!(
+        manifest_output["input_schema"]["properties"]["compact"]["default"],
+        true
+    );
+    assert!(
+        manifest_output["input_schema"]["properties"]["compact"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("MCP defaults to sparse status")
+    );
+
+    let canonical = runtime
+        .dispatch(
+            crate::tool_runtime::ToolCall::from_tool_name("runtime_status", json!({})).unwrap(),
+        )
+        .await;
+    assert!(canonical.output.get("authority").is_some());
+    assert_eq!(
+        webcodex_tool_contracts::input_schema_for_tool("runtime_status")["properties"]["compact"]
+            ["default"],
+        false,
+        "canonical/API runtime_status default must remain full"
+    );
+}
+
+#[test]
+fn mcp_pending_and_success_attention_match_published_output_schema() {
+    use crate::model_surface::{project_tool_result_suggested_calls, suggested_tool_call_route};
+    let tools = mcp_tools_list_payload_with_compact(false);
+    let descriptor = tools["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "cargo_check")
+        .unwrap();
+    let continuation = json!({"follow_up_kind":"fallback_recovery", "tool":"observe_jobs", "arguments":{
+        "items":[{"job_id":"wc_job_pending", "after_observation_token":"wj3_AAAAAAAAAAAAAAAAAAAAAA.1.0.0"}], "wait_secs":5, "wake_on":"terminal"
+    }});
+    let mut result = ToolResult::ok(
+        json!({"execution_state":"pending", "continuation":continuation,
+            "job_attention":{"items":[{"job_id":"wc_job_done","tool":"cargo_check","outcome":"passed",
+                "validation":{"kind":"check","source_state":{"freshness":"unproven","observed_mutation_fence":"uncrossed"}}}]}
+        }),
+    );
+    project_tool_result_suggested_calls("cargo_check", &mut result, &|target| {
+        // This descriptor comes from the non-stateless MCP surface. The
+        // operator-extension bit is target-specific admission, not a blanket
+        // statement that the adapter supports extensions; observe_jobs remains
+        // a direct target here just as it does in production MCP routing.
+        suggested_tool_call_route(target, false)
+    });
+    let envelope = serde_json::to_value(&result).unwrap();
+    webcodex_tool_contracts::test_support::validate_schema_instance(
+        &envelope,
+        &descriptor["outputSchema"],
+    )
+    .unwrap();
+    assert!(result.output.get("pending_strategy").is_none());
+    assert_eq!(result.output["continuation"], continuation);
+    webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(&result.output["continuation"]).unwrap();
+    assert!(result.output["job_attention"]["items"][0]
+        .get("details")
+        .is_none());
 }

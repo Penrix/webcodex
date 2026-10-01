@@ -348,6 +348,16 @@ pub struct AgentTaskCodingRunReconcileMutation {
     pub wait_target_agent_ids: Vec<String>,
 }
 
+/// Internal pin for issuing `attempt_ref`. The fence never leaves the store API
+/// through a model-facing Task summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveAgentTaskAttemptPin {
+    pub attempt_id: String,
+    pub assignee_agent_id: String,
+    pub attempt_fence: String,
+    pub attempt_controller_generation: i64,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AgentTaskAttemptRecord {
     pub attempt_id: String,
@@ -691,6 +701,27 @@ impl Database {
                 ON wc_agent_task_attempts(task_id, attempt_number DESC);
             CREATE INDEX IF NOT EXISTS idx_wc_agent_task_attempts_assignee
                 ON wc_agent_task_attempts(assignee_agent_id, state, lease_expires_at_unix_ms);
+
+            -- Model-facing selector only. Rows are immutable: a newer Attempt,
+            -- assignee, fence, or controller generation inserts a new index and
+            -- never rewrites an older one. The stored fence is the same proof
+            -- start already issued; this row is not authority.
+            CREATE TABLE IF NOT EXISTS wc_agent_task_attempt_references (
+                principal_kind TEXT NOT NULL,
+                principal_digest TEXT NOT NULL,
+                ref_index INTEGER NOT NULL CHECK(ref_index >= 1),
+                task_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
+                assignee_agent_id TEXT NOT NULL,
+                attempt_fence TEXT NOT NULL,
+                attempt_controller_generation INTEGER NOT NULL CHECK(attempt_controller_generation >= 1),
+                created_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(principal_kind, principal_digest, ref_index),
+                UNIQUE(
+                    principal_kind, principal_digest, task_id, attempt_id, assignee_agent_id,
+                    attempt_fence, attempt_controller_generation
+                )
+            );
             ",
         )?;
         Ok(())
@@ -938,6 +969,43 @@ impl Database {
         task_id: &str,
     ) -> Result<AgentTaskDetail, CommunicationStoreError> {
         self.read_agent_task_at(principal, task_id, now_unix_ms())
+    }
+
+    /// The current Attempt pin when that Attempt is the task assignee's live lease.
+    /// Expired, terminal, or assignee-mismatched Attempts return `None` and never
+    /// publish the fence on a Task summary.
+    pub fn live_agent_task_attempt_pin(
+        &self,
+        principal: &CommunicationPrincipal,
+        task_id: &str,
+    ) -> Result<Option<LiveAgentTaskAttemptPin>, CommunicationStoreError> {
+        self.live_agent_task_attempt_pin_at(principal, task_id, now_unix_ms())
+    }
+
+    pub(crate) fn live_agent_task_attempt_pin_at(
+        &self,
+        principal: &CommunicationPrincipal,
+        task_id: &str,
+        now: i64,
+    ) -> Result<Option<LiveAgentTaskAttemptPin>, CommunicationStoreError> {
+        validate_communication_principal(principal)?;
+        validate_id(task_id, AGENT_TASK_ID_PREFIX, "invalid_agent_task_id")?;
+        let conn = self.lock_connection(crate::StoreDomain::AgentTask);
+        let task = load_owned_task(&conn, principal, task_id, now)?;
+        let Some(attempt) = task.latest_attempt.as_ref() else {
+            return Ok(None);
+        };
+        if attempt.effective_state(now) != AgentTaskAttemptState::Active
+            || task.assignee_agent_id.as_deref() != Some(attempt.assignee_agent_id.as_str())
+        {
+            return Ok(None);
+        }
+        Ok(Some(LiveAgentTaskAttemptPin {
+            attempt_id: attempt.attempt_id.clone(),
+            assignee_agent_id: attempt.assignee_agent_id.clone(),
+            attempt_fence: attempt.attempt_fence.clone(),
+            attempt_controller_generation: attempt.attempt_controller_generation,
+        }))
     }
 
     pub(crate) fn read_agent_task_at(
@@ -2780,15 +2848,12 @@ fn stored_coding_run_snapshot(
                 "CodingAgent binding observation revision lacks run state",
             )
         })?,
-        execution_state: binding
-            .last_observed_execution_state
-            .clone()
-            .ok_or_else(|| {
-                CommunicationStoreError::new(
-                    "agent_task_storage_invariant",
-                    "CodingAgent binding observation revision lacks execution state",
-                )
-            })?,
+        execution_state: binding.last_observed_execution_state.ok_or_else(|| {
+            CommunicationStoreError::new(
+                "agent_task_storage_invariant",
+                "CodingAgent binding observation revision lacks execution state",
+            )
+        })?,
         observation_revision: revision,
         terminal_stop_reason: binding.terminal_stop_reason.clone(),
         terminal_error_code: binding.terminal_error_code.clone(),
@@ -3239,7 +3304,7 @@ fn load_coding_run_binding_for_attempt(
                     .get::<_, Option<String>>(10)?
                     .as_deref()
                     .map(|value| {
-                        CodingAgentRunState::from_str(value).ok_or_else(|| {
+                        CodingAgentRunState::from_wire(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 10,
                                 Type::Text,
@@ -3253,7 +3318,7 @@ fn load_coding_run_binding_for_attempt(
                     .get::<_, Option<String>>(11)?
                     .as_deref()
                     .map(|value| {
-                        CodingAgentExecutionState::from_str(value).ok_or_else(|| {
+                        CodingAgentExecutionState::from_wire(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 11,
                                 Type::Text,

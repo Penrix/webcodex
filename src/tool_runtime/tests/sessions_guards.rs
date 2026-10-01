@@ -318,14 +318,30 @@ async fn read_only_recording_session_does_not_guard_same_project_write() {
 #[tokio::test]
 async fn closed_recording_session_remains_provenance_only_for_business_write() {
     let tmp = tempfile::tempdir().unwrap();
-    let runtime = test_runtime();
+    let runtime = test_runtime().with_project_reference_database(std::sync::Arc::new(
+        crate::Database::open(&tmp.path().join("closed-recorder-refs.db")).unwrap(),
+    ));
     let project =
         register_runner_project_at_path(&runtime, "guard-closed-recorder", "demo", tmp.path())
             .await;
     let auth = auth_context(None, true);
+    let authority = crate::tool_runtime::workflow_session_authority_fingerprint(Some(&auth))
+        .expect("closed recorder auth should have stable authority");
     let recorder = runtime
         .sessions
-        .start_session(Some(project.clone()), Some("closed recorder".to_string()));
+        .start_session_with_options(
+            crate::tool_runtime::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("closed recorder".to_string()),
+                crate::tool_runtime::SessionMode::Normal,
+                crate::tool_runtime::SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(authority)),
+        )
+        .unwrap();
+    let recorder_ref = runtime
+        .session_reference_for_id(&recorder.session_id, Some(&auth))
+        .expect("closed recorder test should issue a Session ref before close");
     runtime
         .sessions
         .close_session(&recorder.session_id)
@@ -334,7 +350,7 @@ async fn closed_recording_session_remains_provenance_only_for_business_write() {
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
-        let recorder_id = recorder.session_id.clone();
+        let recorder_id = recorder_ref;
         let auth = auth.clone();
         async move {
             runtime
@@ -509,7 +525,7 @@ async fn read_only_session_allows_read_files_and_records_success() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
@@ -796,6 +812,7 @@ async fn read_only_session_rejects_run_shell_before_agent_enqueue() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project,
                 command: "echo should-not-run".to_string(),
                 session_id: Some(session.session_id.clone()),
@@ -885,7 +902,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
@@ -922,6 +939,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "exit 0".to_string(),
                         session_id: Some(session_id),
@@ -970,6 +988,7 @@ async fn deny_shell_only_allows_write_tools() {
     let denied = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project: project.clone(),
                 command: "echo blocked".to_string(),
                 session_id: Some(session.session_id.clone()),
@@ -1066,7 +1085,7 @@ fn project_tool_schemas_include_optional_session_id() {
     for name in [
         "read_files",
         "run_shell",
-        "write_project_file",
+        "edit_project_files",
         "git_status",
         "git_log",
         "show_changes",
@@ -1089,6 +1108,22 @@ fn project_tool_schemas_include_optional_session_id() {
                 .iter()
                 .any(|field| field == "session_id"),
             "{name} schema must not require session_id"
+        );
+    }
+    let specialist_specs = crate::tool_runtime::registry::exact_manifest_specialist_tool_specs();
+    for name in ["apply_patch", "apply_unified_diff", "write_project_file"] {
+        let spec = spec_named(&specialist_specs, name);
+        assert!(
+            spec.input_schema["properties"].get("session_id").is_some(),
+            "{name} exact specialist schema missing session_id"
+        );
+        assert!(
+            !spec.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "session_id"),
+            "{name} exact specialist schema must not require session_id"
         );
     }
     let assert_session_hint_contract = |session_hint: &serde_json::Value| {
@@ -1136,12 +1171,17 @@ fn project_tool_schemas_include_optional_session_id() {
         assert_session_hint_contract(&output["properties"]["session_hint"]);
     }
 
-    for name in ["run_shell", "write_project_file"] {
-        let spec = spec_named(&specs, name);
-        let properties = &spec.output_schema["properties"]["output"]["properties"];
-        assert!(properties.get("session_recorded").is_none());
-        assert!(properties.get("session_event_id").is_none());
-        assert!(properties.get("session_id").is_none());
-        assert_session_hint_contract(&properties["session_hint"]);
-    }
+    let run_shell = spec_named(&specs, "run_shell");
+    let properties = &run_shell.output_schema["properties"]["output"]["properties"];
+    assert!(properties.get("session_recorded").is_none());
+    assert!(properties.get("session_event_id").is_none());
+    assert!(properties.get("session_id").is_none());
+    assert_session_hint_contract(&properties["session_hint"]);
+
+    let write_project_file = spec_named(&specialist_specs, "write_project_file");
+    let properties = &write_project_file.output_schema["properties"]["output"]["properties"];
+    assert!(properties.get("session_recorded").is_none());
+    assert!(properties.get("session_event_id").is_none());
+    assert!(properties.get("session_id").is_none());
+    assert_session_hint_contract(&properties["session_hint"]);
 }

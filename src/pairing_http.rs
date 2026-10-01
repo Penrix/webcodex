@@ -6,12 +6,12 @@
 //! consumed exactly once. These endpoints are not included in GPT Actions
 //! OpenAPI and are not exposed as MCP tools.
 
+mod runner_capabilities;
+pub(crate) use runner_capabilities::{grant_runner_capabilities, runner_capability_authorization};
+
 use crate::auth::{
     clean_token_name, generate_agent_token, generate_api_token, hash_token, scopes_to_string,
     token_prefix, validate_allowed_client_id, validate_username, AuthContext,
-    SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
-    SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
-    SCOPE_SESSION_COLLABORATE,
 };
 use crate::db::PairingConsumeResult;
 use crate::json_error;
@@ -21,28 +21,15 @@ use crate::models::{
 use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use webcodex_core::authority::SCOPE_RUNNER_MANAGE;
+use webcodex_core::authority::{SCOPE_CODING_AGENT_RUN, SCOPE_SSH_LOCAL};
 
 const DEFAULT_TTL_SECS: i64 = 600;
 const MIN_TTL_SECS: i64 = 60;
 const MAX_TTL_SECS: i64 = 3600;
 
-const ENROLL_USER_SCOPES: &[&str] = &[
-    SCOPE_RUNTIME_READ,
-    SCOPE_RUNNER_MANAGE,
-    SCOPE_SESSION_COLLABORATE,
-    SCOPE_PROJECT_READ,
-    SCOPE_PROJECT_WRITE,
-    SCOPE_JOB_RUN,
-];
-
-const ENROLL_AGENT_SCOPES: &[&str] = &[
-    SCOPE_AGENT_REGISTER,
-    SCOPE_AGENT_POLL,
-    SCOPE_AGENT_RESULT,
-    SCOPE_AGENT_JOB_UPDATE,
-];
-
+use webcodex_core::authority::{
+    profiles::LOCAL_USER as ENROLL_USER_SCOPES, AGENT_SCOPES as ENROLL_AGENT_SCOPES,
+};
 #[derive(Debug, Deserialize)]
 pub(crate) struct PairingCreateRequest {
     pub username: String,
@@ -59,6 +46,9 @@ pub(crate) struct PairingCreateRequest {
     pub agent_token_name: Option<String>,
     #[serde(default)]
     pub overwrite_existing_user: bool,
+    /// Admin-controlled issuance, never accepted as an enrollment-time upgrade.
+    #[serde(default)]
+    pub runner_capabilities: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +59,20 @@ pub(crate) struct PairingEnrollRequest {
     pub display_name: Option<String>,
     #[serde(default)]
     pub transport: Option<String>,
+}
+
+fn enrollment_user_scopes(runner_capabilities: bool) -> Vec<String> {
+    let mut scopes: Vec<_> = ENROLL_USER_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect();
+    if runner_capabilities {
+        scopes.extend([
+            SCOPE_SSH_LOCAL.to_owned(),
+            SCOPE_CODING_AGENT_RUN.to_owned(),
+        ]);
+    }
+    scopes
 }
 
 fn clean_display_name(value: Option<String>) -> Result<Option<String>, String> {
@@ -264,6 +268,7 @@ pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &m
         used_at: None,
         user_token_name: Some(user_token_name),
         agent_token_name,
+        runner_capabilities: body.runner_capabilities,
     };
     if let Err(e) = db.insert_pairing_code(&record) {
         res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
@@ -278,6 +283,7 @@ pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &m
         "username": user.username,
         "client_id": client_id,
         "user": user_summary(&user),
+        "runner_capabilities": record.runner_capabilities,
     })));
 }
 
@@ -385,6 +391,7 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
 
     let user_token = generate_api_token();
     let agent_token = generate_agent_token();
+    let user_scopes = enrollment_user_scopes(record.runner_capabilities);
     let user_key = ApiKeyRecord {
         id: uuid::Uuid::new_v4().to_string(),
         user_id: user.id.clone(),
@@ -396,12 +403,7 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
         created_at: now,
         last_used_at: None,
         revoked_at: None,
-        scopes: scopes_to_string(
-            &ENROLL_USER_SCOPES
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-        ),
+        scopes: scopes_to_string(&user_scopes),
         expires_at: None,
         kind: TOKEN_KIND_USER.to_string(),
         allowed_client_id: None,
@@ -448,7 +450,7 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
         "agent_token_prefix": agent_key.key_prefix,
         "user_token_id": user_key.id,
         "agent_token_id": agent_key.id,
-        "user_token_scopes": ENROLL_USER_SCOPES,
+        "user_token_scopes": user_scopes,
         "agent_token_scopes": ENROLL_AGENT_SCOPES,
     })));
 }
@@ -456,12 +458,18 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "legacy-gpt-actions")]
     use crate::openapi::build_openapi_spec;
     use crate::Database;
     use salvo::prelude::affix_state;
     use salvo::test::{ResponseExt, TestClient};
     use salvo::{Router, Service};
     use std::sync::Arc;
+    use webcodex_core::authority::{
+        SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
+        SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNNER_MANAGE,
+        SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE,
+    };
 
     fn test_db() -> Database {
         let tmp = tempfile::tempdir().unwrap();
@@ -487,6 +495,7 @@ mod tests {
         db.create_user(&user).unwrap();
         let code = "wc_pair_test_secret";
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-1".to_string(),
             code_hash: hash_token(code),
             user_id: user.id,
@@ -528,6 +537,7 @@ mod tests {
         .unwrap();
         let code_hash = hash_token("wc_pair_once");
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-1".to_string(),
             code_hash: code_hash.clone(),
             user_id: "u-1".to_string(),
@@ -576,6 +586,7 @@ mod tests {
             ("p-wrong", "wc_pair_wrong", now + 600),
         ] {
             db.insert_pairing_code(&PairingCodeRecord {
+                runner_capabilities: false,
                 id: id.to_string(),
                 code_hash: hash_token(code),
                 user_id: "u-1".to_string(),
@@ -618,6 +629,7 @@ mod tests {
         })
         .unwrap();
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-open".to_string(),
             code_hash: hash_token("wc_pair_open"),
             user_id: "u-1".to_string(),
@@ -665,6 +677,7 @@ mod tests {
         })
         .unwrap();
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-bound".to_string(),
             code_hash: hash_token("wc_pair_bound"),
             user_id: "u-1".to_string(),
@@ -708,6 +721,7 @@ mod tests {
         .unwrap();
         let code = "wc_pair_endpoint_test";
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-1".to_string(),
             code_hash: hash_token(code),
             user_id: "u-1".to_string(),
@@ -789,6 +803,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-gpt-actions")]
     #[test]
     fn pairing_endpoints_are_absent_from_openapi() {
         let spec = build_openapi_spec();

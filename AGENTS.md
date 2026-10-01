@@ -48,7 +48,7 @@ Product direction: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Process fixtures must mirror production I/O ownership: absent stdin means EOF, explicit input means those bytes followed by EOF, and stdout/stderr must be drained or captured without pipe deadlocks. Never inherit the invoking terminal by accident. Prefer explicit config inputs and child-local environment over process-global mutation.
 - For console-only or flaky failures, compare the same source with one boundary changed and add a deterministic regression that also fails in headless CI. Retries, longer timeouts, and reduced concurrency are diagnostic/resource controls, not substitutes for fixing the demonstrated cause.
 - Async readiness must use a `wait_*` path with one absolute deadline that progress never resets. Use `probe_*` only when immediate absence is valid or inside an already-owned deadline.
-- Retain the exact Job continuation; never redispatch on handoff uncertainty. When blocked on terminal, prefer `wait_for_job_terminal` with a real Host carrier. Otherwise continue independent work, optionally with `context_request=["jobs.attention"]`; use `observe_jobs` for details, explicit `stop_job(confirm=true)` for control, and `list_jobs` only for inventory/identity recovery. Job tools remain outside nested Code Mode.
+- Treat a normal `execution_state=pending` result as the same canonical execution, never as retry authority. Keep its exact continuation as fallback, continue independent work in the same turn, and let ordinary exact Window/Project/Session calls surface sparse terminal `job_attention` when available. Do not immediately poll/follow the continuation while independent work remains. Use one bounded `wait_for_job_readiness` join when Job dependencies block ready work in the current turn, `observe_jobs` for logs/details/recovery, explicit `stop_job(confirm=true)` for control, and `list_jobs` only for inventory/identity recovery. At a wait deadline reassess work and dependencies; do not mechanically refill waits, redispatch execution, or assume an automatic next turn. `wait_for_job_terminal` belongs only to an explicitly established optional continuation workflow, not ordinary waiting. `_wc.context=["jobs.attention"]` remains an explicit Project-level fallback, not the normal Session sidecar. Job tools remain outside nested Code Mode.
 - Distinguish current failures, pre-existing failures, expected negative cases, and failures resolved by retry. Never weaken authentication, authorization, validation, schemas, sandboxing, or tests to get a passing result.
 
 Testing guidance: [`docs/TESTING.md`](docs/TESTING.md).
@@ -66,8 +66,7 @@ For release, recovery, or deployment work, follow [`docs/agent/release-process.m
 
 ## 6. Load relevant domain rules
 
-- Penrix fork continuity / Web Chat / DVR direction: [docs/agent/penrix-fork-direction.md](docs/agent/penrix-fork-direction.md). Read this before fork-specific work involving the ChatGPT Web provider, cross-conversation recovery, DVR/retrieval, or deciding whether a change belongs in upstream WebCodex core versus a fork adapter/plugin.
-
+- Penrix fork continuity / ChatGPT Web Provider / DVR direction: [`docs/agent/penrix-fork-direction.md`](docs/agent/penrix-fork-direction.md). Read this before fork-specific work involving ChatGPT Web bridging, cross-conversation recovery, DVR/retrieval, or deciding whether a change belongs in upstream core versus a fork adapter/plugin.
 - Public runtime and API surfaces: [`docs/agent/openapi-guidelines.md`](docs/agent/openapi-guidelines.md).
 - Model-facing tool contract style and friction policy: [`docs/agent/tool-contract-guidelines.md`](docs/agent/tool-contract-guidelines.md).
 - Workflow Sessions and request identity: [`docs/agent/session-model.md`](docs/agent/session-model.md).
@@ -83,4 +82,4 @@ Use these as domain sources of truth rather than duplicating their detailed cont
 
 For Penrix-owned work in this fork, also read [`PENRIX-CODING.md`](PENRIX-CODING.md) before making production-code changes.
 
-That overlay adds the non-programmer Owner / Coding Agent authority split, mandatory Reality Reconnaissance before coding, a POST Reality Audit against the actual final diff, evidence-backed complexity admission, and honest runtime evidence classes. It supplements the repository rules above and does not replace more specific architecture, build, security, testing, contribution, or release requirements.
+That overlay adds the non-programmer Owner / Coding Agent authority split, Reality Reconnaissance before and after production changes, evidence-backed complexity admission, and honest runtime evidence classes. It supplements the repository rules above and does not replace more specific architecture, build, security, testing, contribution, or release requirements.

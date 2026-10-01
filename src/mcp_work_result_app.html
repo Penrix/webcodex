@@ -3,111 +3,371 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>WebCodex Progress</title>
+<title>WebCodex</title>
 <style>
-:root { color-scheme: light dark; font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+:root {
+  color-scheme: light dark;
+  font: 13px/1.45 var(--font-sans, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+  --card-border: color-mix(in srgb, CanvasText 16%, transparent);
+  --card-header: color-mix(in srgb, Canvas 94%, CanvasText 6%);
+  --card-body: color-mix(in srgb, Canvas 98%, CanvasText 2%);
+  --surface: color-mix(in srgb, Canvas 93%, CanvasText 7%);
+  --surface-hover: color-mix(in srgb, Canvas 87%, CanvasText 13%);
+  --divider: color-mix(in srgb, CanvasText 12%, transparent);
+  --muted: color-mix(in srgb, CanvasText 60%, transparent);
+  --faint: color-mix(in srgb, CanvasText 42%, transparent);
+  --accent: light-dark(#2563eb, #60a5fa);
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --success: light-dark(#16803a, #6fda83);
+  --success-soft: color-mix(in srgb, var(--success) 12%, transparent);
+  --danger: light-dark(#c93636, #ee7676);
+  --danger-soft: color-mix(in srgb, var(--danger) 12%, transparent);
+  --warning: light-dark(#a15c08, #e6b566);
+}
 * { box-sizing: border-box; }
-body { margin: 0; padding: 12px; color: CanvasText; background: Canvas; }
-.card { display: grid; gap: 11px; }
-.header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.actions { display: flex; align-items: center; gap: 7px; }
-h1 { margin: 0; font-size: 15px; font-weight: 650; }
-.badge { padding: 2px 7px; border: 1px solid color-mix(in srgb, CanvasText 22%, transparent); border-radius: 999px; font-size: 11px; white-space: nowrap; }
-.refresh { appearance: none; border: 1px solid color-mix(in srgb, CanvasText 24%, transparent); border-radius: 7px; padding: 3px 8px; color: CanvasText; background: color-mix(in srgb, CanvasText 7%, Canvas); font: inherit; font-size: 11px; cursor: pointer; }
-.refresh:disabled { opacity: .52; cursor: default; }
-.section { display: grid; gap: 4px; padding-top: 8px; border-top: 1px solid color-mix(in srgb, CanvasText 13%, transparent); }
-.section:first-of-type { padding-top: 0; border-top: 0; }
-.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-h2 { margin: 0; font-size: 12px; font-weight: 650; }
-.primary { font-weight: 600; overflow-wrap: anywhere; }
-.secondary, .status { font-size: 11px; color: color-mix(in srgb, CanvasText 62%, transparent); overflow-wrap: anywhere; }
-.files { margin: 1px 0 0; max-height: 13em; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.frozen-file { margin-top: 5px; }
-.file-toggle { display: block; width: 100%; text-align: left; border: 0; border-radius: 4px; padding: 5px; color: CanvasText; background: color-mix(in srgb, CanvasText 5%, Canvas); font: 12px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; cursor: pointer; }
-.diff { max-height: 22em; overflow: auto; margin: 4px 0; font: 11px/1.5 ui-monospace, monospace; }
-.diff-line { display: block; white-space: pre-wrap; overflow-wrap: anywhere; min-height: 1.5em; }
-.diff-line.added { background: color-mix(in srgb, #238636 16%, Canvas); }
-.diff-line.deleted { background: color-mix(in srgb, #da3633 16%, Canvas); }
-.diff-line.hunk { color: light-dark(#0969da, #79c0ff); }
+html, body { margin: 0; background: transparent; }
+body { padding: 2px; color: CanvasText; }
+button { font: inherit; }
+.card {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  background: var(--card-body);
+  box-shadow: 0 1px 2px color-mix(in srgb, CanvasText 5%, transparent), 0 8px 28px color-mix(in srgb, CanvasText 4%, transparent);
+}
+.app-header {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 14px;
+  min-height: 66px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--divider);
+  background: var(--card-header);
+}
+.brand { display: flex; min-width: 0; align-items: center; gap: 11px; }
+.brand-icon {
+  display: grid;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
+  border-radius: 11px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.brand-icon svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.brand-copy { display: grid; min-width: 0; gap: 2px; }
+h1 { margin: 0; font-size: 14px; font-weight: 650; line-height: 1.25; letter-spacing: -.01em; }
+.brand-subtitle { overflow: hidden; color: var(--muted); font: 11px/1.35 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); text-overflow: ellipsis; white-space: nowrap; }
+.actions { display: flex; min-width: 0; max-width: 100%; flex: 0 0 auto; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 7px; }
+.badge, .status-value {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 999px;
+  background: color-mix(in srgb, CanvasText 5%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.badge.tone-clean, .status-value.tone-passed { border-color: color-mix(in srgb, var(--success) 28%, transparent); background: var(--success-soft); color: var(--success); }
+.badge.tone-changed, .status-value.tone-active { border-color: color-mix(in srgb, var(--accent) 28%, transparent); background: var(--accent-soft); color: var(--accent); }
+.badge.tone-unavailable, .status-value.tone-failed { border-color: color-mix(in srgb, var(--danger) 28%, transparent); background: var(--danger-soft); color: var(--danger); }
+.status-value.tone-warning { border-color: color-mix(in srgb, var(--warning) 28%, transparent); color: var(--warning); }
+.refresh {
+  appearance: none;
+  min-height: 30px;
+  border: 1px solid var(--card-border);
+  border-radius: 9px;
+  padding: 5px 10px;
+  color: CanvasText;
+  background: var(--surface);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 550;
+  transition: background 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+.refresh:hover:not(:disabled) { background: var(--surface-hover); border-color: color-mix(in srgb, var(--accent) 28%, var(--card-border)); }
+.refresh:active:not(:disabled) { transform: translateY(1px); }
+.refresh:focus-visible, .file-toggle:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent); outline-offset: 2px; }
+.refresh:disabled { opacity: .48; cursor: default; }
+.content { display: grid; gap: 10px; padding: 11px; }
+.section {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  padding: 11px 12px;
+  border: 1px solid var(--divider);
+  border-radius: 11px;
+  background: color-mix(in srgb, var(--card-body) 88%, transparent);
+}
+.section-head { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
+.section-head > * { min-width: 0; }
+h2 { margin: 0; font-size: 11px; font-weight: 650; letter-spacing: .01em; color: var(--muted); text-transform: uppercase; }
+.primary { min-width: 0; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.secondary, .status { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+.progress-section { background: linear-gradient(135deg, var(--accent-soft), transparent 58%); }
+.status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.stats-inline { display: inline-flex; align-items: center; gap: 7px; font: 11px/1.3 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.add { color: var(--success); }
+.remove { color: var(--danger); }
+.files {
+  margin: 0;
+  max-height: 13em;
+  overflow: auto;
+  padding: 9px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 9px;
+  background: color-mix(in srgb, Canvas 90%, CanvasText 10%);
+  color: color-mix(in srgb, CanvasText 84%, transparent);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 11px/1.6 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+}
+.workspace-files { display: grid; gap: 6px; max-height: 320px; overflow: auto; scrollbar-gutter: stable; box-sizing: border-box; padding-right: 10px; }
+.workspace-file { display: grid; gap: 4px; padding: 9px 10px; border: 1px solid var(--divider); border-radius: 9px; }
+.workspace-file > .diff { margin-top: 4px; }
+.workspace-file code { font: 12px/1.5 var(--font-mono, ui-monospace, monospace); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.frozen-file { overflow: hidden; border: 1px solid var(--divider); border-radius: 9px; background: color-mix(in srgb, Canvas 94%, CanvasText 6%); }
+.frozen-file + .frozen-file { margin-top: 6px; }
+.file-toggle {
+  display: block;
+  width: 100%;
+  min-height: 38px;
+  border: 0;
+  padding: 8px 10px;
+  color: CanvasText;
+  background: transparent;
+  text-align: left;
+  font: 11px/1.5 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.file-toggle:hover { background: var(--surface-hover); }
+.diff { max-height: 24em; overflow: auto; margin: 0; padding: 8px 0; border-top: 1px solid var(--divider); background: color-mix(in srgb, Canvas 88%, CanvasText 12%); font: 11px/1.5 var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); }
+.diff-line { display: block; min-height: 1.5em; padding: 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-line.added { background: color-mix(in srgb, var(--success) 13%, transparent); }
+.diff-line.deleted { background: color-mix(in srgb, var(--danger) 13%, transparent); }
+.diff-line.hunk { color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.app-footer { display: flex; align-items: center; gap: 7px; min-height: 34px; padding: 8px 13px; border-top: 1px solid var(--divider); background: var(--card-header); }
+.activity-line { display: grid; gap: 3px; }
+.activity-current { font-size: 15px; font-weight: 650; }
+.activity-age { font-size: 12px; color: var(--muted); }
+.conversation { display: grid; gap: 7px; }
+.message { display: grid; gap: 4px; max-width: 92%; padding: 8px 10px; border: 1px solid var(--divider); border-radius: 10px; background: var(--surface); }
+.message.user { justify-self: end; background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 18%, var(--divider)); }
+.message.agent { justify-self: start; }
+.message-copy { white-space: pre-wrap; overflow-wrap: anywhere; }
+.message-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; }
+.message-state.acknowledged, .message-state.handled { color: var(--success); }
+.message-resolution { padding-top: 4px; border-top: 1px solid var(--divider); color: var(--muted); font-size: 11px; }
+.composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; align-items: end; }
+.composer textarea { width: 100%; min-height: 58px; max-height: 140px; resize: vertical; border: 1px solid var(--card-border); border-radius: 9px; padding: 8px 9px; color: CanvasText; background: var(--surface); font: inherit; }
+.composer textarea:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent); outline-offset: 1px; }
+.details { border: 1px solid var(--divider); border-radius: 10px; overflow: hidden; }
+.details > summary { padding: 9px 11px; cursor: pointer; color: var(--muted); font-weight: 600; }
+.detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; padding: 0 11px 11px; }
+.detail-item { display: grid; gap: 3px; min-width: 0; padding: 8px; border-radius: 8px; background: var(--surface); }
+.detail-item span { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.detail-item strong { overflow-wrap: anywhere; font-size: 11px; }
+
+.live-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 999px; background: var(--success); box-shadow: 0 0 0 3px var(--success-soft); }
+@media (max-width: 620px) {
+  .app-header { align-items: flex-start; }
+  .actions { margin-left: auto; }
+  .status-grid { grid-template-columns: 1fr; }
+  .brand-icon { width: 36px; height: 36px; }
+  .activity-call > summary { grid-template-columns: minmax(0, 1fr); }
+  .call-outcome { justify-self: start; }
+  .detail-grid { grid-template-columns: 1fr; }
+}
 [hidden] { display: none !important; }
+.task-context { display: flex; min-width: 0; flex-wrap: wrap; gap: 4px 14px; padding: 9px 13px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.diagnostic-identity { min-width: 0; max-width: 100%; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace); word-break: break-all; user-select: text; }
+.card-tabs { display: flex; min-width: 0; padding: 0 11px; border-bottom: 1px solid var(--divider); }
+.card-tabs button { flex: 1; min-width: 0; min-height: 40px; padding: 7px 4px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); cursor: pointer; }
+.card-tabs button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 650; }
+.card-tabs button:focus-visible, .workflow-stages button:focus-visible, .activity-call > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.card-panel { display: grid; width: 100%; min-width: 0; max-width: 100%; gap: 10px; }
+.workflow-stages { display: flex; min-width: 0; flex-wrap: wrap; gap: 6px; }
+.workflow-stages button { min-width: 0; padding: 6px 9px; border: 1px solid var(--divider); border-radius: 9px; color: CanvasText; background: var(--surface); cursor: pointer; }
+.workflow-stages button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.workflow-activity { display: grid; min-width: 0; max-width: 100%; max-height: min(420px, 55vh); overflow-x: hidden; overflow-y: auto; scrollbar-gutter: stable; box-sizing: border-box; padding-right: 10px; }
+.workflow-row { display: grid; min-width: 0; gap: 4px; padding: 10px 0; border-bottom: 1px solid var(--divider); }
+.workflow-row header { display: flex; min-width: 0; flex-wrap: wrap; gap: 4px 8px; justify-content: space-between; }
+.workflow-row strong { min-width: 0; overflow-wrap: anywhere; }
+.workflow-row time { color: var(--muted); font-size: 11px; }
+.activity-call { display: block; min-width: 0; max-width: 100%; border-bottom: 1px solid var(--divider); }
+.activity-call > summary { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 10px 6px 10px 1px; cursor: pointer; list-style-position: inside; }
+.activity-call > summary::marker { color: var(--muted); }
+.call-main { display: grid; min-width: 0; gap: 2px; }
+.call-title { min-width: 0; font-weight: 650; overflow-wrap: anywhere; }
+.call-time { min-width: 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.call-outcome { max-width: 100%; color: var(--muted); font-size: 11px; text-align: right; overflow-wrap: anywhere; }
+.activity-detail { display: grid; min-width: 0; gap: 7px; padding: 0 1px 10px 17px; }
+.activity-detail .detail-grid { padding: 0; }
+.activity-detail-state { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.background-work { display: grid; min-width: 0; gap: 6px; }
+.background-results > summary { padding: 8px 0; cursor: pointer; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.background-results > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.section p { margin: 0; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; } }
 </style>
 </head>
 <body>
 <main class="card" aria-live="polite">
-  <div class="header"><h1>WebCodex Progress</h1><div class="actions"><button id="refresh" class="refresh" type="button" disabled>Refresh</button><span id="badge" class="badge">Loading</span></div></div>
-  <section class="section">
-    <div class="section-head"><h2>Progress</h2><span id="progressMeta" class="secondary"></span></div>
-    <div id="progressStatus" class="primary">Waiting for Session activity…</div>
-  </section>
-  <section class="section">
-    <div class="section-head"><h2>Workspace</h2><span id="changesStats" class="secondary"></span></div>
-    <div id="changesTitle" class="primary">Waiting for Work state…</div>
-    <pre id="files" class="files" hidden></pre>
-  </section>
-  <section class="section">
-    <div class="section-head"><h2>Validation</h2><span id="validationMeta" class="secondary"></span></div>
-    <div id="validationStatus" class="primary">Unknown</div>
-  </section>
-  <section class="section">
-    <div class="section-head"><h2>Review</h2><span id="reviewMeta" class="secondary"></span></div>
-    <div id="reviewStatus" class="primary">No recorded review evidence</div>
-  </section>
-  <section id="finalChanges" class="section" hidden>
-    <div class="section-head"><h2>Frozen final changes</h2><span id="frozenStats" class="secondary"></span></div>
-    <div id="frozenSummary" class="primary"></div>
-    <div id="frozenFiles"></div>
-    <button id="frozenMore" class="refresh" type="button" hidden></button>
-    <div id="frozenFooter" class="secondary"></div>
-  </section>
-  <div id="status" class="status">App active · initializing Host</div>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="3"></circle><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="18" r="3"></circle><path d="M8.6 7.5 15.4 16.5M15.4 7.5 8.6 16.5"></path></svg></span>
+      <div class="brand-copy"><h1 id="taskTitle">WebCodex</h1><span id="branch" class="brand-subtitle">Task</span></div>
+    </div>
+    <div class="actions"><button id="refresh" class="refresh" type="button" disabled>Refresh</button><span id="badge" class="badge">Loading</span></div>
+  </header>
+  <div class="task-context"><span id="projectIdentity" class="diagnostic-identity"></span><span id="windowIdentity" class="diagnostic-identity"></span><span id="sessionIdentity" class="diagnostic-identity"></span><span id="windowSource"></span></div>
+  <nav class="card-tabs" role="tablist" aria-label="Window views">
+    <button id="tabActivity" type="button" role="tab" aria-selected="true" aria-controls="panelActivity">Activity</button>
+    <button id="tabResults" type="button" role="tab" aria-selected="false" aria-controls="panelResults" tabindex="-1">Results</button>
+    <button id="tabCollaboration" type="button" role="tab" aria-selected="false" aria-controls="panelCollaboration" tabindex="-1">Collaboration</button>
+  </nav>
+  <div class="content">
+    <div id="panelActivity" class="card-panel" role="tabpanel" aria-labelledby="tabActivity">
+      <section class="section progress-section">
+        <div class="section-head"><h2>Current activity</h2><span id="activityAge" class="secondary"></span></div>
+        <div class="activity-line">
+          <div id="activityStatus" class="activity-current">Waiting for activity…</div>
+          <div id="activityDetail" class="activity-age"></div>
+        </div>
+        <div id="jobsSection" class="background-work" hidden>
+          <div id="jobsList" aria-label="Work continuing in the background"></div>
+          <details id="jobResults" class="background-results" hidden>
+            <summary id="jobResultsSummary">Recent background results</summary>
+            <div id="jobResultsList"></div>
+          </details>
+          <p id="jobsMeta" class="secondary"></p>
+        </div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Window activity</h2><span id="windowCoverage" class="secondary"></span></div>
+        <p class="secondary">Calls in this chat, earliest first. Expand a call for technical details. Background work above belongs to this task.</p>
+        <div id="windowActivity" class="workflow-activity"></div>
+        <button id="askActivity" class="refresh" type="button">Send an instruction</button>
+      </section>
+      <button id="viewResults" class="refresh" type="button">View changed files</button>
+    </div>
+    <div id="panelResults" class="card-panel" role="tabpanel" aria-labelledby="tabResults" hidden>
+      <section id="finalChanges" class="section" hidden>
+        <div class="section-head"><h2>Final changes</h2><span id="frozenStats" class="stats-inline"></span></div>
+        <div id="frozenSummary" class="primary"></div>
+        <div id="frozenFiles"></div>
+        <button id="frozenMore" class="refresh" type="button" hidden></button>
+        <button id="frozenLess" class="refresh" type="button" hidden>Show fewer files</button>
+        <button id="frozenCollapse" class="refresh" type="button">Collapse all files</button>
+        <div id="frozenFooter" class="secondary"></div>
+      </section>
+      <section class="section">
+        <div class="section-head"><h2>Workspace changes</h2><span id="workspaceStats" class="stats-inline"></span></div>
+        <div id="workspaceStatus" class="primary">Waiting for files…</div>
+        <p class="secondary">Current uncommitted changes in this Project, including other work. Final task changes are shown separately above.</p>
+        <div id="workspaceFiles" class="workspace-files" role="list" aria-label="Changed files"></div>
+        <button id="workspaceMore" class="refresh" type="button" hidden>Show more files</button>
+        <button id="workspaceLess" class="refresh" type="button" hidden>Show fewer files</button>
+        <button id="workspaceCollapse" class="refresh" type="button">Collapse all files</button>
+        <button id="workspaceReload" class="refresh" type="button" hidden>Refresh file snapshot</button>
+        <div id="workspaceMeta" class="secondary"></div>
+      </section>
+      <section id="resultChecks" class="section">
+        <div class="section-head"><h2>Checks and review</h2></div>
+        <div id="validationStatus" class="primary"></div><div id="validationMeta" class="secondary"></div>
+        <div id="reviewStatus" class="primary"></div><div id="reviewMeta" class="secondary"></div>
+        <p class="secondary">Evidence for the linked Session; a clean workspace does not prove the task passed.</p>
+      </section>
+      <button id="discussResults" class="refresh" type="button">Discuss these changes</button>
+    </div>
+    <div id="panelCollaboration" class="card-panel" role="tabpanel" aria-labelledby="tabCollaboration" hidden>
+      <section class="section">
+        <div class="section-head"><h2>Collaboration</h2><span id="collaborationMeta" class="secondary"></span></div>
+        <div id="messages" class="conversation"></div>
+        <form id="composer" class="composer">
+          <textarea id="messageInput" maxlength="8000" placeholder="Send a message to this Window…" aria-label="Message this Window"></textarea>
+          <button id="sendMessage" class="refresh" type="submit">Send</button>
+        </form>
+        <div id="composerState" class="secondary"></div>
+      </section>
+    </div>
+  </div>
+  <footer class="app-footer"><span class="live-dot" aria-hidden="true"></span><div id="status" class="status">Connecting…</div></footer>
 </main>
 <script>
 (() => {
   "use strict";
   const APP_PROTOCOL = "2026-01-26";
+  const WORK_RESULT_META_KEY = "webcodex/workResult";
   const SESSION_ID = /^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$/;
-  const STATE_VERSION = /^wr1_[0-9a-f]{64}$/;
+  const STATE_VERSION = /^wr2_[0-9a-f]{64}$/;
+  const MESSAGE_ID = /^wc_msg_[A-Za-z0-9_-]+$/;
   const CALL_TIMEOUT_MS = 10000;
-  const VISIBLE_REFRESH_MS = 2500;
-  const HIDDEN_REFRESH_MS = 12000;
-  const VISIBLE_IDLE_REFRESH_MS = 10000;
-  const HIDDEN_IDLE_REFRESH_MS = 30000;
+  const VISIBLE_REFRESH_MS = 10000;
+  const VISIBLE_IDLE_REFRESH_MS = 30000;
   const IDLE_BACKOFF_AFTER_MS = 60000;
+  const ACTIVITY_IDLE_AFTER_MS = 60000;
   const AUTO_REFRESH_IDLE_PAUSE_MS = 30 * 60 * 1000;
   const MAX_PROJECT = 512;
   const MAX_PATH = 512;
   const MAX_FILES = 8;
+  const MAX_FILE_CONTENT_CHARS = 12000;
   const MAX_TOOLS = 12;
   const SNAPSHOT_ID = /^wc_changes_snapshot_[0-9a-f]{32}$/;
+  const WINDOW_KEY = /^[0-9a-f]{64}$/;
   const MAX_FROZEN_FILES = 24;
   const INITIAL_FROZEN_FILES = 5;
   let snapshot = null;
-  let initialFrozenKey = null;
+  let acceptedFrozenKey = null;
   let visibleCount = 0;
   let hasRefreshed = false;
   const diffCache = new Map();
   const diffInFlight = new Set();
-  const VALIDATION = new Set(["not_run", "passed", "failed", "mixed", "expected", "inconclusive", "stale", "unknown"]);
+  const activityDetailCache = new Map();
+  const activityDetailInFlight = new Set();
+  const expandedActivity = new Set();
+  const VALIDATION = new Set(["not_run", "unproven", "passed", "failed", "mixed", "expected", "inconclusive", "stale", "unknown"]);
   let nextId = 1;
   let identity = null;
   let lastStateVersion = null;
   let hostInitialized = false;
+  let explicitSession = null;
   let refreshInFlight = false;
+  let unchangedRefreshes = 0;
+  let refreshFailures = 0;
   let refreshTimer = null;
-  let sessionLifecycle = null;
   let lastStateChangeAt = null;
+  let lastRenderedState = null;
+  let sendInFlight = false;
+  let pendingSend = null;
+  let collaborationSendState = "idle";
   let tornDown = false;
+  let initialResultTransportMissing = false;
+  let selectedPane = "Activity";
   const pending = new Map();
   const el = id => document.getElementById(id);
 
-  function send(method, params) {
+  function send(method, params, timeoutMs = CALL_TIMEOUT_MS) {
     if (tornDown) return Promise.reject(new Error("App torn down"));
     const id = nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
         reject(new Error("Host request timed out"));
-      }, CALL_TIMEOUT_MS);
+      }, timeoutMs);
       pending.set(id, { resolve, reject, timer });
       parent.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
     });
@@ -125,22 +385,35 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     return typeof value === "string" && SESSION_ID.test(value);
   }
 
-  function pair(project, session_id) {
-    return validProject(project) && validSession(session_id) ? { project, session_id } : null;
+  function target(project) {
+    return validProject(project) ? { project } : null;
   }
 
-  function failClosed(message) {
+  function failClosed(_message) {
     teardown();
     el("badge").textContent = "Unavailable";
-    el("status").textContent = message;
+    el("status").textContent = "This task card is unavailable";
     el("finalChanges").hidden = true;
     el("frozenFiles").replaceChildren();
+    el("workspaceFiles").replaceChildren();
+    el("workspaceStatus").textContent = "Changes unavailable";
+    el("workspaceStats").replaceChildren();
+    el("workspaceMeta").textContent = "";
+    el("resultChecks").hidden = true;
+    el("jobsSection").hidden = true;
+    el("jobsList").replaceChildren();
+    el("jobResults").hidden = true;
+    el("jobResults").open = false;
+    el("jobResultsList").replaceChildren();
     diffCache.clear();
+    activityDetailCache.clear();
+    activityDetailInFlight.clear();
+    expandedActivity.clear();
   }
 
   function acceptIdentity(candidate) {
     if (tornDown) return false;
-    if (!candidate || (identity && (identity.project !== candidate.project || identity.session_id !== candidate.session_id))) {
+    if (!candidate || (identity && identity.project !== candidate.project)) {
       failClosed("Invalid or conflicting Work identity");
       return false;
     }
@@ -166,6 +439,11 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     for (const key of ["additions", "deletions"]) if (value[key] !== undefined && !safeCount(value[key])) return false;
     for (const key of ["staged", "unstaged"]) if (value[key] !== undefined && typeof value[key] !== "boolean") return false;
     for (const key of ["status", "kind"]) if (value[key] !== undefined && (typeof value[key] !== "string" || value[key].length > 32)) return false;
+    if (value.content_kind !== undefined && !["diff", "preview"].includes(value.content_kind)) return false;
+    if (value.content !== undefined && (typeof value.content !== "string" || value.content.length === 0 || Array.from(value.content).length > MAX_FILE_CONTENT_CHARS || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value.content))) return false;
+    if ((value.content_kind === undefined) !== (value.content === undefined)) return false;
+    if (value.content_truncated !== undefined && typeof value.content_truncated !== "boolean") return false;
+    if (value.content === undefined && value.content_truncated !== undefined) return false;
     return true;
   }
 
@@ -211,26 +489,174 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     if (latest.status !== undefined && (typeof latest.status !== "string" || latest.status.length > 32)) return false;
     return latest.duration_ms === undefined || safeCount(latest.duration_ms);
   }
+  function validActivityItem(value, timestampKey) {
+    if (value === null) return true;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (typeof value.label !== "string" || value.label.length < 1 || value.label.length > 120) return false;
+    if (!(value.kind === null || value.kind === undefined || ["read", "search", "navigate", "edit", "run", "test", "review"].includes(value.kind))) return false;
+    const timestamp = value[timestampKey];
+    return timestamp === null || timestamp === undefined || (Number.isSafeInteger(timestamp) && timestamp >= 0);
+  }
+
+  function validActivity(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (typeof value.available !== "boolean" || !["window", "session"].includes(value.scope) || typeof value.active !== "boolean") return false;
+    if (typeof value.coverage_partial !== "boolean") return false;
+    if (!validActivityItem(value.current, "started_at_ms") || !validActivityItem(value.last, "at_ms")) return false;
+    for (const key of ["last_activity_at_ms", "last_meaningful_activity_at_ms"]) {
+      if (!(value[key] === null || value[key] === undefined || (Number.isSafeInteger(value[key]) && value[key] >= 0))) return false;
+    }
+    return true;
+  }
+
+  function validWindowIdentity(value) {
+    return value === undefined || (!!value && typeof value === "object" && !Array.isArray(value)
+      && typeof value.key === "string" && WINDOW_KEY.test(value.key)
+      && typeof value.source === "string" && value.source.length > 0 && value.source.length <= 64);
+  }
+
+  function validWindowActivityRow(value, active = false) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (typeof value.label !== "string" || value.label.length < 1 || value.label.length > 120) return false;
+    if (!(value.kind === null || value.kind === undefined || ["read", "search", "navigate", "edit", "run", "test", "review"].includes(value.kind))) return false;
+    if (!Number.isSafeInteger(value.started_at_ms) || value.started_at_ms < 0) return false;
+    for (const key of ["tool_name", "server_trace_id"]) {
+      if (value[key] != null && (typeof value[key] !== "string" || !value[key].length || value[key].length > 128)) return false;
+    }
+    if (active) return true;
+    return Number.isSafeInteger(value.ended_at_ms) && value.ended_at_ms >= value.started_at_ms
+      && (value.duration_ms === null || safeCount(value.duration_ms))
+      && typeof value.status === "string" && value.status.length <= 32
+      && typeof value.meaningful === "boolean";
+  }
+
+  function validWindowActivity(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.available !== "boolean" || typeof value.active !== "boolean") return false;
+    if (!safeCount(value.events_returned) || !safeCount(value.events_observed) || typeof value.truncated !== "boolean") return false;
+    if (!Array.isArray(value.events) || value.events.length > 200 || value.events.length !== value.events_returned || !value.events.every(row => validWindowActivityRow(row, false))) return false;
+    if (!Array.isArray(value.active_requests) || value.active_requests.length > 8 || !value.active_requests.every(row => validWindowActivityRow(row, true))) return false;
+    return value.last_activity_at_ms === null
+      || (Number.isSafeInteger(value.last_activity_at_ms) && value.last_activity_at_ms >= 0);
+  }
+
+  function validCollaborationMessage(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || !MESSAGE_ID.test(value.message_id)) return false;
+    if (!Number.isSafeInteger(value.created_at_ms) || value.created_at_ms < 0 || typeof value.message !== "string" || Array.from(value.message).length > 8000) return false;
+    if (!["operator", "window", "peer"].includes(value.source) || !["inbound", "outbound"].includes(value.direction)) return false;
+    if (typeof value.requires_ack !== "boolean") return false;
+    if (value.peer_id !== undefined && (typeof value.peer_id !== "string" || !/^wc_peer_[0-9a-f]{32}$/.test(value.peer_id))) return false;
+    if (value.context_session_id !== undefined && !SESSION_ID.test(value.context_session_id)) return false;
+    if (value.context_project !== undefined && !validProject(value.context_project)) return false;
+    for (const key of ["first_projected_at_ms", "first_ack_observed_at_ms"]) if (!(value[key] === null || (Number.isSafeInteger(value[key]) && value[key] >= 0))) return false;
+    return true;
+  }
+
+  function validCollaboration(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.available !== "boolean" || typeof value.can_send !== "boolean") return false;
+    if (!Array.isArray(value.messages) || value.messages.length > 6 || !value.messages.every(validCollaborationMessage)) return false;
+    return value.available || (!value.can_send && value.messages.length === 0);
+  }
+
+  function validWorkflow(value) {
+    if (value === undefined) return true; // Cached pre-workflow presentations remain readable.
+    return value && typeof value.history_partial === "boolean" && Array.isArray(value.activity)
+      && value.activity.length <= 24 && value.activity.every(row => row
+        && typeof row.label === "string" && row.label.length <= 120
+        && ["explore", "edit", "run", "check", "review", "other"].includes(row.stage)
+        && typeof row.state === "string" && row.state.length <= 64
+        && Number.isSafeInteger(row.started_at) && row.started_at >= 0
+        && (row.finished_at === null || (Number.isSafeInteger(row.finished_at) && row.finished_at >= 0))
+        && (row.duration_ms === null || safeCount(row.duration_ms)) && safeCount(row.count) && row.count > 0);
+  }
+
+  function validJobs(jobs, session) {
+    if (jobs === undefined) return true;
+    if (!jobs || typeof jobs.available !== "boolean") return false;
+    if (!jobs.available) return Object.keys(jobs).length === 1;
+    return validSession(session) && (!explicitSession || explicitSession === session)
+      && typeof jobs.active === "boolean" && typeof jobs.truncated === "boolean"
+      && Array.isArray(jobs.items) && jobs.items.length <= 8
+      && jobs.items.every(job => job && typeof job.job_id === "string" && job.job_id.length > 0 && job.job_id.length <= 128
+        && typeof job.tool === "string" && job.tool.length > 0 && job.tool.length <= 64
+        && typeof job.status === "string" && job.status.length > 0 && job.status.length <= 64
+        && ["active", "terminal"].includes(job.state)
+        && (job.outcome === undefined || (typeof job.outcome === "string" && job.outcome.length <= 64))
+        && (job.recovery_state === undefined || (typeof job.recovery_state === "string" && job.recovery_state.length <= 64)));
+  }
 
   function validState(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== 1) return null;
-    const candidate = pair(value.project, value.session_id);
-    if (!candidate || typeof value.state_version !== "string" || !STATE_VERSION.test(value.state_version)) return null;
-    if (!validWorkspace(value.workspace) || !validValidation(value.validation) || !validReview(value.review) || !validSessionState(value.session)) return null;
-    if (value.final_changes !== undefined && !validFrozen(value.final_changes)) return null;
+    if (!value || typeof value !== "object" || Array.isArray(value) || value.version !== 2) return null;
+    if (!validProject(value.project) || typeof value.state_version !== "string" || !STATE_VERSION.test(value.state_version)) return null;
+    if (value.session_id !== undefined && !validSession(value.session_id)) return null;
+    if (!validWindowIdentity(value.window) || !validWorkspace(value.workspace) || !validActivity(value.activity) || !validWindowActivity(value.window_activity) || !validCollaboration(value.collaboration)) return null;
+    if (!validJobs(value.jobs, value.session_id)) return null;
+    if (value.validation !== undefined && !validValidation(value.validation)) return null;
+    if (value.review !== undefined && !validReview(value.review)) return null;
+    if (value.session !== undefined && !validSessionState(value.session)) return null;
+    if (value.workflow !== undefined && !validWorkflow(value.workflow)) return null;
+    if (value.final_changes !== undefined && (!validSession(value.session_id) || !validFrozen(value.final_changes))) return null;
     return value;
   }
 
-  function toolSuccess(result) {
-    const structured = result && (result.structuredContent || result.structured_content || result);
-    return structured && typeof structured === "object" && !Array.isArray(structured) && typeof structured.success === "boolean"
-      ? structured.success
+  function callToolResultOf(result) {
+    if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+    const nested = result.result;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)
+      && (nested.structuredContent || nested.structured_content || Array.isArray(nested.content)
+        || nested._meta || typeof nested.success === "boolean")) return nested;
+    return result;
+  }
+
+  function canonicalStructuredEnvelope(value) {
+    return !!(value && typeof value === "object" && !Array.isArray(value)
+      && typeof value.success === "boolean"
+      && (Object.prototype.hasOwnProperty.call(value, "output")
+        || Object.prototype.hasOwnProperty.call(value, "error")));
+  }
+
+  function standardContentEnvelopeOf(callResult) {
+    const blocks = Array.isArray(callResult && callResult.content) ? callResult.content : [];
+    for (const block of blocks) {
+      if (!block || block.type !== "text" || typeof block.text !== "string") continue;
+      try {
+        const parsed = JSON.parse(block.text);
+        if (canonicalStructuredEnvelope(parsed)) return parsed;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  function structuredOf(result) {
+    const callResult = callToolResultOf(result);
+    if (!callResult || typeof callResult !== "object" || Array.isArray(callResult)) return null;
+    if (canonicalStructuredEnvelope(callResult)) return callResult;
+    const meta = callResult._meta && typeof callResult._meta === "object" && !Array.isArray(callResult._meta)
+      ? callResult._meta[WORK_RESULT_META_KEY]
       : null;
+    if (canonicalStructuredEnvelope(meta)) return meta;
+    const standard = standardContentEnvelopeOf(callResult);
+    if (standard) return standard;
+    const direct = callResult.structuredContent || callResult.structured_content;
+    return canonicalStructuredEnvelope(direct) ? direct : null;
+  }
+
+  function sendFailureOf(result) {
+    const structured = structuredOf(result);
+    if (!structured || structured.success !== false) return null;
+    const output = structured.output && typeof structured.output === "object" && !Array.isArray(structured.output) ? structured.output : {};
+    const failureKind = typeof output.failure_kind === "string" ? output.failure_kind : "";
+    const errorKind = typeof output.error_kind === "string" ? output.error_kind : "";
+    const error = typeof structured.error === "string" ? structured.error : "";
+    if (failureKind === "outcome_unknown" || output.retry_same_delivery === true) return "uncertain";
+    if (failureKind === "conflict" || errorKind === "delivery_key_conflict") return "conflict";
+    if (failureKind === "invalid_context" || errorKind.startsWith("session_context_") || errorKind === "invalid_session_context") return "context";
+    if (failureKind === "unavailable" || failureKind === "permission" || /unavailable|scope required|stable Window identity required/i.test(error)) return "unavailable";
+    return "failed";
   }
 
   function extractState(result) {
-    const structured = result && (result.structuredContent || result.structured_content || result);
-    const output = structured && (structured.output || structured);
+    const structured = structuredOf(result);
+    const output = structured && structured.output;
     return validState(output && output.work_result);
   }
 
@@ -263,30 +689,41 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
       value.files.map(file => [file.path, file.previous_path ?? null, file.kind, file.additions, file.deletions, file.binary ?? null])]);
   }
 
-  function acceptInitialFrozen(value) {
-    const key = value === undefined ? "" : frozenKey(value);
-    if (initialFrozenKey !== null) {
-      if (key !== initialFrozenKey) { failClosed("Conflicting frozen Work identity"); return false; }
+  function renderLineStats(target, additions, deletions, suffix = "") {
+    target.replaceChildren();
+    const add = document.createElement("span"); add.className = "add"; add.textContent = `+${additions}`;
+    const remove = document.createElement("span"); remove.className = "remove"; remove.textContent = `−${deletions}`;
+    target.append(add, remove);
+    if (suffix) { const meta = document.createElement("span"); meta.className = "secondary"; meta.textContent = suffix; target.append(meta); }
+  }
+
+  function acceptFrozen(value, sessionId) {
+    if (value === undefined) return true;
+    const key = JSON.stringify([sessionId, frozenKey(value)]);
+    if (acceptedFrozenKey !== null) {
+      if (key !== acceptedFrozenKey) { failClosed("Conflicting sealed Work identity"); return false; }
       return true;
     }
-    initialFrozenKey = key;
-    if (value === undefined) return true;
+    acceptedFrozenKey = key;
     snapshot = {
       snapshot_id: value.snapshot_id, files_total: value.files_total, files_truncated: value.files_truncated,
+      session_id: sessionId,
+      next_offset: value.files_returned < value.files_total ? value.files_returned : null,
+      source_truncated: false,
       files: value.files.map(file => ({ path: file.path, previous_path: file.previous_path, kind: file.kind,
         additions: file.additions, deletions: file.deletions, binary: file.binary })),
     };
     el("finalChanges").hidden = false;
     el("frozenSummary").textContent = `Changed ${value.files_changed} ${value.files_changed === 1 ? "file" : "files"}`;
-    el("frozenStats").textContent = `+${value.additions} −${value.deletions}`;
+    renderLineStats(el("frozenStats"), value.additions, value.deletions);
     appendFrozenFiles(INITIAL_FROZEN_FILES);
     return true;
   }
 
   function extractFrozenDiff(result, file) {
-    const structured = result && (result.structuredContent || result.structured_content || result);
-    const value = structured && (structured.output || structured).changes_file_diff;
-    if (!value || value.version !== 1 || value.project !== identity.project || value.session_id !== identity.session_id
+    const structured = structuredOf(result);
+    const value = structured && structured.output && structured.output.changes_file_diff;
+    if (!value || value.version !== 1 || value.project !== identity.project || value.session_id !== snapshot.session_id
       || value.snapshot_id !== snapshot.snapshot_id || value.path !== file.path || value.kind !== file.kind
       || (value.previous_path ?? null) !== (file.previous_path ?? null)) return null;
     if (value.binary !== null && typeof value.binary !== "boolean") return null;
@@ -301,18 +738,22 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     return value;
   }
 
-  function renderFrozenDiff(state, pre, diff) {
-    state.textContent = `${diff.binary ? "Binary file · frozen metadata" : "Frozen diff"}${diff.truncated
-      ? ` · truncated (${diff.bytes_returned}/${diff.bytes_total} bytes, ${diff.lines_returned}/${diff.lines_total} lines)` : ""}`;
+  function renderDiffText(pre, text, styled) {
     pre.replaceChildren();
-    for (const text of diff.diff.split("\n")) {
+    for (const value of text.split("\n")) {
       const line = document.createElement("span");
-      const kind = text.startsWith("@@") ? "hunk" : text.startsWith("+") && !text.startsWith("+++") ? "added"
-        : text.startsWith("-") && !text.startsWith("---") ? "deleted" : "";
+      const kind = styled ? (value.startsWith("@@") ? "hunk" : value.startsWith("+") && !value.startsWith("+++") ? "added"
+        : value.startsWith("-") && !value.startsWith("---") ? "deleted" : "") : "";
       line.className = `diff-line ${kind}`;
-      line.textContent = text;
+      line.textContent = value;
       pre.appendChild(line);
     }
+  }
+
+  function renderFrozenDiff(state, pre, diff) {
+    state.textContent = `${diff.binary ? "Binary file" : "File changes"}${diff.truncated
+      ? ` · partial (${diff.lines_returned}/${diff.lines_total} lines)` : ""}`;
+    renderDiffText(pre, diff.diff, true);
   }
 
   async function loadFrozenDiff(file, state, pre) {
@@ -320,53 +761,66 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     if (diffCache.has(file.path)) { renderFrozenDiff(state, pre, diffCache.get(file.path)); return; }
     if (diffInFlight.has(file.path)) return;
     diffInFlight.add(file.path);
-    state.textContent = "Loading frozen diff…";
+    state.textContent = "Loading changes…";
     try {
       const response = await send("tools/call", { name: "changes_file_diff", arguments: {
-        project: identity.project, session_id: identity.session_id, snapshot_id: snapshot.snapshot_id, path: file.path,
+        project: identity.project, session_id: snapshot.session_id, snapshot_id: snapshot.snapshot_id, path: file.path,
       } });
       if (tornDown) return;
-      if (toolSuccess(response) === false) { state.textContent = "Frozen diff unavailable · snapshot may have expired"; return; }
-      const diff = extractFrozenDiff(response, file);
-      if (!diff) { failClosed("Invalid frozen diff identity or bounded content"); return; }
+      const structured = structuredOf(response);
+      if (!structured) { state.textContent = "Changes unavailable · collapse and expand to retry"; return; }
+      if (structured.success === false) { state.textContent = "Changes unavailable · refresh the card"; return; }
+      const diff = extractFrozenDiff(structured, file);
+      if (!diff) { failClosed("Invalid file changes"); return; }
       diffCache.set(file.path, diff);
       renderFrozenDiff(state, pre, diff);
     } catch (_) {
-      if (!tornDown) state.textContent = "Frozen diff unavailable · collapse and expand to retry";
+      if (!tornDown) state.textContent = "Changes unavailable · collapse and expand to retry";
     } finally {
       diffInFlight.delete(file.path);
     }
   }
 
-  function frozenFileNode(file) {
+  // Both live and final file rows share keyboard, folding and lazy-DOM behavior.
+  function collapsibleFileNode(file, load) {
     const root = document.createElement("div"); root.className = "frozen-file";
     const button = document.createElement("button"); button.className = "file-toggle"; button.type = "button";
-    const path = file.previous_path ? `${file.previous_path} → ${file.path}` : file.path;
-    const stats = file.binary ? "binary" : file.additions === null || file.deletions === null ? "line stats unavailable" : `+${file.additions} −${file.deletions}`;
-    button.textContent = `${({added: "A", modified: "M", deleted: "D", renamed: "R"})[file.kind]} ${path} · ${stats}`;
+    const previous = file.previous_path || file.old_path;
+    const path = previous ? `${previous} → ${file.path}` : file.path;
+    const stats = file.binary ? "binary" : !safeCount(file.additions) || !safeCount(file.deletions) ? "line counts unavailable" : `+${file.additions} −${file.deletions}`;
+    button.textContent = `${path} · ${stats}`;
     button.setAttribute("aria-expanded", "false");
     const wrap = document.createElement("div"); wrap.hidden = true;
     const state = document.createElement("div"); state.className = "secondary";
-    const pre = document.createElement("pre"); pre.className = "diff";
-    wrap.append(state, pre); root.append(button, wrap);
+    let pre = null;
+    wrap.append(state); root.append(button, wrap);
+    root.collapse = () => { wrap.hidden = true; button.setAttribute("aria-expanded", "false"); };
     button.onclick = () => {
       if (tornDown || !hostInitialized) return;
       wrap.hidden = !wrap.hidden;
       button.setAttribute("aria-expanded", String(!wrap.hidden));
-      if (!wrap.hidden) void loadFrozenDiff(file, state, pre);
+      if (!wrap.hidden) {
+        if (!pre) { pre = document.createElement("pre"); pre.className = "diff"; wrap.append(pre); }
+        void load(file, state, pre);
+      }
     };
     return root;
   }
+
+  function frozenFileNode(file) { return collapsibleFileNode(file, loadFrozenDiff); }
 
   function appendFrozenFiles(limit) {
     if (tornDown || !snapshot) return;
     // Append only: refresh/Show more cannot detach an in-flight diff's nodes.
     const end = Math.min(limit, snapshot.files.length);
-    while (visibleCount < end) el("frozenFiles").appendChild(frozenFileNode(snapshot.files[visibleCount++]));
-    el("frozenMore").hidden = visibleCount >= snapshot.files.length;
-    el("frozenMore").textContent = `Show ${snapshot.files.length - visibleCount} more files`;
-    el("frozenFooter").textContent = `Frozen at presentation · live Refresh does not change these files${snapshot.files_truncated
-      ? ` · metadata truncated (${snapshot.files.length}/${snapshot.files_total} files advertised)` : ""}`;
+    const root = el("frozenFiles");
+    while (root.children.length < end) root.appendChild(frozenFileNode(snapshot.files[root.children.length]));
+    visibleCount = end;
+    Array.from(root.children).forEach((row, index) => { row.hidden = index >= end; });
+    el("frozenMore").hidden = visibleCount >= snapshot.files.length && snapshot.next_offset === null;
+    el("frozenMore").textContent = "Show more files";
+    el("frozenLess").hidden = visibleCount <= INITIAL_FROZEN_FILES;
+    el("frozenFooter").textContent = `Final result · showing ${visibleCount} of ${snapshot.files_total} files${snapshot.source_truncated ? " · limited by source bounds or path policy" : ""}`;
   }
 
   function changeCode(file) {
@@ -381,100 +835,662 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     return "?";
   }
 
-  function renderChanges(workspace) {
-    if (!workspace.git_available) {
-      el("badge").textContent = "Unavailable";
-      el("changesTitle").textContent = workspace.reason_code === "non_git_project" ? "Not a Git worktree" : "Git state unavailable";
-      el("changesStats").textContent = "";
-      el("files").textContent = "";
-      el("files").hidden = true;
-      return;
-    }
-    if (workspace.clean) {
-      el("badge").textContent = "Clean";
-      el("changesTitle").textContent = "Clean";
-      el("changesStats").textContent = "+0 −0";
-      el("files").textContent = "";
-      el("files").hidden = true;
-      return;
-    }
-    el("badge").textContent = "Changed";
-    el("changesTitle").textContent = `Changed ${workspace.files_total} ${workspace.files_total === 1 ? "file" : "files"}`;
-    if (safeCount(workspace.additions) && safeCount(workspace.deletions)) {
-      el("changesStats").textContent = `+${workspace.additions} −${workspace.deletions}${workspace.line_stats_partial ? " · partial" : ""}`;
-    } else {
-      el("changesStats").textContent = workspace.line_stats_partial ? "line stats partial" : "";
-    }
-    el("files").textContent = workspace.files.map(file => {
-      const stats = safeCount(file.additions) && safeCount(file.deletions) ? `  +${file.additions} −${file.deletions}` : "";
-      return `${changeCode(file)} ${file.path}${stats}`;
-    }).join("\n");
-    el("files").hidden = workspace.files.length === 0;
+  function formatAge(timestampMs) {
+    if (!Number.isSafeInteger(timestampMs) || timestampMs < 0) return "";
+    const elapsed = Math.max(0, Date.now() - timestampMs);
+    if (elapsed < 5000) return "now";
+    if (elapsed < 60000) return `${Math.floor(elapsed / 1000)}s ago`;
+    const minutes = Math.floor(elapsed / 60000);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+    return `${Math.floor(hours / 24)}d ago`;
   }
 
-  function validationLabel(status) {
-    if (status === "passed") return "Passed";
-    if (status === "failed") return "Failed";
-    if (status === "mixed") return "Mixed";
-    if (status === "stale") return "Stale";
-    if (status === "not_run") return "Not run";
-    if (status === "expected") return "Expected result recorded";
-    if (status === "inconclusive") return "Inconclusive";
-    return "Unknown";
+  function activityIdleElapsed(activity) {
+    const last = activity.last_activity_at_ms ?? activity.last_meaningful_activity_at_ms;
+    if (activity.active || last === null || last === undefined) return null;
+    return Math.max(0, Date.now() - last);
+  }
+
+  function formatDuration(elapsedMs) {
+    const minutes = Math.floor(Math.max(0, elapsedMs) / 60000);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ${minutes % 60}m`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ${hours % 24}h`;
+  }
+
+  let workspaceSnapshot = null;
+  let workspaceSeed = null;
+  let workspaceEpoch = 0;
+  let workspacePagePromise = null;
+  let workspaceVisible = INITIAL_FROZEN_FILES;
+  const workspaceNodes = new Map();
+  const workspaceDiffCache = new Map();
+  const workspaceDiffPending = new Set();
+
+  function resetWorkspaceFiles() {
+    workspaceEpoch++; workspaceSnapshot = null; workspacePagePromise = null;
+    workspaceVisible = INITIAL_FROZEN_FILES;
+    workspaceNodes.clear(); workspaceDiffCache.clear(); workspaceDiffPending.clear();
+    el("workspaceMore").disabled = false;
+  }
+
+  async function readFilesPage(current, session, offset) {
+    const response = await send("tools/call", { name: "work_result_state", arguments: {
+      project: identity.project, ...(session ? { session_id: session } : {}),
+      files: { ...(current ? { snapshot_id: current.snapshot_id } : {}), offset },
+    } }, 60000);
+    const structured = structuredOf(response);
+    const page = structured?.success !== false && structured?.output?.work_result_files;
+    if (tornDown || !page || page.project !== identity.project || (page.session_id ?? null) !== (session ?? null)
+      || !SNAPSHOT_ID.test(page.snapshot_id) || (current && page.snapshot_id !== current.snapshot_id)
+      || page.offset !== offset || !safeCount(page.files_total) || typeof page.source_truncated !== "boolean"
+      || !Array.isArray(page.files) || page.files.length > MAX_FROZEN_FILES || !page.files.every(validFrozenFile)
+      || new Set(page.files.map(file => file.path)).size !== page.files.length
+      || offset + page.files.length > page.files_total || (current && page.files_total !== current.files_total)
+      || (page.next_offset !== null && (page.next_offset !== offset + page.files.length || page.files.length === 0))) throw new Error("Invalid file page");
+    return page;
+  }
+
+  async function ensureWorkspaceSnapshot() {
+    if (workspaceSnapshot) return workspaceSnapshot;
+    if (workspacePagePromise) return workspacePagePromise;
+    const epoch = workspaceEpoch;
+    const pendingPage = readFilesPage(null, null, 0).then(page => {
+      if (tornDown || epoch !== workspaceEpoch) throw new Error("File view replaced");
+      workspaceSnapshot = page;
+      el("workspaceReload").hidden = false;
+      return page;
+    });
+    workspacePagePromise = pendingPage;
+    try { return await pendingPage; }
+    finally { if (workspacePagePromise === pendingPage) workspacePagePromise = null; }
+  }
+
+  async function loadWorkspaceDiff(file, state, pre) {
+    if (typeof file.content === "string") {
+      state.textContent = `${file.content_kind === "preview" ? "New file preview" : "Changed content"}${file.content_truncated ? " · partial" : ""}`;
+      renderDiffText(pre, file.content, file.content_kind === "diff"); return;
+    }
+    if (workspaceDiffCache.has(file.path)) {
+      const cached = workspaceDiffCache.get(file.path);
+      state.textContent = cached.truncated ? "File changes · partial" : "File changes";
+      renderDiffText(pre, cached.diff, true); return;
+    }
+    if (workspaceDiffPending.has(file.path)) return;
+    const epoch = workspaceEpoch;
+    workspaceDiffPending.add(file.path); state.textContent = "Loading changes…";
+    try {
+      const source = await ensureWorkspaceSnapshot();
+      if (tornDown || epoch !== workspaceEpoch) return;
+      const response = await send("tools/call", { name: "work_result_state", arguments: {
+        project: identity.project, files: { snapshot_id: source.snapshot_id, path: file.path },
+      } }, 60000);
+      if (tornDown || epoch !== workspaceEpoch) return;
+      const structured = structuredOf(response);
+      const diff = structured?.success !== false && structured?.output?.work_result_files;
+      if (!diff || diff.project !== identity.project || diff.session_id != null || diff.snapshot_id !== source.snapshot_id
+        || diff.path !== file.path || typeof diff.diff !== "string" || typeof diff.truncated !== "boolean"
+        || new TextEncoder().encode(diff.diff).length > 48 * 1024 || diff.diff.split("\n").length > 1201) throw new Error("Invalid file diff");
+      workspaceDiffCache.set(file.path, diff);
+      state.textContent = diff.truncated ? "File changes · partial" : "File changes";
+      renderDiffText(pre, diff.diff, true);
+    } catch (_) {
+      if (!tornDown && epoch === workspaceEpoch) state.textContent = "Changes unavailable or no net working-tree diff · collapse and expand to retry";
+    } finally {
+      if (epoch === workspaceEpoch) workspaceDiffPending.delete(file.path);
+    }
+  }
+
+  function renderWorkspaceRows() {
+    const source = workspaceSnapshot || workspaceSeed;
+    const root = el("workspaceFiles");
+    if (!source) return;
+    const end = Math.min(workspaceVisible, source.files.length);
+    const rows = source.files.slice(0, end).map(file => {
+      if (!workspaceNodes.has(file.path)) workspaceNodes.set(file.path, collapsibleFileNode(file, loadWorkspaceDiff));
+      return workspaceNodes.get(file.path);
+    });
+    root.replaceChildren(...rows);
+    el("workspaceMore").hidden = end >= source.files.length && (workspaceSnapshot ? source.next_offset === null : !source.truncated);
+    el("workspaceLess").hidden = end <= INITIAL_FROZEN_FILES;
+    el("workspaceMeta").textContent = `Showing ${end} of ${source.files_total} files${workspaceSnapshot
+      ? " · pinned net working-tree snapshot; refresh files for newer edits" : ""}${source.source_truncated ? " · limited by source bounds or path policy" : ""}`;
+  }
+
+  async function showMoreFiles(final) {
+    if (tornDown || !hostInitialized) return;
+    const button = el(final ? "frozenMore" : "workspaceMore");
+    if (button.disabled) return;
+    button.disabled = true;
+    const epoch = workspaceEpoch;
+    try {
+      let source = final ? snapshot : await ensureWorkspaceSnapshot();
+      if (!source) return;
+      const shown = final ? visibleCount : workspaceVisible;
+      if (shown >= source.files.length && source.next_offset !== null) {
+        const page = await readFilesPage(source, final ? source.session_id : null, source.next_offset);
+        if (tornDown || (!final && epoch !== workspaceEpoch)) return;
+        const paths = new Set(source.files.map(file => file.path));
+        if (page.files.some(file => paths.has(file.path)) || source.files.length + page.files.length > 2000) throw new Error("Repeated file page");
+        source.files.push(...page.files); source.next_offset = page.next_offset; source.source_truncated = page.source_truncated;
+      }
+      if (final) appendFrozenFiles(shown + INITIAL_FROZEN_FILES);
+      else { workspaceVisible = shown + INITIAL_FROZEN_FILES; renderWorkspaceRows(); }
+    } catch (_) {
+      if (!tornDown && (final || epoch === workspaceEpoch)) el(final ? "frozenFooter" : "workspaceMeta").textContent = "File page unavailable · retry or refresh the file snapshot";
+    } finally { if (final || epoch === workspaceEpoch) button.disabled = false; }
+  }
+
+  let renderedWorkspace = null;
+  function renderWorkspace(workspace) {
+    el("branch").textContent = workspace.branch || "Window activity";
+    const fingerprint = JSON.stringify(workspace);
+    if (fingerprint === renderedWorkspace) return;
+    renderedWorkspace = fingerprint;
+    const root = el("workspaceFiles");
+    if (!workspaceSnapshot || workspace.clean || !workspace.git_available) {
+      resetWorkspaceFiles(); workspaceSeed = workspace; root.replaceChildren();
+      el("workspaceReload").hidden = true;
+    }
+    el("workspaceStats").replaceChildren();
+    el("workspaceMeta").textContent = "";
+    if (!workspace.git_available) {
+      el("workspaceStatus").textContent = workspace.reason_code === "non_git_project"
+        ? "This Project is not a Git repository" : "Workspace changes unavailable";
+      el("workspaceMeta").textContent = "File changes cannot be determined from this snapshot.";
+      el("workspaceMore").hidden = true; el("workspaceLess").hidden = true;
+      return;
+    }
+    el("workspaceStatus").textContent = workspace.clean ? "No uncommitted changes"
+      : workspace.files_total ? `${workspace.files_total} ${workspace.files_total === 1 ? "file" : "files"} changed` : "Change status incomplete";
+    if (safeCount(workspace.additions) && safeCount(workspace.deletions)) {
+      renderLineStats(el("workspaceStats"), workspace.additions, workspace.deletions, workspace.line_stats_partial ? "partial" : "");
+    }
+    renderWorkspaceRows();
+  }
+
+  function validationLabel(validation) {
+    if (validation.unresolved_failures > 0 || validation.current_status === "failed") return "Checks need attention";
+    if (validation.current_status === "passed") return "Checks passed";
+    if (validation.current_status === "stale") return "Checks are out of date";
+    if (validation.current_status === "not_run" || validation.current_status === "unproven") return "Checks not run";
+    if (validation.current_status === "expected") return "Expected result recorded";
+    if (validation.current_status === "inconclusive") return "Checks inconclusive";
+    return "Check status unavailable";
   }
 
   function renderValidation(validation) {
-    el("validationStatus").textContent = validationLabel(validation.current_status);
+    el("validationStatus").textContent = validationLabel(validation);
     const pieces = [];
-    if (safeCount(validation.successes)) pieces.push(`${validation.successes} validations`);
+    if (safeCount(validation.successes) && validation.successes > 0) pieces.push(`${validation.successes} passed`);
     if (validation.unresolved_failures > 0) pieces.push(`${validation.unresolved_failures} unresolved`);
-    else if (safeCount(validation.failures) && validation.failures > 0) pieces.push(`${validation.failures} historical failures`);
-    if (validation.evidence_gaps > 0) pieces.push(`${validation.evidence_gaps} evidence gaps`);
-    if (validation.history_partial) pieces.push("history partial");
+    if (validation.history_partial) pieces.push("limited history");
     el("validationMeta").textContent = pieces.join(" · ");
   }
 
   function renderReview(review) {
-    if (review.total === 0) {
-      if (review.history_partial) {
-        el("reviewStatus").textContent = "Review history partial";
-        el("reviewMeta").textContent = "Earlier review evidence may be outside the bounded window";
-      } else {
-        el("reviewStatus").textContent = "No recorded review evidence";
-        el("reviewMeta").textContent = "";
-      }
-      return;
+    if (!review.available) {
+      el("reviewStatus").textContent = "Review status unavailable";
+      el("reviewMeta").textContent = "";
+    } else if (review.total > 0) {
+      el("reviewStatus").textContent = "Review recorded";
+      el("reviewMeta").textContent = review.history_partial ? "Recent review activity available" : "";
+    } else if (review.history_partial) {
+      el("reviewStatus").textContent = "Review status incomplete";
+      el("reviewMeta").textContent = "Earlier activity is outside the retained history";
+    } else {
+      el("reviewStatus").textContent = "Review not recorded";
+      el("reviewMeta").textContent = "";
     }
-    const labels = [];
-    if (review.workspace_review_count > 0) labels.push("Workspace reviewed");
-    if (review.diff_review_count > 0) labels.push("Diff inspected");
-    if (review.tools.includes("git_review_summary")) labels.push("Committed range mapped");
-    if (review.hygiene_review_count > 0) labels.push("Hygiene inspected");
-    if (labels.length === 0) labels.push("Review evidence recorded");
-    el("reviewStatus").textContent = labels.join(" · ");
-    el("reviewMeta").textContent = `${review.total} review ${review.total === 1 ? "event" : "events"}${review.history_partial ? " · history partial" : ""}`;
   }
 
-  function renderProgress(session) {
-    const latest = session.latest_activity;
-    if (latest) {
-      const status = latest.status ? ` · ${latest.status}` : "";
-      el("progressStatus").textContent = `${latest.tool}${status}`;
-    } else {
-      el("progressStatus").textContent = session.lifecycle === "closed" ? "Session closed" : "Session active";
+  function renderActivity(activity, session, hasFinalChanges) {
+    if (hasFinalChanges || session.lifecycle === "closed") {
+      el("activityStatus").textContent = "Work completed";
+      el("activityDetail").textContent = activity.last?.label || "";
+      el("activityAge").textContent = activity.last_meaningful_activity_at_ms === null ? "" : `Finished ${formatAge(activity.last_meaningful_activity_at_ms)}`;
+      return;
     }
-    const pieces = [`${session.events_total} session events`];
-    if (session.history_partial) pieces.push("history partial");
-    pieces.push(session.lifecycle === "closed" ? "closed" : "live");
-    el("progressMeta").textContent = pieces.join(" · ");
+    if (activity.active && activity.current) {
+      el("activityStatus").textContent = activity.current.label;
+      el("activityDetail").textContent = activity.scope === "window" ? "This chat is active" : "WebCodex is working on this task";
+      el("activityAge").textContent = activity.scope === "window" ? "This chat · Active now" : "Active now";
+      return;
+    }
+    const idleElapsed = activityIdleElapsed(activity);
+    if (idleElapsed !== null && idleElapsed >= ACTIVITY_IDLE_AFTER_MS) {
+      el("activityStatus").textContent = "No WebCodex activity";
+      el("activityDetail").textContent = activity.last ? `Last work: ${activity.last.label}`
+        : activity.coverage_partial ? "Earlier activity is not fully observable" : "";
+      el("activityAge").textContent = `Idle for ${formatDuration(idleElapsed)}`;
+      return;
+    }
+    if (activity.last_meaningful_activity_at_ms === null) {
+      el("activityStatus").textContent = "Waiting for WebCodex activity";
+      el("activityDetail").textContent = activity.last?.label || (activity.coverage_partial ? "Current activity is not fully observable" : "");
+      el("activityAge").textContent = "";
+      return;
+    }
+    if (activity.last) {
+      el("activityStatus").textContent = activity.last.label;
+      el("activityDetail").textContent = activity.scope === "window" ? "Waiting for the next activity in this chat" : "Waiting for the next task activity";
+      const prefix = activity.scope === "window" ? "This chat · Last active " : "Task · Last active ";
+      el("activityAge").textContent = prefix + formatAge(activity.last_meaningful_activity_at_ms);
+      return;
+    }
+    el("activityStatus").textContent = "Waiting for WebCodex activity";
+    el("activityDetail").textContent = activity.coverage_partial ? "Current activity is not fully observable" : "";
+    el("activityAge").textContent = "";
+  }
+
+  function deliveryLabel(message) {
+    if (message.source === "peer" && message.direction === "inbound") return null;
+    if (message.source === "window") return null;
+    if (message.first_ack_observed_at_ms !== null) return "Acknowledged";
+    if (message.first_projected_at_ms !== null) return "Included in tool result";
+    return "Saved";
+  }
+
+  let renderedCollaboration = null;
+  let messageTimes = [];
+  function renderMessages(collaboration) {
+    updateComposerControl(collaboration);
+    const fingerprint = JSON.stringify({ available: collaboration.available, messages: collaboration.messages });
+    if (fingerprint === renderedCollaboration) {
+      for (const [node, createdAt] of messageTimes) node.textContent = formatAge(createdAt);
+      return;
+    }
+    renderedCollaboration = fingerprint;
+    messageTimes = [];
+    const root = el("messages");
+    root.replaceChildren();
+    el("collaborationMeta").textContent = "";
+    const rows = collaboration.messages;
+    for (const message of rows) {
+      const article = document.createElement("article");
+      article.className = `message ${message.source === "operator" ? "user" : "agent"}`;
+      const copy = document.createElement("div"); copy.className = "message-copy"; copy.textContent = message.message;
+      const meta = document.createElement("div"); meta.className = "message-meta";
+      const author = document.createElement("strong");
+      author.textContent = message.source === "operator"
+        ? "You"
+        : message.source === "window"
+          ? "This Window"
+          : (message.direction === "outbound" ? "This Window → " : "") + "Window · " + String(message.peer_id || "").slice(8, 16);
+      const time = document.createElement("span"); time.textContent = formatAge(message.created_at_ms);
+      messageTimes.push([time, message.created_at_ms]);
+      meta.append(author, time);
+      const label = deliveryLabel(message);
+      if (label) {
+        const state = document.createElement("span"); state.className = "message-state"; state.textContent = label;
+        meta.append(state);
+      }
+      if (message.context_session_id) {
+        const context = document.createElement("span"); context.textContent = "Session · " + message.context_session_id.slice(8, 14);
+        meta.append(context);
+      }
+      article.append(copy, meta);
+      root.append(article);
+    }
+    if (!rows.length) {
+      const empty = document.createElement("div"); empty.className = "empty";
+      empty.textContent = collaboration.available ? "No messages yet" : "Collaboration unavailable";
+      root.append(empty);
+    }
+    updateComposerControl(collaboration);
+  }
+
+  function updateComposerControl(collaboration = lastRenderedState?.collaboration) {
+    const enabled = !!collaboration?.available && !!collaboration?.can_send && hostInitialized && !tornDown && !sendInFlight && collaborationSendState !== "unavailable";
+    const exactRetry = collaborationSendState === "uncertain" && !!pendingSend;
+    el("messageInput").disabled = !enabled || exactRetry;
+    el("sendMessage").disabled = !enabled || (!exactRetry && !String(el("messageInput").value || "").trim());
+    el("sendMessage").textContent = sendInFlight ? "Sending…" : exactRetry ? "Retry" : "Send";
+    if (collaboration && !collaboration.can_send && collaborationSendState === "idle") el("composerState").textContent = collaboration.available ? "Messaging unavailable." : "";
+  }
+
+  function renderWindowCurrentActivity(activity) {
+    const lastAt = activity.last_activity_at_ms ?? activity.last_meaningful_activity_at_ms;
+    if (activity.active && activity.current) {
+      el("activityStatus").textContent = activity.current.label;
+      el("activityDetail").textContent = "This Window is active";
+      el("activityAge").textContent = "Active now";
+      return;
+    }
+    const idleElapsed = activityIdleElapsed(activity);
+    if (idleElapsed !== null && idleElapsed >= ACTIVITY_IDLE_AFTER_MS) {
+      el("activityStatus").textContent = "No WebCodex activity";
+      el("activityDetail").textContent = activity.last ? "Last activity: " + activity.last.label
+        : activity.coverage_partial ? "Earlier activity is not fully observable" : "";
+      el("activityAge").textContent = "Idle for " + formatDuration(idleElapsed);
+      return;
+    }
+    if (activity.last) {
+      el("activityStatus").textContent = activity.last.label;
+      el("activityDetail").textContent = "Waiting for the next Window activity";
+      el("activityAge").textContent = lastAt === null || lastAt === undefined ? "" : "Last active " + formatAge(lastAt);
+      return;
+    }
+    el("activityStatus").textContent = "Waiting for WebCodex activity";
+    el("activityDetail").textContent = activity.coverage_partial ? "Current activity is not fully observable" : "";
+    el("activityAge").textContent = "";
+  }
+
+  function validActivityDetail(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (typeof value.server_trace_id !== "string" || !value.server_trace_id.length || value.server_trace_id.length > 128) return false;
+    if (typeof value.method !== "string" || value.method.length > 64 || typeof value.status !== "string" || value.status.length > 32) return false;
+    if (!Number.isSafeInteger(value.started_at_ms) || !Number.isSafeInteger(value.ended_at_ms) || value.ended_at_ms < value.started_at_ms) return false;
+    if (!safeCount(value.duration_ms) || typeof value.meaningful !== "boolean") return false;
+    for (const key of ["tool_name", "project", "activity_presentation", "activity_kind", "window_transition_kind", "async_job_id", "recorder_gap_session_id"]) {
+      if (value[key] != null && (typeof value[key] !== "string" || value[key].length > 512)) return false;
+    }
+    for (const key of ["request_observed_at_ms", "response_handed_at_ms", "service_ms", "next_call_gap_ms", "cycle_ms", "http_status"]) {
+      if (value[key] != null && (!Number.isSafeInteger(value[key]) || value[key] < 0)) return false;
+    }
+    if (value.response_streaming != null && typeof value.response_streaming !== "boolean") return false;
+    const observedJobIds = value.observed_job_ids ?? [];
+    if (!Array.isArray(observedJobIds) || observedJobIds.length > 8 || !observedJobIds.every(id => typeof id === "string" && id.length <= 128)) return false;
+    if (!Array.isArray(value.workflow_sessions) || value.workflow_sessions.length > 32) return false;
+    return value.workflow_sessions.every(item => item && typeof item === "object"
+      && validSession(item.workflow_session_id)
+      && (item.project == null || validProject(item.project))
+      && typeof item.relation === "string" && item.relation.length <= 64);
+  }
+
+  function detailItem(label, value) {
+    const item = document.createElement("div"); item.className = "detail-item";
+    const key = document.createElement("span"); key.textContent = label;
+    const detail = document.createElement("strong"); detail.textContent = String(value);
+    item.append(key, detail);
+    return item;
+  }
+
+  function renderActivityDetail(root, detail) {
+    root.replaceChildren();
+    const grid = document.createElement("div"); grid.className = "detail-grid";
+    grid.append(
+      detailItem("Trace", detail.server_trace_id),
+      detailItem("Method", detail.tool_name || detail.method),
+      detailItem("Status", detail.status),
+    );
+    if (detail.project) grid.append(detailItem("Project", detail.project));
+    if (detail.service_ms != null) grid.append(detailItem("Service time", formatDuration(detail.service_ms)));
+    if (detail.http_status != null) grid.append(detailItem("HTTP", detail.http_status));
+    if (detail.window_transition_kind) grid.append(detailItem("Window transition", detail.window_transition_kind));
+    if (detail.response_handed_at_ms != null) grid.append(detailItem("Response handed off", new Date(detail.response_handed_at_ms).toLocaleString()));
+    if (detail.async_job_id) grid.append(detailItem("Async job", detail.async_job_id));
+    const observedJobIds = detail.observed_job_ids ?? [];
+    if (observedJobIds.length) grid.append(detailItem("Observed jobs", observedJobIds.join(", ")));
+    if (detail.workflow_sessions.length) grid.append(detailItem("Workflow Sessions", detail.workflow_sessions.map(item => item.workflow_session_id).join(", ")));
+    root.append(grid);
+  }
+
+  async function loadActivityDetail(row, root) {
+    const trace = row.server_trace_id;
+    if (!trace || row.running) {
+      root.textContent = row.running ? "Live call · detailed timing is available after completion." : "No trace identity is available for this retained event.";
+      root.className = "activity-detail activity-detail-state";
+      return;
+    }
+    const cached = activityDetailCache.get(trace);
+    if (cached) { root.className = "activity-detail"; renderActivityDetail(root, cached); return; }
+    if (activityDetailInFlight.has(trace)) return;
+    activityDetailInFlight.add(trace);
+    root.className = "activity-detail activity-detail-state";
+    root.textContent = "Loading details…";
+    try {
+      const response = await send("tools/call", {
+        name: "work_result_activity_detail",
+        arguments: { project: lastRenderedState.project, server_trace_id: trace },
+      });
+      if (tornDown) return;
+      const structured = structuredOf(response);
+      const detail = structured?.success === true ? structured.output?.activity_detail : null;
+      if (!validActivityDetail(detail) || detail.server_trace_id !== trace) {
+        root.textContent = "Details unavailable.";
+        return;
+      }
+      activityDetailCache.set(trace, detail);
+      root.className = "activity-detail";
+      renderActivityDetail(root, detail);
+    } catch (_) {
+      if (!tornDown) root.textContent = "Details unavailable.";
+    } finally {
+      activityDetailInFlight.delete(trace);
+    }
+  }
+
+  function renderWindowActivity(windowActivity) {
+    const root = el("windowActivity"); root.replaceChildren();
+    const observed = windowActivity.events_observed;
+    const returned = windowActivity.events_returned;
+    el("windowCoverage").textContent = windowActivity.truncated || observed > returned
+      ? "Showing " + returned + " of " + observed + " observed events"
+      : observed + " observed " + (observed === 1 ? "event" : "events");
+    if (windowActivity.active_requests.length >= 8) el("windowCoverage").textContent += " · Showing up to 8 active calls";
+    const completed = new Set(windowActivity.events.map(row => row.server_trace_id).filter(Boolean));
+    const rows = [
+      ...windowActivity.events.map(row => ({ ...row, running: false })),
+      ...windowActivity.active_requests.filter(row => !row.server_trace_id || !completed.has(row.server_trace_id))
+        .map(row => ({ ...row, running: true })),
+    ].sort((a, b) => a.started_at_ms - b.started_at_ms);
+    for (const row of rows) {
+      const details = document.createElement("details"); details.className = "activity-call";
+      const key = row.server_trace_id || (row.running ? "active:" : "event:") + row.started_at_ms + ":" + (row.tool_name || row.label);
+      details.open = expandedActivity.has(key);
+      const summary = document.createElement("summary");
+      const main = document.createElement("span"); main.className = "call-main";
+      const label = document.createElement("span"); label.className = "call-title"; label.textContent = row.tool_name || row.label;
+      const time = document.createElement("time"); time.className = "call-time";
+      const elapsed = row.running ? Math.max(0, Date.now() - row.started_at_ms) : row.duration_ms;
+      const duration = elapsed == null ? "" : " · " + (elapsed < 1000 ? elapsed + "ms" : (elapsed / 1000).toFixed(1) + "s");
+      time.textContent = new Date(row.started_at_ms).toLocaleString() + duration;
+      main.append(label, time);
+      const status = document.createElement("span"); status.className = "call-outcome";
+      const outcome = ({ success: "Succeeded", succeeded: "Succeeded", completed: "Completed", failed: "Failed", timeout: "Timed out", unknown: "Outcome unknown" })[row.status] || row.status;
+      status.textContent = row.running ? "Running" : row.meaningful ? outcome : "Observe · " + outcome;
+      summary.append(main, status);
+      const detail = document.createElement("div"); detail.className = "activity-detail activity-detail-state";
+      if (details.open) void loadActivityDetail(row, detail);
+      details.ontoggle = () => {
+        if (details.open) {
+          expandedActivity.add(key);
+          void loadActivityDetail(row, detail);
+        } else {
+          expandedActivity.delete(key);
+        }
+      };
+      details.append(summary, detail);
+      root.append(details);
+    }
+    if (!root.children.length) {
+      const empty = document.createElement("p"); empty.className = "secondary";
+      empty.textContent = windowActivity.available ? "No completed Window activity yet." : "Window activity is unavailable.";
+      root.append(empty);
+    }
+  }
+  const panes = ["Activity", "Results", "Collaboration"];
+  function selectPane(name, focus = false) {
+    if (!panes.includes(name)) return;
+    selectedPane = name;
+    for (const pane of panes) {
+      el("panel" + pane).hidden = pane !== name;
+      el("tab" + pane).setAttribute("aria-selected", String(pane === name));
+      el("tab" + pane).setAttribute("tabindex", pane === name ? "0" : "-1");
+    }
+    if (focus) el("tab" + name).focus?.();
+  }
+
+  function renderWorkflow(workflow) {
+    const rows = workflow?.activity || [];
+    const stages = [["all", "All"], ["explore", "Explore"], ["edit", "Edit"], ["run", "Run"], ["check", "Checks"], ["review", "Review"], ["other", "Other"]];
+    el("workflowCoverage").textContent = !workflow ? "Unavailable" : workflow.history_partial ? "Recent retained activity" : "Retained activity";
+    const filters = el("workflowStages");
+    // Keep focused filter buttons mounted while polling refreshes their counts.
+    if (!filters.children.length) for (const [stage, label] of stages) {
+      const button = document.createElement("button"); button.type = "button";
+      button.onclick = () => { selectedStage = stage; renderWorkflow(lastRenderedState?.workflow); };
+      button.setAttribute("aria-label", label); filters.append(button);
+    }
+    stages.forEach(([stage, label], index) => {
+      const count = rows.filter(row => stage === "all" || row.stage === stage).reduce((total, row) => total + row.count, 0);
+      filters.children[index].textContent = `${label} · ${count}`;
+      filters.children[index].setAttribute("aria-pressed", String(stage === selectedStage));
+    });
+    const root = el("workflowActivity"); root.replaceChildren();
+    for (const row of [...rows].reverse().filter(row => selectedStage === "all" || row.stage === selectedStage)) {
+      const article = document.createElement("article"); article.className = "workflow-row";
+      const header = document.createElement("header");
+      const label = document.createElement("strong"); label.textContent = row.label + (row.count > 1 ? ` · ${row.count}` : "");
+      const status = document.createElement("span"); status.className = "secondary";
+      status.textContent = ({ started: "Started · outcome not recorded", running: "Started · completion not recorded", queued: "Queued", outcome_unknown: "Outcome unknown", timed_out: "Timed out", cancelled: "Cancelled", not_started: "Not started", success: "Succeeded", succeeded: "Succeeded", completed: "Completed", failed: "Failed", info: "Reported progress" })[row.state] || row.state;
+      header.append(label, status);
+      const time = document.createElement("time");
+      time.textContent = new Date(row.started_at * 1000).toLocaleString() + (row.duration_ms === null ? "" : ` · ${row.duration_ms < 1000 ? row.duration_ms + "ms" : (row.duration_ms / 1000).toFixed(1) + "s"}`);
+      article.append(header, time); root.append(article);
+    }
+    if (!root.children.length) {
+      const empty = document.createElement("p"); empty.className = "secondary";
+      empty.textContent = workflow ? "No recorded activity in this stage." : "Workflow history is unavailable in this snapshot. Refresh to check.";
+      root.append(empty);
+    }
+  }
+
+  function jobOutcomeLabel(job) {
+    const state = job.state === "active" ? job.status : job.outcome || job.status;
+    return ({ running: "Running", queued: "Queued", completed: "Completed", passed: "Passed", failed: "Failed", recovering: "Reconnecting", lost: "Execution lost", stopped: "Stopped", cancelled: "Cancelled", timed_out: "Timed out", inconclusive: "Inconclusive", stop_requested: "Stopping" })[state] || state.replaceAll("_", " ");
+  }
+
+  function renderJobs(jobs) {
+    const root = el("jobsList"); root.replaceChildren();
+    const results = el("jobResultsList"); results.replaceChildren();
+    el("jobsSection").hidden = !jobs?.available || (!jobs.items.length && !jobs.active);
+    el("jobsMeta").textContent = jobs?.truncated ? "Showing up to 8 background executions; more may be active or finished." : "";
+    el("jobResults").hidden = true;
+    if (!jobs?.available) return;
+    const outcomes = new Map();
+    for (const job of jobs.items) {
+      const row = document.createElement("article"); row.className = "workflow-row";
+      const header = document.createElement("header");
+      const label = document.createElement("strong"); label.textContent = job.tool.replaceAll("_", " ");
+      const status = document.createElement("span"); status.className = "secondary";
+      const outcome = jobOutcomeLabel(job);
+      status.textContent = outcome;
+      if (job.recovery_state) status.textContent += " · " + job.recovery_state.replaceAll("_", " ");
+      header.append(label, status); row.append(header);
+      if (job.state === "active") root.append(row);
+      else {
+        results.append(row);
+        outcomes.set(outcome, (outcomes.get(outcome) || 0) + 1);
+      }
+    }
+    el("jobResults").hidden = !results.children.length;
+    el("jobResultsSummary").textContent = "Recent background results · "
+      + [...outcomes].map(([outcome, count]) => count + " " + outcome.toLowerCase()).join(" · ");
   }
 
   function render(state) {
     if (tornDown) return;
-    renderProgress(state.session);
-    renderChanges(state.workspace);
-    renderValidation(state.validation);
-    renderReview(state.review);
+    lastRenderedState = state;
+    el("projectIdentity").textContent = "Project · " + state.project;
+    el("windowIdentity").textContent = state.window ? "Window · " + state.window.key : "Window · unavailable";
+    el("sessionIdentity").textContent = state.session_id ? "Session · " + state.session_id : "Session · not linked yet";
+    el("windowSource").textContent = state.window ? "Source · " + state.window.source : "";
+    const hasFinalChanges = snapshot !== null || state.final_changes !== undefined;
+    el("taskTitle").textContent = state.session?.title || "WebCodex activity";
+    renderWindowCurrentActivity(state.activity);
+    renderWindowActivity(state.window_activity);
+    renderJobs(state.jobs);
+    if (!state.activity.active && state.jobs?.available && state.jobs.active) {
+      el("activityStatus").textContent = "Work continuing in the background";
+      el("activityDetail").textContent = "This task still has background work. Current execution states are shown below.";
+      el("activityAge").textContent = "";
+    }
+    renderMessages(state.collaboration);
+    renderWorkspace(state.workspace);
+    el("resultChecks").hidden = !state.session_id || (!state.validation && !state.review);
+    if (state.validation) renderValidation(state.validation);
+    else { el("validationStatus").textContent = "Check status unavailable"; el("validationMeta").textContent = ""; }
+    if (state.review) renderReview(state.review);
+    else { el("reviewStatus").textContent = "Review status unavailable"; el("reviewMeta").textContent = ""; }
+    el("viewResults").textContent = hasFinalChanges ? "View final result" : `View changed files · ${state.workspace.files_total}`;
+    el("finalChanges").hidden = !hasFinalChanges;
+
+    if (state.activity.active || state.jobs?.active) {
+      el("badge").className = "badge tone-changed";
+      el("badge").textContent = "Working";
+    } else if ((activityIdleElapsed(state.activity) ?? -1) >= ACTIVITY_IDLE_AFTER_MS) {
+      el("badge").className = "badge";
+      el("badge").textContent = "Idle";
+    } else {
+      el("badge").className = "badge";
+      el("badge").textContent = "Waiting";
+    }
+  }
+
+  function newDeliveryKey() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return "wrc_" + Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async function sendMessageFromCard() {
+    if (tornDown || !hostInitialized || !identity || sendInFlight || !lastRenderedState?.collaboration?.can_send || collaborationSendState === "unavailable") return;
+    const text = String(el("messageInput").value || "").trim();
+    if (!text) return;
+    if (!pendingSend) pendingSend = { project: identity.project, ...(lastRenderedState.session_id ? { session_id: lastRenderedState.session_id } : {}), message: text, delivery_key: newDeliveryKey() };
+    sendInFlight = true;
+    collaborationSendState = "sending";
+    el("composerState").textContent = "Sending…";
+    updateComposerControl();
+    try {
+      const response = await send("tools/call", { name: "work_result_send_message", arguments: pendingSend });
+      if (tornDown) return;
+      const receipt = structuredOf(response);
+      if (!receipt || (receipt.success === true && (typeof receipt.output?.message_id !== "string" || !MESSAGE_ID.test(receipt.output.message_id)))) {
+        collaborationSendState = "uncertain";
+        el("composerState").textContent = "Send status unknown · retry";
+        return;
+      }
+      if (receipt.success !== true) {
+        const failure = sendFailureOf(response);
+        if (failure === "uncertain") {
+          collaborationSendState = "uncertain";
+          el("composerState").textContent = "Send status unknown · retry";
+          return;
+        }
+        pendingSend = null;
+        if (failure === "context") {
+          collaborationSendState = "error";
+          el("composerState").textContent = "Context is no longer available";
+        } else if (failure === "unavailable") {
+          collaborationSendState = "unavailable";
+          el("composerState").textContent = "Collaboration is unavailable for this Window";
+        } else {
+          collaborationSendState = "error";
+          el("composerState").textContent = "Message could not be sent";
+        }
+        return;
+      }
+      el("messageInput").value = "";
+      pendingSend = null;
+      collaborationSendState = "idle";
+      el("composerState").textContent = "Saved";
+      await refresh(false);
+    } catch (_) {
+      if (!tornDown) {
+        collaborationSendState = "uncertain";
+        el("composerState").textContent = "Send status unknown · retry";
+      }
+    } finally {
+      sendInFlight = false;
+      updateComposerControl();
+    }
   }
 
   function updateRefreshControl() {
@@ -485,16 +1501,18 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
 
   function automaticRefreshDelay() {
     const idleMs = lastStateChangeAt === null ? 0 : Math.max(0, Date.now() - lastStateChangeAt);
-    if (idleMs < IDLE_BACKOFF_AFTER_MS) return document.hidden ? HIDDEN_REFRESH_MS : VISIBLE_REFRESH_MS;
-    return document.hidden ? HIDDEN_IDLE_REFRESH_MS : VISIBLE_IDLE_REFRESH_MS;
+    const active = lastRenderedState?.window_activity.active || lastRenderedState?.jobs?.active;
+    const base = active || idleMs < IDLE_BACKOFF_AFTER_MS ? VISIBLE_REFRESH_MS : VISIBLE_IDLE_REFRESH_MS;
+    const steady = Math.min(active ? 60000 : 120000, base * 2 ** Math.min(unchangedRefreshes, 4));
+    return Math.max(steady, Math.min(120000, VISIBLE_REFRESH_MS * 2 ** Math.min(refreshFailures, 4)));
   }
 
   function scheduleRefresh(delay) {
     if (refreshTimer !== null) clearTimeout(refreshTimer);
     refreshTimer = null;
-    if (tornDown || !hostInitialized || !identity || lastStateVersion === null || sessionLifecycle === "closed") return;
-    if (lastStateChangeAt !== null && Date.now() - lastStateChangeAt >= AUTO_REFRESH_IDLE_PAUSE_MS) {
-      if (!refreshInFlight) el("status").textContent = "Live · auto refresh paused";
+    if (tornDown || !hostInitialized || !identity || lastStateVersion === null || document.hidden) return;
+    if (!lastRenderedState?.window_activity.active && !lastRenderedState?.jobs?.active && lastStateChangeAt !== null && Date.now() - lastStateChangeAt >= AUTO_REFRESH_IDLE_PAUSE_MS) {
+      if (!refreshInFlight) el("status").textContent = "Updates paused · Refresh to check";
       return;
     }
     refreshTimer = setTimeout(() => {
@@ -507,37 +1525,49 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     if (tornDown || !hostInitialized || !identity || refreshInFlight) return;
     const hadSnapshot = lastStateVersion !== null;
     refreshInFlight = true;
+    if (refreshTimer !== null) clearTimeout(refreshTimer);
+    refreshTimer = null;
+    refreshFailures++;
     updateRefreshControl();
     if (!automatic) el("status").textContent = "Refreshing…";
     try {
-      const response = await send("tools/call", { name: "work_result_state", arguments: { project: identity.project, session_id: identity.session_id } });
+      const response = await send("tools/call", { name: "work_result_state", arguments: { project: identity.project, ...(explicitSession ? { session_id: explicitSession } : {}) } });
       if (tornDown) return;
-      if (toolSuccess(response) === false) {
-        if (!automatic) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
+      const structured = structuredOf(response);
+      if (!structured) {
+        el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
         return;
       }
-      const state = extractState(response);
-      if (!state || state.final_changes !== undefined || !acceptIdentity(pair(state.project, state.session_id))) {
-        if (!tornDown) failClosed("Invalid authoritative Work state");
+      if (structured.success === false) {
+        el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
         return;
       }
+      const state = extractState(structured);
+      if (!state || !acceptIdentity(target(state.project))) {
+        if (!tornDown) failClosed("Task state unavailable");
+        return;
+      }
+      const hadFrozen = snapshot !== null;
+      if (!acceptFrozen(state.final_changes, state.session_id)) return;
+      const completedNow = !hadFrozen && snapshot !== null;
       hasRefreshed = true;
-      sessionLifecycle = state.session.lifecycle;
-      if (state.state_version !== lastStateVersion) {
+      initialResultTransportMissing = false;
+      const changed = state.state_version !== lastStateVersion;
+      refreshFailures = 0;
+      unchangedRefreshes = changed || !automatic ? 0 : unchangedRefreshes + 1;
+      if (changed) {
         lastStateVersion = state.state_version;
         lastStateChangeAt = Date.now();
-        render(state);
-        el("status").textContent = sessionLifecycle === "closed"
-          ? (automatic ? "Closed · updated" : "Updated · closed")
-          : (automatic ? "Live · updated" : "Updated");
-      } else {
-        if (!automatic) lastStateChangeAt = Date.now();
-        el("status").textContent = sessionLifecycle === "closed"
-          ? (automatic ? "Closed" : "Up to date · closed")
-          : (automatic ? "Live" : "Up to date");
       }
+      // Re-render even when authoritative state is unchanged so the View can
+      // update human-friendly "last active" time from the stable timestamp.
+      render(state);
+      if (!changed && !automatic) lastStateChangeAt = Date.now();
+      el("status").textContent = completedNow ? "Live · final changes available"
+        : changed ? (automatic ? "Live · updated" : "Updated")
+        : (automatic ? "Live" : "Up to date");
     } catch (_) {
-      if (!tornDown && !automatic) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
+      if (!tornDown) el("status").textContent = hadSnapshot ? "Refresh unavailable · showing last snapshot" : "Refresh unavailable · retry";
     } finally {
       refreshInFlight = false;
       updateRefreshControl();
@@ -547,24 +1577,48 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
 
   function acceptToolInput(params) {
     const args = params && params.arguments;
-    acceptIdentity(pair(args && !Array.isArray(args) && args.project, args && !Array.isArray(args) && args.session_id));
+    if (args?.session_id !== undefined) {
+      if (!validSession(args.session_id) || (explicitSession && explicitSession !== args.session_id)
+        || (lastRenderedState?.jobs?.available && lastRenderedState.session_id !== args.session_id)) {
+        failClosed("Conflicting Workflow Session"); return;
+      }
+      explicitSession = args.session_id;
+    }
+    if (!acceptIdentity(target(args && !Array.isArray(args) && args.project))) return;
+    if (initialResultTransportMissing && hostInitialized && lastStateVersion === null) void refresh(false);
   }
 
   function acceptToolResult(result) {
     if (tornDown) return;
-    const state = extractState(result);
-    if (toolSuccess(result) === false || !state || !acceptIdentity(pair(state.project, state.session_id))) {
-      if (!tornDown) failClosed("Invalid Work Result state");
+    const structured = structuredOf(result);
+    if (!structured) {
+      // Production Hosts may omit structuredContent from a ToolResult delivered
+      // to the View. Preserve exact identity from tool-input and recover once
+      // through the app-only state read instead of permanently disabling the card.
+      initialResultTransportMissing = true;
+      if (identity && hostInitialized && lastStateVersion === null) void refresh(false);
       return;
     }
-    if (!acceptInitialFrozen(state.final_changes)) return;
-    sessionLifecycle = state.session.lifecycle;
+    const state = extractState(structured);
+    if (structured.success === false || !state || !acceptIdentity(target(state.project))) {
+      if (!tornDown) failClosed("Task state unavailable");
+      return;
+    }
+    initialResultTransportMissing = false;
+    const hadFrozen = snapshot !== null;
+    if (!acceptFrozen(state.final_changes, state.session_id)) return;
+    const adoptedFinal = !hadFrozen && snapshot !== null;
     if (!hasRefreshed && state.state_version !== lastStateVersion) {
       lastStateVersion = state.state_version;
       lastStateChangeAt = Date.now();
       render(state);
+    } else if (adoptedFinal && lastRenderedState) {
+      // A delayed initial ToolResult may carry the immutable closeout snapshot
+      // after a fresher live refresh. Adopt only that frozen domain and re-render
+      // the fresher live state as completed; never roll workspace/activity back.
+      render(lastRenderedState);
     }
-    el("status").textContent = sessionLifecycle === "closed" ? "Closed · manual Refresh available" : "Live";
+    el("status").textContent = adoptedFinal ? "Live · final changes available" : "Live";
     updateRefreshControl();
     scheduleRefresh(500);
   }
@@ -609,29 +1663,67 @@ h2 { margin: 0; font-size: 12px; font-weight: 650; }
     }
   });
 
+  for (const pane of panes) {
+    el("tab" + pane).onclick = () => selectPane(pane);
+    el("tab" + pane).onkeydown = event => {
+      const index = panes.indexOf(selectedPane);
+      const next = event.key === "ArrowRight" ? panes[(index + 1) % panes.length]
+        : event.key === "ArrowLeft" ? panes[(index + panes.length - 1) % panes.length]
+        : event.key === "Home" ? panes[0] : event.key === "End" ? panes.at(-1) : null;
+      if (next) { event.preventDefault(); selectPane(next, true); }
+    };
+  }
+  el("askActivity").onclick = () => { selectPane("Collaboration"); el("messageInput").focus?.(); };
+  el("viewResults").onclick = () => selectPane("Results", true);
+  el("discussResults").onclick = () => { selectPane("Collaboration"); el("messageInput").focus?.(); };
+  selectPane("Activity");
   el("refresh").onclick = () => { void refresh(false); };
-  el("frozenMore").onclick = () => { if (snapshot) appendFrozenFiles(snapshot.files.length); };
-  addEventListener("visibilitychange", () => {
-    if (!tornDown && hostInitialized && identity && lastStateVersion !== null) {
-      scheduleRefresh(document.hidden ? HIDDEN_REFRESH_MS : 250);
+  el("frozenMore").onclick = () => { void showMoreFiles(true); };
+  el("frozenLess").onclick = () => appendFrozenFiles(INITIAL_FROZEN_FILES);
+  el("frozenCollapse").onclick = () => { for (const row of el("frozenFiles").children) row.collapse?.(); };
+  el("workspaceMore").onclick = () => { void showMoreFiles(false); };
+  el("workspaceLess").onclick = () => { workspaceVisible = INITIAL_FROZEN_FILES; renderWorkspaceRows(); };
+  el("workspaceCollapse").onclick = () => { for (const row of el("workspaceFiles").children) row.collapse?.(); };
+  el("workspaceReload").onclick = () => {
+    resetWorkspaceFiles(); renderedWorkspace = null;
+    if (lastRenderedState) renderWorkspace(lastRenderedState.workspace);
+  };
+  el("composer").onsubmit = event => { event.preventDefault(); void sendMessageFromCard(); };
+  el("messageInput").oninput = () => {
+    if (collaborationSendState !== "uncertain" && pendingSend && pendingSend.message !== String(el("messageInput").value || "").trim()) pendingSend = null;
+    if (collaborationSendState !== "sending" && collaborationSendState !== "uncertain") {
+      collaborationSendState = "idle";
+      el("composerState").textContent = "";
     }
+    updateComposerControl();
+  };
+  addEventListener("visibilitychange", () => {
+    if (tornDown || !hostInitialized || !identity || lastStateVersion === null) return;
+    if (document.hidden) {
+      if (refreshTimer !== null) clearTimeout(refreshTimer);
+      refreshTimer = null;
+      return;
+    }
+    scheduleRefresh(250);
   });
   updateRefreshControl();
   addEventListener("pagehide", teardown, { once: true });
   addEventListener("beforeunload", teardown, { once: true });
 
-  send("ui/initialize", { protocolVersion: APP_PROTOCOL, appInfo: { name: "webcodex-work-result-app", title: "WebCodex Progress", version: "1.1.0" }, appCapabilities: {} })
+  send("ui/initialize", { protocolVersion: APP_PROTOCOL, appInfo: { name: "webcodex-work-result-app", title: "WebCodex", version: "3.0.0" }, appCapabilities: {} })
     .then(() => {
       if (tornDown) return;
       hostInitialized = true;
       el("status").textContent = lastStateVersion !== null
-        ? (sessionLifecycle === "closed" ? "Closed · manual Refresh available" : "Live")
-        : identity ? "Waiting for Work snapshot" : "Host initialized · waiting for exact tool identity";
+        ? "Live"
+        : identity ? "Waiting for Window activity" : "Ready";
       notify("ui/notifications/initialized", {});
       updateRefreshControl();
-      scheduleRefresh();
+      updateComposerControl();
+      if (initialResultTransportMissing && identity && lastStateVersion === null) void refresh(false);
+      else scheduleRefresh();
     })
-    .catch(() => { if (!tornDown) el("status").textContent = "Host initialization unavailable"; });
+    .catch(() => { if (!tornDown) el("status").textContent = "Task card unavailable"; });
 })();
 </script>
 </body>

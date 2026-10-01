@@ -13,7 +13,16 @@ Native Plugin 是**受信任的本地 executable**。WebCodex 不会 sandbox、�
 不可信 executable 自动变安全；启动 Plugin 与在 prepared Runner environment 下直接运行
 这个本地程序具有同等级别的本机信任含义。
 
+> **术语区分：** ChatGPT 有时把 developer MCP/custom app 也称为“插件”，但它与
+> WebCodex 的 **Native Tool Plugin** 不是同一层。若 ChatGPT 返回
+> `FORBIDDEN: This conversation does not support developer MCPs`，并且 Host 在
+> `plugin_tool` 到达 WebCodex 之前就拒绝 MCP connection，这不是 Native Tool Plugin
+> health result。此类问题先看[故障排查](TROUBLESHOOTING.zh-CN.md)；只有请求已经到达
+> WebCodex 后，才使用本文的 `plugin_tool` diagnostic 排查本地 provider。
+
 ## 配置 Plugin
+
+Desktop 在“扩展 → 原生 Plugin”提供独立分类，与 MCP 工具服务分开。添加可信程序后，上方显示已保存的注册项；下方选择项目，查看该项目 Runner 实际提供的工具。预览展示该 Runner 报告的插件加载状态，失败时给出处理建议和安全诊断码；它不是 Project-affine 工具目录，也不显示 provider-list 接口未提供的工具数量。保存不启动 Plugin，需要明确重启所管理的 Runner 才会应用；重新加载仅针对所选项目中获授权的 Plugin。
 
 Plugin 使用独立的 `runner.toml` 配置，不复用 MCP provider：
 
@@ -315,9 +324,10 @@ Phase 1 曾有意暂缓 `webcodex plugin init`，直到 SDK 建立真实 externa
 这个前置条件现在已经满足：`@yyjeqhc/webcodex-plugin-sdk@0.1.0` 已通过 npm 公开分发，Phase 3
 因此加入使用该**精确兼容版本**的本地 scaffold。生成项目不依赖 WebCodex 源码 checkout。
 仓库内 first-party dogfood（例如 `plugins/safe-delete`、
-[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md) 和
-[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md)）仍有意使用同
-checkout 的 local SDK source，以持续测试正在开发的 SDK；外部 `plugin init` 项目则使用
+[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md)、
+[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 和
+[`plugins/agent-browser`](../plugins/agent-browser/README.zh-CN.md)）仍有意使用同 checkout
+的 local SDK source，以持续测试正在开发的 SDK；外部 `plugin init` 项目则使用
 published package。
 
 ## TypeScript Plugin SDK
@@ -420,9 +430,12 @@ first-party SDK dogfood Plugin：[`plugins/safe-delete`](../plugins/safe-delete/
 不会把永久删除能力加入 WebCodex 内建工具面；
 [`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md) 是只读 authoring 示例，它唯一的
 `git_summary` 只观察 provider 配置的 repository `cwd`；
-[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 则把 bounded
+[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 把 bounded
 Browser semantic snapshot 转换成结构化简历填写计划，支持重复 section 和多步骤网申，
-并有意在最终提交之前停止。
+并有意在最终提交之前停止；
+[`plugins/agent-browser`](../plugins/agent-browser/README.zh-CN.md) 则调用 operator 已安装的
+本机 Agent Browser，继承 native profile/config 或连接用户明确授权的当前 Chrome，同时把
+opaque page/snapshot identity、tab ownership 和不确定 effect 的处理限制在 Plugin 边界内。
 
 ## 调用与失败语义
 

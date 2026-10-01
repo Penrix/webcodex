@@ -1,4 +1,3 @@
-use crate::capabilities::RunnerFeatureInference;
 use crate::projects::RunnerLookupError;
 use crate::protocol::AcceptedRunnerProtocol;
 use crate::registry::{MAX_SHARED_KEY_RUNNERS_PER_GROUP, SHARED_KEY_OFFLINE_TTL_SECS};
@@ -69,6 +68,7 @@ fn runner_registration(
     _projects: Vec<RunnerProjectSummary>,
 ) -> RunnerRegisterRequest {
     RunnerRegisterRequest {
+        computer_session_availability: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -87,13 +87,20 @@ fn runner_registration(
     }
 }
 
-fn v2_baseline_capabilities() -> RunnerCapabilities {
-    let mut value = serde_json::Map::new();
-    value.insert("shell".to_string(), serde_json::Value::Bool(false));
-    for capability in RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
-        value.insert((*capability).to_string(), serde_json::Value::Bool(true));
+fn all_enabled_capabilities() -> RunnerCapabilities {
+    let mut capabilities = RunnerCapabilities::default();
+    for feature in RunnerFeature::all() {
+        capabilities.set(*feature, true);
     }
-    serde_json::from_value(serde_json::Value::Object(value)).unwrap()
+    capabilities
+}
+
+fn v2_baseline_capabilities() -> RunnerCapabilities {
+    let mut capabilities = RunnerCapabilities::default();
+    for feature in RunnerFeature::all() {
+        capabilities.set(*feature, feature.is_v2_baseline());
+    }
+    capabilities
 }
 
 fn current_runner_registration(registration: RunnerRegisterRequest) -> RunnerRegisterRequest {
@@ -137,6 +144,7 @@ async fn register_computer_test_runner(
 ) {
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -169,6 +177,7 @@ async fn register_computer_test_runner(
 async fn register_quic_v1_runner(registry: &RunnerRegistry, client_id: &str) {
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -201,6 +210,7 @@ async fn register_instance_with_capabilities(
 ) -> Result<RunnerView, String> {
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -239,6 +249,7 @@ async fn register_with_instance(
 ) -> RunnerView {
     registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -335,12 +346,16 @@ mod job_lifecycle;
 mod job_log_wait;
 #[path = "tests/lsp.rs"]
 mod lsp;
+#[path = "tests/maintenance.rs"]
+mod maintenance;
 #[path = "tests/mcp_gateway.rs"]
 mod mcp_gateway;
 #[path = "tests/plugin_gateway.rs"]
 mod plugin_gateway;
 #[path = "tests/polling.rs"]
 mod polling;
+#[path = "tests/project_build.rs"]
+mod project_build;
 #[path = "tests/project_file_read.rs"]
 mod project_file_read;
 #[path = "tests/project_inventory.rs"]

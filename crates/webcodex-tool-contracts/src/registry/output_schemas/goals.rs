@@ -127,6 +127,7 @@ fn goal_activity_schema() -> Value {
             "available": {"type": "boolean", "description": "Whether runtime liveness evidence is authorized and available. False never reveals Window existence, counts, or timestamps."},
             "state": {"type": "string", "enum": ["active", "attention_needed", "unobserved", "not_applicable"], "description": "Derived soft liveness observation only; never authoritative Goal or Task state."},
             "idle_threshold_ms": {"type": "integer", "const": 300000, "description": "Internal five-minute soft-attention heuristic, not an execution timeout."},
+            "observation_lease_ms": {"type": "integer", "const": 75000, "description": "Server-owned Goal Plan card observation lease. Successful App sync calls renew liveness evidence; browser timestamps are never accepted."},
             "last_seen_at_ms": nullable_integer("Latest caller-visible WebCodex Window activity, including non-meaningful Host/App control traffic."),
             "last_meaningful_activity_at_ms": nullable_integer("Latest caller-visible meaningful WebCodex business activity across correlated Windows."),
             "quiet_for_ms": nullable_integer("Milliseconds since latest visible meaningful activity at projection time, or null when unobserved."),
@@ -135,11 +136,46 @@ fn goal_activity_schema() -> Value {
             "coverage_partial": {"type": "boolean", "description": "True when bounded scans or active-request retention may omit evidence. Partial coverage never produces attention_needed."}
         },
         "required": [
-            "available", "state", "idle_threshold_ms", "last_seen_at_ms",
+            "available", "state", "idle_threshold_ms", "observation_lease_ms", "last_seen_at_ms",
             "last_meaningful_activity_at_ms", "quiet_for_ms", "linked_window_count",
             "active_meaningful_request_count", "coverage_partial"
         ],
         "description": "Payload-free ClientWindow liveness evidence derived only after exact Goal/Session/Project re-authorization. It grants no authority and never exposes Window keys or raw Host metadata."
+    })
+}
+
+fn goal_continuity_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "available": {"type": "boolean", "description": "Whether the bounded continuity join is available. False is fail-closed and never implies absence of durable continuation state."},
+            "state": {"type": "string", "enum": ["ready", "stalled", "wake_queued", "dispatching", "host_accepted", "host_unknown", "resume_confirmed", "not_configured", "not_applicable", "unavailable"], "description": "Current exact-Goal continuity summary. Host acceptance/delivery is distinct from exact Wake-consume resume confirmation."},
+            "production_auto_resume_available": {"type": "boolean", "description": "Current exact controller Agent/generation production Host-carrier readiness only. It grants no execution authority and is not proof that a Wake exists or a fresh turn ran."},
+            "wake_state": {"anyOf": [{"type": "string", "enum": ["pending", "claimed", "prepared", "delivered", "delivery_unknown", "consumed", "retired"]}, {"type": "null"}], "description": "Bounded durable lifecycle of the exact current Goal-stall Wake, or null when no current-epoch Wake is correlated."},
+            "host_delivery": {"type": "string", "enum": ["not_started", "dispatching", "accepted", "unknown", "not_confirmed", "not_applicable"], "description": "Bounded Host-delivery observation for the current Goal-stall Wake, or for the retained most recent confirmed resume when no current-epoch Wake exists. accepted never means the fresh model turn ran; unknown remains uncertain."},
+            "fresh_turn": {"type": "string", "enum": ["not_confirmed", "confirmed", "not_applicable"], "description": "Fresh-turn proof for the current Goal-stall Wake, or for the retained most recent confirmed resume when no current-epoch Wake exists. confirmed requires exact corresponding durable Wake consume."},
+            "attention_candidate_at_unix_ms": nullable_integer("Server-derived inactivity threshold instant for the current stall epoch, or for the most recent confirmed Goal-stall continuation after newer meaningful work begins; null when no bounded timeline exists."),
+            "attention_created_at_unix_ms": nullable_integer("Durable goal_workflow_stalled Attention creation time for the current stall epoch or most recent confirmed continuation timeline, or null before any commit."),
+            "wake_created_at_unix_ms": nullable_integer("Durable Goal-stall Wake creation time for the current stall epoch or most recent confirmed continuation timeline, or null before any commit."),
+            "host_dispatch_prepared_at_unix_ms": nullable_integer("Existing Wake Attempt preparation time, or null before the Host dispatch fence."),
+            "host_dispatch_accepted_at_unix_ms": nullable_integer("Host dispatch acceptance time, or null when not accepted. Acceptance never proves a fresh turn."),
+            "host_dispatch_unknown_at_unix_ms": nullable_integer("Conservative Host delivery-unknown time, or null when delivery is not uncertain."),
+            "wake_consumed_at_unix_ms": nullable_integer("Exact Goal-stall Wake consume time proving the current or most recent confirmed fresh turn, or null before any consume."),
+            "first_post_resume_meaningful_at_unix_ms": nullable_integer("First durable meaningful Window activity correlated to the exact resumed Workflow Session after Wake consume, or null."),
+            "last_post_resume_meaningful_at_unix_ms": nullable_integer("Latest durable meaningful Window activity correlated to the exact resumed Workflow Session after Wake consume, or null."),
+            "last_resume_at_unix_ms": nullable_integer("Most recent exact Goal-stall Wake consume time for bounded historical context, or null. Historical resume never determines the current continuity state.")
+        },
+        "required": [
+            "available", "state", "production_auto_resume_available", "wake_state",
+            "host_delivery", "fresh_turn", "attention_candidate_at_unix_ms",
+            "attention_created_at_unix_ms", "wake_created_at_unix_ms",
+            "host_dispatch_prepared_at_unix_ms", "host_dispatch_accepted_at_unix_ms",
+            "host_dispatch_unknown_at_unix_ms", "wake_consumed_at_unix_ms",
+            "first_post_resume_meaningful_at_unix_ms", "last_post_resume_meaningful_at_unix_ms",
+            "last_resume_at_unix_ms"
+        ],
+        "description": "Read-only exact-Goal continuity observability. It exposes no Wake/Attempt/Endpoint/Host-binding ids, consume tokens, claim fences, principal identity, Project path, Session ledger, stdout, or stderr."
     })
 }
 
@@ -148,7 +184,7 @@ fn goal_plan_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "version": {"type": "integer", "const": 2, "description": "Current bounded Goal workflow plan projection."},
+            "version": {"type": "integer", "const": 3, "description": "Current bounded Goal workflow plan projection."},
             "goal_id": {"type": "string", "pattern": "^wc_goal_[A-Za-z0-9_-]{16}$", "description": "Exact durable Goal identity used for refresh/rehydration and app-only polling. Identity is never authority."},
             "title": {"type": "string", "minLength": 1, "maxLength": 200, "description": "Bounded Goal title."},
             "total_step_count": {"type": "integer", "minimum": 0, "maximum": 32},
@@ -164,12 +200,13 @@ fn goal_plan_schema() -> Value {
             "terminal_at_unix_ms": nullable_integer("Terminal transition time, or null while active."),
             "agent_task_count": {"type": "integer", "minimum": 0, "maximum": 64, "description": "Count of explicit AgentTask correlations; no target-domain state or authority is projected."},
             "workflow_session_count": {"type": "integer", "minimum": 0, "maximum": 64, "description": "Count of explicit Workflow Session correlations; no Session ledger, Project state, or authority is projected."},
-            "activity": goal_activity_schema()
+            "activity": goal_activity_schema(),
+            "continuity": goal_continuity_schema()
         },
         "required": [
             "version", "goal_id", "title", "total_step_count", "completed_step_count", "current_step_id", "steps", "progress_summary", "checkpoint_at_unix_ms", "controller_agent_id", "lifecycle", "revision",
             "updated_at_unix_ms", "terminal_at_unix_ms", "agent_task_count",
-            "workflow_session_count", "activity"
+            "workflow_session_count", "activity", "continuity"
         ],
         "description": "Read-only bounded Goal Plan presentation projection. It contains no execution authority, fences, tokens, credentials, Session ledger, Job logs, stdout, or stderr."
     })
@@ -193,10 +230,10 @@ fn goal_mutation_schema() -> Value {
     ])
 }
 
-pub(super) fn goal_follow_up_schema() -> Value {
+pub(super) fn active_goal_context_schema() -> Value {
     json!({
         "type": "object", "additionalProperties": false,
-        "description": "Owned active Goals explicitly correlated to the authorized Workflow Session. Progress follow-up only; no automatic completion. When incomplete, checkpoint_goal with this exact revision; otherwise freshly verify/review completion intent and explicitly update_goal to completed. Missing authority omits this field; unavailable evidence never implies no active Goal.",
+        "description": "Owned active Goals explicitly correlated to the exact authorized Workflow Session. Identity/reuse projection only: it never selects, binds, or completes a Goal, and Session/Project/Window state never becomes Goal authority. One result may be reused explicitly; multiple results require explicit selection. When incomplete, checkpoint_goal with the exact revision; otherwise freshly verify/review completion intent and explicitly update_goal to completed. Missing authority omits this field; unavailable evidence never implies no active Goal.",
         "properties": {
             "available": {"type": "boolean"},
             "truncated": {"type": "boolean"},
@@ -222,27 +259,14 @@ pub(super) fn goal_follow_up_schema() -> Value {
 
 pub fn output_schema_for_tool(name: &str) -> Option<Value> {
     let schema = match name {
-        "create_goal"
+        "prepare_goal_workflow"
+        | "create_goal"
         | "update_goal"
         | "checkpoint_goal"
         | "associate_goal_agent_task"
         | "associate_goal_workflow_session" => goal_mutation_schema(),
         "get_goal" => wrapped_output_schema(vec![("goal", goal_detail_schema())]),
-        "goal_plan_recheck_attention" => wrapped_output_schema(vec![
-            ("state_changed", json!({"type": "boolean"})),
-            (
-                "attention",
-                json!({"anyOf": [
-                    {"type": "null"},
-                    {"type": "object", "additionalProperties": false, "properties": {
-                        "event_id": {"type": "string", "pattern": "^wc_attention_event_[A-Za-z0-9_-]{16}$"},
-                        "wake_id": {"type": "string", "pattern": "^wc_wake_[A-Za-z0-9_-]{16}$"},
-                        "created": {"type": "boolean"}
-                    }, "required": ["event_id", "wake_id", "created"]}
-                ]}),
-            ),
-        ]),
-        "present_goal_plan" | "goal_plan_state" => {
+        "present_goal_plan" | "goal_plan_sync" => {
             wrapped_output_schema(vec![("goal_plan", goal_plan_schema())])
         }
         "list_goals" => wrapped_output_schema(vec![

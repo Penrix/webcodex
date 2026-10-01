@@ -1,6 +1,7 @@
 //! Canonical ToolCall parser, wire, accessor, and request-audit helper tests.
 
 use super::tool_call_test_support::*;
+use super::{required_fields, spec_named};
 use crate::*;
 use serde_json::{json, Value};
 use webcodex_core::workflow_session_contract as sessions;
@@ -101,68 +102,167 @@ fn code_mode_exec_mutating_is_not_a_tool_call_without_feature() {
 }
 
 #[test]
-fn apply_text_edits_shorthand_normalizes_once_to_canonical_call() {
-    let revision = 3817291045227_u64;
-    let call = ToolCall::from_tool_name(
-        "apply_text_edits",
+fn edit_project_files_rejects_retired_shorthand() {
+    assert!(ToolCall::from_tool_name("edit_project_files", json!({
+        "project":"demo","changes":[{"path":"a","old_text":"old","new_text":"new","expected_read_revision":123}]
+    })).is_err());
+}
+
+#[test]
+fn start_agent_task_endpoint_continuation_parses_ref_or_explicit_tuple() {
+    let by_ref = ToolCall::from_tool_name(
+        "start_agent_task_endpoint_continuation",
+        json!({"attempt_ref": "~ta1"}),
+    )
+    .unwrap();
+    assert!(matches!(
+        by_ref,
+        ToolCall::StartAgentTaskEndpointContinuation {
+            attempt_ref: Some(ref selector),
+            task_id: None,
+            attempt_id: None,
+            assignee_agent_id: None,
+            attempt_fence: None,
+            attempt_controller_generation: None,
+        } if selector == "~ta1"
+    ));
+    let by_tuple = ToolCall::from_tool_name(
+        "start_agent_task_endpoint_continuation",
         json!({
-            "project": "agent:special:demo",
-            "changes": [{
-                "path": "src/lib.rs",
-                "old_text": "old",
-                "new_text": "new",
-                "expected_read_revision": revision
-            }]
+            "task_id": "wc_agent_task_ERERERERERERERER",
+            "attempt_id": "wc_agent_task_attempt_IiIiIiIiIiIiIiIi",
+            "assignee_agent_id": "wc_dagent_MzMzMzMzMzMzMzMz",
+            "attempt_fence": "wc_agent_task_fence_RERERERERERERERERERERA",
+            "attempt_controller_generation": 1
         }),
     )
     .unwrap();
-    let ToolCall::ApplyTextEdits { changes, .. } = call else {
-        panic!("expected apply_text_edits");
-    };
-    assert_eq!(changes.len(), 1);
-    let change = &changes[0];
-    assert_eq!(change.kind, ApplyFileChangeKind::Edit);
-    assert_eq!(change.path, "src/lib.rs");
-    assert!(change.to_path.is_none());
-    assert!(change.content.is_none());
-    assert_eq!(change.expected_read_revision, Some(revision));
-    assert_eq!(change.edits.len(), 1);
-    let edit = &change.edits[0];
-    assert_eq!(edit.kind, ApplyTextEditKind::ReplaceExact);
-    assert_eq!(edit.old_text.as_deref(), Some("old"));
-    assert_eq!(edit.new_text.as_deref(), Some("new"));
-    assert!(edit.anchor_text.is_none());
-    assert!(edit.occurrence.is_none());
-    assert!(edit.line_scope.is_none());
-
-    let canonical = ToolCall::from_tool_name(
-        "apply_text_edits",
+    assert!(matches!(
+        by_tuple,
+        ToolCall::StartAgentTaskEndpointContinuation {
+            attempt_ref: None,
+            task_id: Some(_),
+            attempt_id: Some(_),
+            assignee_agent_id: Some(_),
+            attempt_fence: Some(_),
+            attempt_controller_generation: Some(1),
+        }
+    ));
+    assert!(ToolCall::from_tool_name(
+        "start_agent_task_endpoint_continuation",
         json!({
-            "project": "agent:special:demo",
-            "changes": [{
-                "kind": "edit",
-                "path": "src/lib.rs",
-                "edits": [{"kind": "replace_exact", "old_text": "old", "new_text": "new"}]
-            }]
+            "attempt_ref": "~ta1",
+            "task_id": "wc_agent_task_ERERERERERERERER"
+        }),
+    )
+    .is_ok());
+    assert!(ToolCall::from_tool_name(
+        "start_agent_task_endpoint_continuation",
+        json!({"task_id": "wc_agent_task_ERERERERERERERER"}),
+    )
+    .is_ok());
+    assert!(ToolCall::from_tool_name(
+        "start_agent_task_endpoint_continuation",
+        json!({
+            "attempt_ref": "~ta1",
+            "session_id": "wc_sess_0123456789abcdef0123456789abcdef"
+        }),
+    )
+    .is_err());
+    let heartbeat_by_ref = ToolCall::from_tool_name(
+        "heartbeat_agent_task_attempt",
+        json!({"attempt_ref": "~ta1"}),
+    )
+    .unwrap();
+    assert!(matches!(
+        heartbeat_by_ref,
+        ToolCall::HeartbeatAgentTaskAttempt {
+            attempt_ref: Some(ref selector),
+            task_id: None,
+            attempt_fence: None,
+            active_turn_wake_id: None,
+            active_turn_consume_token: None,
+            ..
+        } if selector == "~ta1"
+    ));
+    let completion_by_ref = ToolCall::from_tool_name(
+        "complete_agent_task_attempt",
+        json!({
+            "attempt_ref": "~ta1",
+            "outcome": "succeeded",
+            "completion_key": "completion-by-ref"
         }),
     )
     .unwrap();
-    let ToolCall::ApplyTextEdits { changes, .. } = canonical else {
-        panic!("expected canonical apply_text_edits");
-    };
-    assert_eq!(changes[0].kind, ApplyFileChangeKind::Edit);
-    assert_eq!(changes[0].edits[0].kind, ApplyTextEditKind::ReplaceExact);
-    assert_eq!(changes[0].edits[0].old_text.as_deref(), Some("old"));
-    assert_eq!(changes[0].edits[0].new_text.as_deref(), Some("new"));
+    assert!(matches!(
+        completion_by_ref,
+        ToolCall::CompleteAgentTaskAttempt {
+            attempt_ref: Some(ref selector),
+            task_id: None,
+            attempt_id: None,
+            assignee_agent_id: None,
+            attempt_fence: None,
+            attempt_controller_generation: None,
+            ref outcome,
+            ref completion_key,
+            ..
+        } if selector == "~ta1" && outcome == "succeeded" && completion_key == "completion-by-ref"
+    ));
+}
 
-    for invalid in [
-        json!({"project":"agent:special:demo","changes":[{"path":"src/lib.rs","old_text":"old","new_text":"new","unknown":true}]}),
-        json!({"project":"agent:special:demo","changes":[{"path":"src/lib.rs","old_text":"old","new_text":"new","occurrence":2}]}),
-        json!({"project":"agent:special:demo","changes":[{"path":"src/lib.rs","old_text":"old","new_text":"new","expected_read_revision":revision,"line_scope":{"start_line":10,"end_line":20}}]}),
-        json!({"project":"agent:special:demo","changes":[{"kind":"edit","path":"src/lib.rs","old_text":"old","new_text":"new"}]}),
-        json!({"project":"agent:special:demo","changes":[{"path":"new.rs","content":"fn main() {}"}]}),
+#[test]
+fn start_agent_task_coding_run_parses_ref_or_explicit_tuple() {
+    let by_ref = json!({
+        "attempt_ref": "~ta1",
+        "project": "agent:special:task-project",
+        "provider_id": "codex"
+    });
+    let call = ToolCall::from_tool_name("start_agent_task_coding_run", by_ref.clone()).unwrap();
+    assert!(matches!(call, ToolCall::StartAgentTaskCodingRun {
+        attempt_ref: Some(ref selector), task_id: None, attempt_id: None,
+        assignee_agent_id: None, attempt_fence: None, attempt_controller_generation: None, ..
+    } if selector == "~ta1"));
+    let by_tuple = json!({
+        "project": "agent:special:task-project",
+        "task_id": "wc_agent_task_ERERERERERERERER",
+        "attempt_id": "wc_agent_task_attempt_IiIiIiIiIiIiIiIi",
+        "assignee_agent_id": "wc_dagent_MzMzMzMzMzMzMzMz",
+        "attempt_fence": "wc_agent_task_fence_RERERERERERERERERERERA",
+        "attempt_controller_generation": 1,
+        "provider_id": "codex"
+    });
+    let call = ToolCall::from_tool_name("start_agent_task_coding_run", by_tuple).unwrap();
+    assert!(matches!(
+        call,
+        ToolCall::StartAgentTaskCodingRun {
+            attempt_ref: None,
+            task_id: Some(_),
+            attempt_id: Some(_),
+            assignee_agent_id: Some(_),
+            attempt_fence: Some(_),
+            attempt_controller_generation: Some(1),
+            ..
+        }
+    ));
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "start_agent_task_coding_run");
+    assert_eq!(spec.input_schema["additionalProperties"], false);
+    assert_eq!(required_fields(spec), vec!["project", "provider_id"]);
+    assert!(test_support::validate_schema_instance(&by_ref, &spec.input_schema).is_ok());
+    for missing in ["project", "provider_id"] {
+        let mut invalid = by_ref.clone();
+        invalid.as_object_mut().unwrap().remove(missing);
+        assert!(ToolCall::from_tool_name("start_agent_task_coding_run", invalid).is_err());
+    }
+    for forbidden in [
+        "session_id",
+        "instruction",
+        "idempotency_key",
+        "provider_instance_id",
     ] {
-        assert!(ToolCall::from_tool_name("apply_text_edits", invalid).is_err());
+        let mut invalid = by_ref.clone();
+        invalid[forbidden] = json!("not-inferred");
+        assert!(ToolCall::from_tool_name("start_agent_task_coding_run", invalid).is_err());
     }
 }
 
@@ -559,6 +659,57 @@ fn cargo_test_lib_false_canonicalizes_to_omission_and_true_is_preserved() {
 }
 
 #[test]
+fn cargo_check_package_selectors_canonicalize_to_one_internal_shape() {
+    let single = ToolCall::from_tool_name(
+        "cargo_check",
+        json!({"project": "demo", "package": " package-b "}),
+    )
+    .unwrap();
+    assert!(matches!(
+        single,
+        ToolCall::CargoCheck {
+            package: None,
+            packages: Some(ref packages),
+            ..
+        } if packages == &["package-b"]
+    ));
+
+    let multiple = ToolCall::from_tool_name(
+        "cargo_check",
+        json!({
+            "project": "demo",
+            "packages": ["package-c", " package-a ", "package-c", "package-b"]
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        multiple,
+        ToolCall::CargoCheck {
+            package: None,
+            packages: Some(ref packages),
+            ..
+        } if packages == &["package-a", "package-b", "package-c"]
+    ));
+
+    for invalid in [
+        json!({"project": "demo", "package": "package-a", "packages": ["package-b"]}),
+        json!({"project": "demo", "packages": []}),
+        json!({"project": "demo", "packages": ["   "]}),
+    ] {
+        let error = ToolCall::from_tool_name("cargo_check", invalid)
+            .expect_err("invalid package selector must fail closed");
+        assert!(error.contains("package"), "{error}");
+    }
+
+    let error = ToolCall::from_tool_name("cargo_check", json!({"project": "demo", "packages": []}))
+        .expect_err("empty package selection must fail closed");
+    assert_eq!(
+        error,
+        "invalid arguments for tool 'cargo_check': packages must contain between 1 and 32 items"
+    );
+}
+
+#[test]
 fn tool_manifest_default_flows_follow_discovery_shape() {
     for arguments in [
         json!({"tool_name": "cargo_test"}),
@@ -805,6 +956,7 @@ fn from_tool_name_parses_structured_run_process_boundaries() {
     match call {
         ToolCall::RunProcess {
             project,
+            interactive,
             executable,
             args,
             cwd,
@@ -816,6 +968,7 @@ fn from_tool_name_parses_structured_run_process_boundaries() {
         } => {
             assert_eq!(project, "demo");
             assert_eq!(executable, "git");
+            assert!(!interactive);
             assert_eq!(
                 args,
                 ["status", "--porcelain", "two words", "$(literal)"].map(str::to_string)
@@ -846,6 +999,196 @@ fn from_tool_name_parses_structured_run_process_boundaries() {
         }
         other => panic!("expected RunProcess, got {other:?}"),
     }
+}
+
+#[test]
+fn interactive_pipe_schema_is_opt_in_and_input_is_adaptive_direct() {
+    let ordinary =
+        ToolCall::from_tool_name("run_process", json!({"project":"p","executable":"python"}))
+            .unwrap();
+    assert!(matches!(
+        ordinary,
+        ToolCall::RunProcess {
+            interactive: false,
+            ..
+        }
+    ));
+    let interactive = ToolCall::from_tool_name(
+        "run_process",
+        json!({"project":"p","executable":"python","interactive":true}),
+    )
+    .unwrap();
+    assert!(matches!(
+        interactive,
+        ToolCall::RunProcess {
+            interactive: true,
+            ..
+        }
+    ));
+    let definition = crate::lookup_tool_definition("job_write_input").unwrap();
+    assert!(!definition.effect_annotations().read_only_hint);
+    assert!(definition.effect_annotations().idempotent_hint);
+    assert_eq!(definition.adaptive_runtime_direct_rank(), Some(71));
+    for field in [
+        "command",
+        "executable",
+        "runner_instance_id",
+        "pid",
+        "session_id",
+        "tty",
+    ] {
+        let mut value = json!({"project":"~p1","job_id":"exact","input_id":"same","data":"bytes"});
+        value[field] = json!("forbidden");
+        assert!(
+            ToolCall::from_tool_name("job_write_input", value).is_err(),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn process_argv_alias_is_exact_and_canonical() {
+    for name in ["run_process", "run_detached_process"] {
+        let mut base = json!({"project":"demo", "executable":"git"});
+        if name == "run_detached_process" {
+            base["idempotency_key"] = json!("exact-key");
+        }
+        let mut alias = base.clone();
+        alias["argv"] = json!(["status"]);
+        let (call, code) =
+            ToolCall::from_tool_name_with_normalization(name, alias.clone()).unwrap();
+        assert_eq!(code, Some(ToolInputNormalizationCode::ArgvToArgs));
+        assert_eq!(
+            serde_json::to_value(&call).unwrap()["params"]["args"],
+            json!(["status"])
+        );
+        assert!(serde_json::to_string(&call).unwrap().find("argv").is_none());
+
+        let mut canonical = base.clone();
+        canonical["args"] = json!(["status"]);
+        assert_eq!(
+            ToolCall::from_tool_name_with_normalization(name, canonical.clone())
+                .unwrap()
+                .1,
+            None
+        );
+        let canonical_value =
+            serde_json::to_value(ToolCall::from_tool_name(name, canonical).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&call).unwrap(), canonical_value);
+        assert_eq!(call.tool_name(), name);
+        alias["args"] = json!(["status"]);
+        assert_eq!(
+            serde_json::to_value(ToolCall::from_tool_name(name, alias.clone()).unwrap()).unwrap(),
+            canonical_value
+        );
+        assert_eq!(
+            ToolCall::from_tool_name_with_normalization(name, alias.clone())
+                .unwrap()
+                .1,
+            Some(ToolInputNormalizationCode::ArgvToArgs)
+        );
+        alias["args"] = json!(["different"]);
+        assert_eq!(
+            ToolCall::from_tool_name(name, alias).unwrap_err(),
+            "ambiguous input alias: args and argv differ"
+        );
+        for (field, value) in [("argv", json!("status")), ("arguments", json!(["status"]))] {
+            let mut invalid = base.clone();
+            invalid[field] = value;
+            assert!(
+                ToolCall::from_tool_name(name, invalid).is_err(),
+                "{name}: {field}"
+            );
+        }
+        for invalid_value in [json!(null), json!(7), json!([7]), json!({})] {
+            let mut invalid = base.clone();
+            invalid["argv"] = invalid_value.clone();
+            invalid["args"] = invalid_value;
+            assert!(
+                ToolCall::from_tool_name(name, invalid).is_err(),
+                "identical aliases do not bypass typing"
+            );
+        }
+        for field in ["timeout", "workdir", "arg", "command_args", "params"] {
+            let mut invalid = base.clone();
+            invalid[field] = json!("value");
+            assert!(
+                ToolCall::from_tool_name(name, invalid).is_err(),
+                "{name}: {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn python_is_semantic_script_language_without_interpreter_alias() {
+    let (call, code) = ToolCall::from_tool_name_with_normalization(
+        "run_script",
+        json!({
+            "project":"demo", "language":"python", "script":"print('雪')"
+        }),
+    )
+    .unwrap();
+    assert_eq!(code, None);
+    assert!(matches!(
+        call,
+        ToolCall::RunScript {
+            language: webcodex_core::runner_protocol::ShellScriptLanguage::Python,
+            ..
+        }
+    ));
+    assert!(ToolCall::from_tool_name(
+        "run_script",
+        json!({
+            "project":"demo", "language":"python3", "script":"print('x')"
+        })
+    )
+    .is_err());
+    for field in ["python_path", "interpreter", "runtime_flags"] {
+        let mut request = json!({"project":"demo", "language":"python", "script":"print('x')"});
+        request[field] = json!("--unsafe");
+        assert!(
+            ToolCall::from_tool_name("run_script", request).is_err(),
+            "{field}"
+        );
+    }
+    assert!(ToolCall::from_tool_name(
+        "run_script",
+        json!({
+            "project":"demo", "language":"python", "script":"print('x')", "command":"print('x')"
+        })
+    )
+    .is_err());
+}
+
+#[test]
+fn bash_login_requires_explicit_bash_selection() {
+    let call = ToolCall::from_tool_name(
+        "run_shell",
+        json!({
+            "project":"demo", "shell":"bash", "login":true, "command":"printf ok"
+        }),
+    )
+    .unwrap();
+    assert!(matches!(call, ToolCall::RunShell { login: true, .. }));
+    for shell in [None, Some("sh")] {
+        let mut request = json!({"project":"demo", "login":true, "command":"printf ok"});
+        if let Some(shell) = shell {
+            request["shell"] = json!(shell);
+        }
+        assert_eq!(
+            ToolCall::from_tool_name("run_shell", request).unwrap_err(),
+            "run_shell login=true requires shell=bash"
+        );
+    }
+    let default = ToolCall::from_tool_name(
+        "run_shell",
+        json!({
+            "project":"demo", "shell":"bash", "command":"printf ok"
+        }),
+    )
+    .unwrap();
+    assert!(matches!(default, ToolCall::RunShell { login: false, .. }));
 }
 
 #[test]
@@ -922,7 +1265,7 @@ fn from_tool_name_rejects_retired_inspection_tools_and_parses_retained_git_tools
 }
 
 #[test]
-fn continuation_endpoint_rotation_has_canonical_and_legacy_tool_names() {
+fn continuation_endpoint_rotation_only_retains_legacy_name_with_legacy_feature() {
     let args = json!({
         "agent_id": "wc_dagent_qqqqqqqqqqqqqqqq".to_string(),
         "host": "ChatGPT",
@@ -938,9 +1281,20 @@ fn continuation_endpoint_rotation_has_canonical_and_legacy_tool_names() {
         ToolCall::RotateAgentContinuationEndpoint { .. }
     ));
 
-    let legacy = ToolCall::from_tool_name("attach_agent_endpoint", args).unwrap();
-    assert_eq!(legacy.tool_name(), "attach_agent_endpoint");
-    assert!(matches!(legacy, ToolCall::AttachAgentEndpoint { .. }));
+    #[cfg(feature = "legacy-gpt-actions")]
+    {
+        let legacy = ToolCall::from_tool_name("attach_agent_endpoint", args).unwrap();
+        assert_eq!(legacy.tool_name(), "attach_agent_endpoint");
+        assert!(matches!(legacy, ToolCall::AttachAgentEndpoint { .. }));
+    }
+    #[cfg(not(feature = "legacy-gpt-actions"))]
+    {
+        assert!(ToolCall::from_tool_name("attach_agent_endpoint", args.clone()).is_err());
+        assert!(serde_json::from_value::<ToolCall>(
+            json!({"tool":"attach_agent_endpoint", "params":args})
+        )
+        .is_err());
+    }
 }
 
 #[test]
@@ -1022,6 +1376,23 @@ fn tool_call_project_accessor_covers_project_tool_specs() {
     )
     .unwrap();
     assert_eq!(handoff.project(), Some("agent:oe:private-drop"));
+
+    // Adapter-only handoff state keeps its exact business target but never
+    // exposes that Session through the generic recorder projection.
+    let handoff_state = ToolCall::from_tool_name(
+        "session_handoff_state",
+        json!({"session_id": "wc_sess_x", "project": "agent:oe:private-drop"}),
+    )
+    .unwrap();
+    assert_eq!(handoff_state.project(), Some("agent:oe:private-drop"));
+    assert_eq!(handoff_state.session_id(), None);
+    assert!(is_model_hidden_tool_name("session_handoff_state"));
+    assert!(runtime_tool_requires_explicit_business_session(
+        "session_handoff_state"
+    ));
+    let activity = runtime_tool_activity_semantics("session_handoff_state");
+    assert_eq!(activity.presentation.as_str(), "support");
+    assert!(!activity.interaction.is_meaningful());
 }
 
 #[test]
@@ -1040,14 +1411,21 @@ fn tool_call_session_id_accessor_covers_session_tool_specs() {
         }
         let call = ToolCall::from_tool_name(&spec.name, sample_tool_args_with_session(&spec.name))
             .unwrap_or_else(|e| panic!("{} should deserialize: {}", spec.name, e));
-        let expected = if spec.name == "list_jobs" {
-            // list_jobs.session_id is an exact metadata filter over the
-            // already-authorized Job set. It deliberately does not opt into
-            // generic Workflow Session lookup/recording, which would turn a
-            // foreign or missing filter value into an existence oracle.
-            None
-        } else {
-            Some("wc_sess_accessor")
+        let expected = match spec.name.as_str() {
+            "list_jobs" => {
+                // list_jobs.session_id is an exact metadata filter over the
+                // already-authorized Job set. It deliberately does not opt into
+                // generic Workflow Session lookup/recording, which would turn a
+                // foreign or missing filter value into an existence oracle.
+                None
+            }
+            "present_work_result" => {
+                // Work Result is Window-first. Its optional session_id is
+                // compatibility/context evidence only and must not re-enter the
+                // generic business-Session lookup or recorder projection.
+                None
+            }
+            _ => Some("wc_sess_accessor"),
         };
         assert_eq!(
             call.session_id(),
@@ -1069,7 +1447,13 @@ fn from_tool_name_unknown_tool_lists_available_tools_and_hint() {
     );
     // Should list at least a couple of known tool names.
     assert!(err.contains("show_changes"));
-    assert!(err.contains("apply_unified_diff"));
+    assert!(err.contains("edit_project_files"));
+    for hidden in EXACT_MANIFEST_SPECIALIST_TOOL_NAMES {
+        assert!(
+            !err.contains(hidden),
+            "ordinary unknown-tool hints must not advertise hidden specialist {hidden}: {err}"
+        );
+    }
     // Must not leak secret/config artifacts.
     let lower = err.to_lowercase();
     for forbidden in [
@@ -1742,6 +2126,64 @@ fn observe_jobs_wake_policy_defaults_and_validates() {
     }
 }
 
+#[test]
+fn observe_jobs_compact_ref_selector_is_additive_and_unambiguous() {
+    let raw = ToolCall::from_tool_name(
+        "observe_jobs",
+        json!({
+            "items": [{
+                "job_id": "wc_job_example",
+                "after_observation_token": "wj3_example"
+            }],
+            "summary_only": true
+        }),
+    )
+    .expect("classic observe_jobs path must remain supported");
+    assert!(matches!(
+        raw,
+        ToolCall::ObserveJobs {
+            summary_only: true,
+            ..
+        }
+    ));
+
+    let compact = ToolCall::from_tool_name(
+        "observe_jobs",
+        json!({"items": [{"observation_ref": "~j12"}]}),
+    )
+    .expect("compact observation_ref path must parse");
+    let ToolCall::ObserveJobs { items, .. } = compact else {
+        panic!("expected observe_jobs");
+    };
+    assert_eq!(items.len(), 1);
+    assert!(items[0].job_id.is_empty());
+    assert_eq!(items[0].observation_ref.as_deref(), Some("~j12"));
+    assert!(items[0].after_observation_token.is_none());
+
+    for invalid in [
+        json!({"items": [{}]}),
+        json!({"items": [{"job_id": "job", "observation_ref": "~j1"}]}),
+        json!({"items": [{"observation_ref": "~j1", "after_observation_token": "wj3_x"}]}),
+        json!({"items": [{"observation_ref": "j1"}]}),
+        json!({"items": [{"observation_ref": "~j2"}, {"observation_ref": "~j2"}]}),
+    ] {
+        assert!(
+            ToolCall::from_tool_name("observe_jobs", invalid).is_err(),
+            "ambiguous/invalid compact selector must fail closed"
+        );
+    }
+
+    let schema = crate::input_schema_for_tool("observe_jobs");
+    let branches = schema["properties"]["items"]["items"]["oneOf"]
+        .as_array()
+        .expect("observe_jobs item schema must expose selector oneOf");
+    assert_eq!(branches.len(), 2);
+    assert_eq!(branches[0]["required"], json!(["job_id"]));
+    assert_eq!(branches[1]["required"], json!(["observation_ref"]));
+    assert_eq!(branches[0]["additionalProperties"], false);
+    assert_eq!(branches[1]["additionalProperties"], false);
+}
+
 #[cfg(feature = "experimental-code-mode")]
 #[test]
 fn code_mode_exec_parses_outer_authority() {
@@ -1818,6 +2260,71 @@ fn retired_start_coding_task_is_a_canonical_unknown_tool() {
 }
 
 #[test]
+fn present_agent_continuation_parses_ref_or_explicit_tuple_without_session() {
+    assert!(!registered_tool_specs()
+        .iter()
+        .any(|spec| spec.name == "present_agent_continuation"));
+    let schema = input_schema_for_tool("present_agent_continuation");
+    let properties = schema["properties"].as_object().unwrap();
+    assert!(properties.contains_key("agent_continuation_ref"));
+    assert!(properties.contains_key("agent_id"));
+    if let Some(fields) = schema["required"].as_array() {
+        for field in fields {
+            assert!(
+                field != "agent_id"
+                    && field != "endpoint_id"
+                    && field != "expected_controller_generation"
+                    && field != "agent_continuation_ref",
+                "present_agent_continuation must accept either selector form"
+            );
+        }
+    }
+    let schema_text = schema.to_string();
+    assert!(schema_text.contains(crate::AGENT_CONTINUATION_REF_PATTERN));
+
+    let by_ref = ToolCall::from_tool_name(
+        "present_agent_continuation",
+        json!({"agent_continuation_ref": "~ac1"}),
+    )
+    .unwrap();
+    assert!(matches!(
+        by_ref,
+        ToolCall::PresentAgentContinuation {
+            agent_continuation_ref: Some(ref selector),
+            agent_id: None,
+            endpoint_id: None,
+            expected_controller_generation: None,
+        } if selector == "~ac1"
+    ));
+    let by_tuple = ToolCall::from_tool_name(
+        "present_agent_continuation",
+        json!({
+            "agent_id": "wc_dagent_qqqqqqqqqqqqqqqq",
+            "endpoint_id": "wc_endpoint_u7u7u7u7u7u7u7u7",
+            "expected_controller_generation": 1
+        }),
+    )
+    .unwrap();
+    assert!(matches!(
+        by_tuple,
+        ToolCall::PresentAgentContinuation {
+            agent_continuation_ref: None,
+            agent_id: Some(_),
+            endpoint_id: Some(_),
+            expected_controller_generation: Some(1),
+        }
+    ));
+    assert!(ToolCall::from_tool_name(
+        "present_agent_continuation",
+        json!({
+            "agent_continuation_ref": "~ac1",
+            "session_id": "wc_sess_0123456789abcdef0123456789abcdef"
+        }),
+    )
+    .is_err());
+}
+
+#[test]
 fn agent_continuation_bind_requires_view_fence() {
     let binding_id = format!("wc_host_binding_{}", "a0".repeat(16));
     let mut args = json!({
@@ -1870,32 +2377,33 @@ fn job_terminal_continuation_calls_require_explicit_wait_and_private_view_fence(
 
 #[test]
 fn guidance_profile_defaults_and_schema_follow_compiled_availability() {
-    use crate::tool_inputs::CodingGuidanceProfile;
     let base = json!({"project": "agent:profile:demo", "instruction": "inspect the project"});
     let default = ToolCall::from_tool_name("work_on_project", base.clone()).unwrap();
     assert!(matches!(
         default,
         ToolCall::WorkOnProject {
-            guidance_profile: CodingGuidanceProfile::Direct,
+            guidance_profile: None,
             ..
         }
     ));
     let schema = crate::request_schema::input_schema_for_tool("work_on_project");
     let property = &schema["properties"]["guidance_profile"];
-    assert_eq!(property["default"], "direct");
+    assert!(property.get("default").is_none());
     assert!(!schema["required"]
         .as_array()
         .unwrap()
         .contains(&json!("guidance_profile")));
-    let mut profiles = vec!["direct"];
+    let mut profiles = vec!["direct", "host_code_mode"];
     if cfg!(feature = "experimental-code-mode") {
         profiles.push("code_mode");
     }
-    assert_eq!(property["enum"], json!(profiles));
+    assert_eq!(property["enum"], json!(profiles), "{property}");
     let output_schema = output_schema_for_tool("work_on_project");
-    assert!(output_schema["properties"]["output"]["properties"]
+    let output_properties = output_schema["properties"]["output"]["properties"]
         .as_object()
-        .is_some_and(|properties| !properties.contains_key("workflow")));
+        .unwrap();
+    assert!(!output_properties.contains_key("workflow"));
+    assert!(output_properties.contains_key("goal_context"));
     for profile in profiles {
         let mut args = base.clone();
         args["guidance_profile"] = json!(profile);
@@ -1915,6 +2423,47 @@ fn guidance_profile_defaults_and_schema_follow_compiled_availability() {
     }
 }
 
+#[test]
+fn current_window_activity_has_no_model_supplied_window_selector() {
+    let input = crate::request_schema::input_schema_for_tool("current_window_activity");
+    let properties = input["properties"].as_object().unwrap();
+    assert!(properties.contains_key("limit"));
+    assert!(properties.contains_key("include_nonmeaningful"));
+    assert!(!properties.contains_key("client_window_key"));
+    assert!(!properties.contains_key("window"));
+    assert!(ToolCall::from_tool_name(
+        "current_window_activity",
+        json!({
+            "client_window_key": "foreign"
+        })
+    )
+    .is_err());
+    assert_eq!(
+        ToolCall::from_tool_name("current_window_activity", json!({"limit":20}))
+            .unwrap()
+            .tool_name(),
+        "current_window_activity"
+    );
+}
+
+#[test]
+fn current_window_activity_description_keeps_timing_factual_and_overlap_explicit() {
+    let spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "current_window_activity")
+        .expect("current_window_activity ToolSpec");
+    let description = spec.description.as_str();
+    for phrase in [
+        "WebCodex-observed request timing only",
+        "gap threshold counts are cumulative",
+        "short gaps never prove Host cells",
+        "window_transition_kind=overlap",
+        "never inferred from gap duration",
+    ] {
+        assert!(description.contains(phrase), "{phrase}: {description}");
+    }
+}
+
 #[cfg(not(feature = "experimental-code-mode"))]
 #[test]
 fn guidance_profile_code_mode_fails_closed_when_feature_is_unavailable() {
@@ -1924,5 +2473,70 @@ fn guidance_profile_code_mode_fails_closed_when_feature_is_unavailable() {
     assert!(
         error.contains("code_mode") && error.contains("direct"),
         "{error}"
+    );
+}
+
+#[test]
+fn external_observation_contract_uses_explicit_identities_and_no_raw_payload() {
+    let mut value = json!({"project":"agent:r:p", "session_id":format!("wc_sess_{}","1".repeat(32)),
+        "adapter_id":"a".repeat(64),"event_id":"b".repeat(64),"observed_tool":"Bash"});
+    let call = ToolCall::from_tool_name("record_external_observation", value.clone()).unwrap();
+    assert_eq!(call.project(), Some("agent:r:p"));
+    assert_eq!(call.session_id(), None);
+    assert!(matches!(
+        call,
+        ToolCall::RecordExternalObservation {
+            exit_code: None,
+            ..
+        }
+    ));
+    value["command"] = json!("must not be accepted");
+    assert!(ToolCall::from_tool_name("record_external_observation", value).is_err());
+    assert!(!crate::is_model_visible_tool_name(
+        "record_external_observation"
+    ));
+    assert!(crate::is_model_visible_tool_name(
+        "list_external_observations"
+    ));
+    assert!(registered_tool_specs()
+        .into_iter()
+        .all(|spec| spec.name != "record_external_observation"));
+
+    for name in ["record_external_observation", "list_external_observations"] {
+        let activity = crate::runtime_tool_activity_semantics(name);
+        assert_eq!(activity.presentation.as_str(), "support");
+        assert!(!activity.interaction.is_meaningful());
+    }
+
+    let list_spec = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "list_external_observations")
+        .unwrap();
+    for field in ["session_id", "project"] {
+        assert!(list_spec.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(field)));
+    }
+
+    let record_schema = crate::registry::output_schema_for_tool("record_external_observation");
+    let record_output = &record_schema["properties"]["output"]["properties"];
+    let observation = &record_output["observation"];
+    assert_eq!(observation["additionalProperties"], false);
+    assert_eq!(
+        observation["properties"]["status"]["enum"],
+        json!(["unknown", "reported_success", "reported_failure"])
+    );
+
+    let list_output = &list_spec.output_schema["properties"]["output"]["properties"];
+    let observations = &list_output["observations"];
+    assert_eq!(observations["maxItems"], 256);
+    assert_eq!(observations["items"]["additionalProperties"], false);
+    let coverage = &list_output["coverage"];
+    assert_eq!(coverage["additionalProperties"], false);
+    assert_eq!(coverage["properties"]["complete"]["const"], false);
+    assert_eq!(
+        coverage["properties"]["reason"]["enum"],
+        json!(["source_sequence_unavailable"])
     );
 }

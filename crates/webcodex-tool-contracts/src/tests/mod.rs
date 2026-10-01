@@ -63,6 +63,7 @@ mod computer_schemas;
 mod definitions;
 mod edit_schemas;
 mod identifier_schemas;
+mod input_normalization;
 mod input_schemas;
 mod metadata_policy;
 mod migration_contracts;
@@ -72,3 +73,5 @@ mod registry_specs;
 mod tool_call_contracts;
 mod tool_call_test_support;
 mod typed_output_schemas;
+
+mod schema_samples;

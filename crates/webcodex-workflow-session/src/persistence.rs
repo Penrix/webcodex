@@ -17,10 +17,10 @@ use super::events::{
 };
 use super::model::{
     ColdSessionRecord, PersistedSessionLedger, PersistedSessionRecord, SessionEvent, SessionGuards,
-    SessionMessage, SessionRecord, StoredSession, DEFAULT_MAX_MESSAGES_PER_SESSION,
-    EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS,
-    MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS,
-    SESSION_LEDGER_VERSION,
+    SessionLifecycle, SessionMessage, SessionRecord, StoredSession,
+    DEFAULT_MAX_MESSAGES_PER_SESSION, EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS,
+    MAX_INPUT_ARRAY_ITEMS, MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_CHARS,
+    MAX_MESSAGE_RESOLUTION_CHARS, SESSION_LEDGER_VERSION,
 };
 use super::query::{is_valid_completion_id, validate_message_tags};
 use super::util::{
@@ -98,6 +98,7 @@ impl PersistedSessionRecord {
             updated_at: record.updated_at,
             events,
             messages,
+            message_delivery_replays: record.message_delivery_replays.clone(),
             events_observed: record.events_observed,
             legacy_context_revision: None,
             git_baseline_tree: record.git_baseline_tree.clone(),
@@ -145,6 +146,7 @@ impl PersistedSessionRecord {
                 .iter()
                 .eq(record.materialized_validation_job_ids.iter())
             && self.message_observation_revision == record.message_observation_revision
+            && self.message_delivery_replays == record.message_delivery_replays
             && self.message_observation_floor == record.message_observation_floor
             && self.message_observation_revisions == record.message_observation_revisions
             && self.assignment_history_floors == record.assignment_history_floors
@@ -234,6 +236,16 @@ impl PersistedSessionRecord {
             .iter()
             .map(|message| message.message_id.clone())
             .collect::<HashSet<_>>();
+        let message_delivery_replays = self
+            .message_delivery_replays
+            .into_iter()
+            .filter(|(scope_key, replay)| {
+                is_lower_hex_sha256(scope_key.split_once(':').map_or("", |(scope, _)| scope))
+                    && is_lower_hex_sha256(scope_key.split_once(':').map_or("", |(_, key)| key))
+                    && is_lower_hex_sha256(&replay.payload_fingerprint)
+                    && retained_message_ids.contains(&replay.message_id)
+            })
+            .collect();
         let current_observation_revision = self.message_observation_revision;
         let mut observation_floor = self
             .message_observation_floor
@@ -393,6 +405,7 @@ impl PersistedSessionRecord {
             repository_edit_observed: self.repository_edit_observed,
             materialized_validation_job_ids,
             messages,
+            message_delivery_replays,
             project_instructions: None,
             message_observation_revision: current_observation_revision,
             message_observation_floor: observation_floor,
@@ -484,6 +497,7 @@ pub struct RestoredSessionLedger {
     pub sessions: HashMap<String, StoredSession>,
     pub lru: VecDeque<String>,
     pub restored_sessions: usize,
+    pub capacity_evictions: u64,
     pub last_persist_error: Option<String>,
 }
 
@@ -493,6 +507,7 @@ impl RestoredSessionLedger {
             sessions: HashMap::new(),
             lru: VecDeque::new(),
             restored_sessions: 0,
+            capacity_evictions: 0,
             last_persist_error,
         }
     }
@@ -500,7 +515,7 @@ impl RestoredSessionLedger {
 
 pub fn load_persisted_ledger(
     path: &PathBuf,
-    max_sessions: usize,
+    historical_session_retention_limit: usize,
     max_events_per_session: usize,
 ) -> RestoredSessionLedger {
     let content = match fs::read_to_string(path) {
@@ -577,9 +592,22 @@ pub fn load_persisted_ledger(
         })
         .collect();
     records.sort_by_key(StoredSession::updated_at);
-    while records.len() > max_sessions {
-        records.remove(0);
-    }
+
+    let closed_count = records
+        .iter()
+        .filter(|record| record.lifecycle() == SessionLifecycle::Closed)
+        .count();
+    let closed_to_prune = closed_count.saturating_sub(historical_session_retention_limit);
+    let mut pruned_closed = 0usize;
+    records.retain(|record| {
+        if pruned_closed < closed_to_prune && record.lifecycle() == SessionLifecycle::Closed {
+            pruned_closed += 1;
+            false
+        } else {
+            true
+        }
+    });
+
     let mut sessions = HashMap::new();
     let mut lru = VecDeque::new();
     for record in records {
@@ -593,6 +621,7 @@ pub fn load_persisted_ledger(
         sessions,
         lru,
         restored_sessions,
+        capacity_evictions: pruned_closed as u64,
         last_persist_error: None,
     }
 }
@@ -813,12 +842,12 @@ pub fn sanitize_persisted_message(
             }
         }
     }
-    message.completion_id = message.completion_id.and_then(|completion_id| {
+    message.completion_id = message.completion_id.map(|completion_id| {
         let completion_id = completion_id.trim().to_ascii_lowercase();
         if is_valid_completion_id(&completion_id) {
-            Some(completion_id)
+            completion_id
         } else {
-            Some("invalid".to_string())
+            "invalid".to_string()
         }
     });
     message.resolution = message

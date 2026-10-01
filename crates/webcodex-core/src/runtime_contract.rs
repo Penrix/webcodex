@@ -26,13 +26,13 @@ pub const DEFAULT_OBSERVE_JOBS_TAIL_LINES: usize = 40;
 /// This is intentionally separate from execution timeouts and initial
 /// synchronous handoff grace budgets.
 pub const MAX_JOB_OBSERVATION_WAIT_SECS: u64 = 100;
-/// Model-facing continuation wait kept below common MCP Host call deadlines.
-/// Runtime still accepts waits up to MAX_JOB_OBSERVATION_WAIT_SECS.
-pub const MODEL_JOB_CONTINUATION_WAIT_SECS: u64 = 55;
-/// Keep initial structured-execution handoff grace under the same Host-safe
-/// model-facing wait budget. This does not shorten the execution timeout; work
-/// past this grace continues as the same durable Job.
-pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = MODEL_JOB_CONTINUATION_WAIT_SECS;
+/// Historical transport-agnostic suggested Job observation wait. MCP adapters
+/// may further normalize this to the configured Host timing policy.
+pub const DEFAULT_JOB_CONTINUATION_WAIT_SECS: u64 = 55;
+/// Intrinsic structured-execution synchronous-grace ceiling. This is a runtime
+/// capability bound, not an MCP Host deadline; MCP transport applies a separate
+/// Server-side clamp before dispatch.
+pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = 60;
 
 pub const MAX_SKILL_LIST_LIMIT: usize = 64;
 pub const MAX_SKILL_QUERY_CHARS: usize = 200;
@@ -59,6 +59,32 @@ pub const RECOVERY_KIND_VALUES: [&str; 7] = [
     "user_action",
     "none",
 ];
+
+pub const GENERATED_FOLLOW_UP_KIND_VALUES: [&str; 2] =
+    ["mechanically_followable", "fallback_recovery"];
+
+/// Host-facing execution posture for a server-generated parser-ready tool call.
+///
+/// MechanicallyFollowable means the Server has already resolved the semantic
+/// choice needed for this exact follow-up, for example deterministic paging.
+/// FallbackRecovery means the call is available only as an explicit recovery,
+/// detail, or blocked-dependency path and must not be auto-followed merely
+/// because it is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedFollowUpKind {
+    MechanicallyFollowable,
+    FallbackRecovery,
+}
+
+impl GeneratedFollowUpKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MechanicallyFollowable => "mechanically_followable",
+            Self::FallbackRecovery => "fallback_recovery",
+        }
+    }
+}
 
 /// Closed model-facing vocabulary for continuing successful or partial
 /// observations. This is deliberately separate from failure recovery,
@@ -137,9 +163,11 @@ impl ContinuationSemantics {
 }
 
 pub const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
-pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 15;
-pub const BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS: usize = 8;
-
+pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 28;
+/// Ergonomic regression targets for built-in model guidance. These are not
+/// wire/schema limits; the serialized startup budget remains the hard bound.
+pub const BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEMS: usize = 8;
+pub const BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEM_CHARS: usize = 320;
 /// Validate a Runner project path without applying host-local filesystem semantics.
 /// The Server may route to an agent on another OS, so both POSIX and Windows
 /// absolute-path shapes are accepted; the Runner remains authoritative for

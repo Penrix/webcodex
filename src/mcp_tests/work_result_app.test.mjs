@@ -2,51 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { app, flush, toolResult } from "./app_test_support.mjs";
 
-const project = "agent:special:demo";
-const session_id = `wc_sess_${"1".repeat(32)}`;
-const input = { project, session_id };
-const baseState = {
-  version: 1,
-  project,
-  session_id,
-  state_version: `wr1_${"a".repeat(64)}`,
-  workspace: {
-    git_available: true,
-    clean: false,
-    branch: "feature/work",
-    counts: {
-      modified: 1, added: 0, deleted: 0, renamed: 0, copied: 0,
-      untracked: 0, conflicted: 0, staged: 0, unstaged: 1,
-    },
-    files_total: 1,
-    files: [{ path: "src/a.rs", status: "modified", kind: "tracked", staged: false, unstaged: true, additions: 4, deletions: 1 }],
-    additions: 4,
-    deletions: 1,
-    line_stats_partial: false,
-    truncated: false,
-  },
-  validation: {
-    status: "passed", latest_status: "passed", current_status: "passed", history_partial: false,
-    successes: 3, failures: 0, unresolved_failures: 0, evidence_gaps: 0,
-  },
-  review: {
-    available: true, total: 1, history_partial: false, read_only_inspection_count: 0, search_count: 0,
-    diff_review_count: 1, workspace_review_count: 1, hygiene_review_count: 0,
-    tools: ["show_changes"],
-  },
-  session: {
-    lifecycle: "active", events_total: 7, events_returned: 7, history_partial: false,
-    updated_at: 1789812000, title: "Work Result test",
-    latest_activity: {
-      tool: "show_changes", kind: "tool_call_finished", timestamp: 1789812000,
-      status: "completed", duration_ms: 42,
-    },
-  },
-};
+import { project, session_id, input, baseState } from "./work_result_app_fixture.mjs";
 
 const nextState = {
   ...baseState,
-  state_version: `wr1_${"b".repeat(64)}`,
+  state_version: `wr2_${"b".repeat(64)}`,
   workspace: {
     ...baseState.workspace,
     clean: true,
@@ -79,7 +39,339 @@ const nextState = {
       status: "completed", duration_ms: 730,
     },
   },
+  activity: {
+    ...baseState.activity,
+    active: true,
+    current: { label: "Running checks", kind: "test", started_at_ms: 1789812010000 },
+    last: { label: "Edited code", kind: "edit", at_ms: 1789812009000 },
+    last_meaningful_activity_at_ms: 1789812009000,
+  },
+  window_activity: {
+    ...baseState.window_activity,
+    active: true,
+    active_requests: [{ label: "Running checks", kind: "test", started_at_ms: 1789812010000 }],
+    events_returned: 3,
+    events_observed: 3,
+    last_activity_at_ms: 1789812010000,
+    events: [
+      { label: "Edited code", kind: "edit", status: "success", meaningful: true, started_at_ms: 1789812008000, ended_at_ms: 1789812009000, duration_ms: 1000 },
+      ...baseState.window_activity.events,
+    ],
+  },
 };
+
+function contentOnly(result) {
+  return { content: [{ type: "text", text: JSON.stringify(result.structuredContent) }] };
+}
+
+function privateOnly(result) {
+  return { _meta: { "webcodex/workResult": result.structuredContent } };
+}
+
+test("initial private Work Result fallback renders when Host omits structuredContent", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  await view.initialize();
+  view.notification("ui/notifications/tool-result", privateOnly(toolResult({ work_result: baseState })));
+  await flush();
+  assert.equal(view.nodes.taskTitle.textContent, "Work Result test");
+  assert.equal(view.nodes.badge.textContent, "Waiting");
+  assert.equal(view.nodes.refresh.disabled, false);
+  assert.equal(view.calls("work_result_state").length, 0);
+});
+test("Window card renders and refreshes before any Workflow Session exists", async () => {
+  const windowOnlyState = {
+    version: 2,
+    project,
+    state_version: `wr2_${"7".repeat(64)}`,
+    window: baseState.window,
+    workspace: baseState.workspace,
+    activity: baseState.activity,
+    window_activity: baseState.window_activity,
+    collaboration: { available: false, can_send: false, messages: [] },
+  };
+  const view = app("mcp_work_result_app.html");
+  view.toolInput({ project });
+  view.toolResult({ work_result: windowOnlyState });
+  await view.initialize();
+  assert.equal(view.nodes.taskTitle.textContent, "WebCodex activity");
+  assert.equal(view.nodes.projectIdentity.textContent, "Project · " + project);
+  assert.equal(view.nodes.windowIdentity.textContent, "Window · " + "f".repeat(64));
+  assert.equal(view.nodes.sessionIdentity.textContent, "Session · not linked yet");
+  assert.equal(view.nodes.windowSource.textContent, "Source · mcp");
+  assert.equal(view.nodes.windowCoverage.textContent, "2 observed events");
+  assert.equal(view.nodes.windowActivity.children.length, 2);
+  assert.equal(view.nodes.collaborationMeta.textContent, "");
+  assert.equal(view.nodes.messageInput.disabled, true);
+  assert.equal(view.timers.size, 1);
+  await view.fireTimers(10000);
+  assert.equal(view.calls("work_result_state").length, 1);
+  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, { project });
+});
+
+test("missing initial machine result recovers once through app-only content fallback", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  await view.initialize();
+  view.notification("ui/notifications/tool-result", {
+    content: [{ type: "text", text: "WebCodex tool completed successfully." }],
+  });
+  await flush();
+  assert.notEqual(view.nodes.status.textContent, "This task card is unavailable");
+  assert.equal(view.calls("work_result_state").length, 1);
+  await view.reply(view.calls("work_result_state")[0], contentOnly(toolResult({ work_result: baseState })));
+  assert.equal(view.nodes.taskTitle.textContent, "Work Result test");
+  assert.equal(view.nodes.refresh.disabled, false);
+  assert.match(view.nodes.status.textContent, /Updated|Up to date|Live/);
+});
+
+test("Activity stays focused while Results exposes live files", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: baseState });
+  await view.initialize();
+  assert.equal(view.nodes.taskTitle.textContent, "Work Result test");
+  assert.equal(view.nodes.activityStatus.textContent, "Reviewed changes");
+  assert.doesNotMatch(view.nodes.activityStatus.textContent, /show_changes|session event/i);
+  assert.equal(view.nodes.windowCoverage.textContent, "2 observed events");
+  assert.equal(view.nodes.windowActivity.children.length, 2);
+  assert.equal(view.nodes.panelResults.hidden, true);
+  assert.match(view.nodes.workspaceFiles.children[0].children[0].textContent, /src\/a.rs/);
+  assert.equal(view.nodes.collaborationMeta.textContent, "");
+});
+
+test("recent inactive work keeps the lightweight last-active state before the idle threshold", async () => {
+  const quietState = {
+    ...baseState,
+    state_version: `wr2_${"c".repeat(64)}`,
+    activity: {
+      ...baseState.activity,
+      last: { label: "Edited code", kind: "edit", at_ms: 1_999_999_990_000 },
+      last_meaningful_activity_at_ms: 1_999_999_990_000,
+    },
+  };
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: quietState });
+  await view.initialize();
+  assert.equal(view.nodes.activityStatus.textContent, "Edited code");
+  assert.equal(view.nodes.activityAge.textContent, "Last active 10s ago");
+  assert.equal(view.nodes.badge.textContent, "Waiting");
+});
+
+test("inactive work becomes explicitly idle from local wall-clock time while preserving the last semantic activity", async () => {
+  const idleState = {
+    ...baseState,
+    state_version: `wr2_${"f".repeat(64)}`,
+    activity: {
+      ...baseState.activity,
+      last: { label: "Ran checks", kind: "test", at_ms: 1_999_999_820_000 },
+      last_meaningful_activity_at_ms: 1_999_999_820_000,
+    },
+  };
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: idleState });
+  await view.initialize();
+  assert.equal(view.nodes.badge.textContent, "Idle");
+  assert.equal(view.nodes.activityStatus.textContent, "No WebCodex activity");
+  assert.equal(view.nodes.activityDetail.textContent, "Last activity: Ran checks");
+  assert.equal(view.nodes.activityAge.textContent, "Idle for 3m");
+});
+
+test("missing meaningful activity time waits without inventing an idle age", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: {
+    ...baseState,
+    activity: { ...baseState.activity, last: null, last_meaningful_activity_at_ms: null },
+  } });
+  await view.initialize();
+  assert.equal(view.nodes.badge.textContent, "Waiting");
+  assert.equal(view.nodes.activityStatus.textContent, "Waiting for WebCodex activity");
+  assert.equal(view.nodes.activityAge.textContent, "");
+});
+
+test("internal validation or Session lifecycle does not override Window idle truth", async () => {
+  const idleActivity = {
+    ...baseState.activity,
+    last: { label: "Ran checks", kind: "test", at_ms: 1_999_999_820_000 },
+    last_activity_at_ms: 1_999_999_820_000,
+    last_meaningful_activity_at_ms: 1_999_999_820_000,
+  };
+  for (const state of [
+    { ...baseState, activity: idleActivity, validation: { ...baseState.validation, current_status: "failed", unresolved_failures: 1, failures: 1 } },
+    { ...baseState, activity: idleActivity, session: { ...baseState.session, lifecycle: "closed" } },
+  ]) {
+    const view = app("mcp_work_result_app.html");
+    view.toolResult({ work_result: state });
+    await view.initialize();
+    assert.equal(view.nodes.badge.textContent, "Idle");
+    assert.equal(view.nodes.activityStatus.textContent, "No WebCodex activity");
+  }
+});
+
+test("unchanged state_version refresh still advances wall-clock idle copy without server mutation", async () => {
+  const recent = {
+    ...baseState,
+    activity: {
+      ...baseState.activity,
+      last: { label: "Reviewed changes", kind: "review", at_ms: 1_999_999_950_000 },
+      last_meaningful_activity_at_ms: 1_999_999_950_000,
+    },
+  };
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: recent });
+  await view.initialize();
+  assert.equal(view.nodes.badge.textContent, "Waiting");
+  view.advanceTime(20_000);
+  view.nodes.refresh.onclick();
+  await flush();
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: recent }));
+  assert.equal(view.nodes.badge.textContent, "Idle");
+  assert.equal(view.nodes.activityStatus.textContent, "No WebCodex activity");
+  assert.equal(view.nodes.activityAge.textContent, "Idle for 1m");
+});
+
+test("Window messages render sender delivery state but not inbound peer delivery state", async () => {
+  const messageState = {
+    ...baseState,
+    state_version: `wr2_${"d".repeat(64)}`,
+    collaboration: {
+      available: true,
+      can_send: true,
+      messages: [
+        { message_id: "wc_msg_sent", created_at_ms: 1_999_999_997_000, message: "sent", source: "operator", direction: "inbound", requires_ack: true, first_projected_at_ms: null, first_ack_observed_at_ms: null },
+        { message_id: "wc_msg_seen", created_at_ms: 1_999_999_998_000, message: "seen", source: "operator", direction: "inbound", requires_ack: true, first_projected_at_ms: 1_999_999_999_000, first_ack_observed_at_ms: null },
+        { message_id: "wc_msg_handled", created_at_ms: 1_999_999_999_000, message: "acknowledged", source: "operator", direction: "inbound", requires_ack: true, first_projected_at_ms: 1_999_999_999_000, first_ack_observed_at_ms: 2_000_000_000_000 },
+        { message_id: "wc_msg_window_reply", created_at_ms: 1_999_999_999_500, message: "window reply", source: "window", direction: "outbound", reply_to_message_id: "wc_msg_handled", requires_ack: false, first_projected_at_ms: null, first_ack_observed_at_ms: null },
+        { message_id: "wc_msg_peer_in", created_at_ms: 2_000_000_000_000, message: "peer inbound", source: "peer", direction: "inbound", peer_id: `wc_peer_${"2".repeat(32)}`, requires_ack: false, first_projected_at_ms: 2_000_000_000_000, first_ack_observed_at_ms: null },
+        { message_id: "wc_msg_peer_out", created_at_ms: 2_000_000_001_000, message: "peer outbound", source: "peer", direction: "outbound", peer_id: `wc_peer_${"3".repeat(32)}`, requires_ack: false, first_projected_at_ms: 2_000_000_001_000, first_ack_observed_at_ms: null },
+      ],
+    },
+  };
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: messageState });
+  await view.initialize();
+  const rows = view.nodes.messages.children;
+  const lastMeta = row => row.children[1].children.at(-1).textContent;
+  assert.equal(lastMeta(rows[0]), "Saved");
+  assert.equal(lastMeta(rows[1]), "Included in tool result");
+  assert.equal(lastMeta(rows[2]), "Acknowledged");
+  assert.doesNotMatch(lastMeta(rows[3]), /Saved|Included in tool result|Acknowledged/);
+  assert.equal(rows[3].children[1].children[0].textContent, "This Window");
+  assert.doesNotMatch(lastMeta(rows[4]), /Saved|Included in tool result|Acknowledged/);
+  assert.equal(lastMeta(rows[5]), "Included in tool result");
+});
+
+test("card composer retries uncertain delivery with the same payload across context changes", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: baseState });
+  await view.initialize();
+  view.nodes.messageInput.value = "Use the existing retry mechanism.";
+  view.nodes.messageInput.oninput();
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  assert.equal(view.calls("work_result_send_message").length, 1);
+  const first = view.calls("work_result_send_message")[0];
+  assert.equal(first.params.arguments.project, project);
+  assert.equal(first.params.arguments.session_id, session_id);
+  assert.equal(first.params.arguments.message, "Use the existing retry mechanism.");
+  assert.match(first.params.arguments.delivery_key, /^wrc_[0-9a-f]{32}$/);
+
+  await view.fireTimers(10000);
+  assert.match(view.nodes.composerState.textContent, /status unknown/);
+  const changedContext = { ...baseState, session_id: `wc_sess_${"2".repeat(32)}`, state_version: `wr2_${"9".repeat(64)}` };
+  view.toolResult({ work_result: changedContext });
+  await flush();
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  assert.equal(view.calls("work_result_send_message").length, 2);
+  const second = view.calls("work_result_send_message")[1];
+  assert.deepEqual(second.params.arguments, first.params.arguments);
+
+  await view.reply(second, contentOnly(toolResult({
+    success: true,
+    session_id,
+    message_id: "wc_msg_card",
+    replayed: true,
+    state_changed: false,
+  })));
+  assert.equal(view.calls("work_result_state").length, 1);
+  const refreshed = {
+    ...baseState,
+    state_version: `wr2_${"e".repeat(64)}`,
+    collaboration: {
+      available: true,
+      can_send: true,
+      messages: [
+        { message_id: "wc_msg_card", created_at_ms: 2_000_000_000_000, message: "Use the existing retry mechanism.", source: "operator", direction: "inbound", requires_ack: true, first_projected_at_ms: null, first_ack_observed_at_ms: null },
+      ],
+    },
+  };
+  await view.reply(view.calls("work_result_state")[0], contentOnly(toolResult({ work_result: refreshed })));
+  assert.equal(view.nodes.messageInput.value, "");
+  assert.equal(view.nodes.messages.children[0].children[1].children.at(-1).textContent, "Saved");
+});
+
+test("card conflict is deterministic and the next explicit send gets a new delivery key", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: baseState });
+  await view.initialize();
+  view.nodes.messageInput.value = "Keep conflict draft";
+  view.nodes.messageInput.oninput();
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  const first = view.calls("work_result_send_message")[0];
+  await view.reply(first, { structuredContent: { success: false, output: { failure_kind: "conflict", error_kind: "delivery_key_conflict", state_changed: false }, error: "delivery_key_conflict" } });
+  assert.equal(view.nodes.messageInput.value, "Keep conflict draft");
+  assert.equal(view.nodes.sendMessage.textContent, "Send");
+  assert.equal(view.nodes.composerState.textContent, "Message could not be sent");
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  const second = view.calls("work_result_send_message")[1];
+  assert.notEqual(second.params.arguments.delivery_key, first.params.arguments.delivery_key);
+});
+
+test("card invalid context preserves the draft and rebuilds payload on the next explicit send", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: baseState });
+  await view.initialize();
+  view.nodes.messageInput.value = "Keep context draft";
+  view.nodes.messageInput.oninput();
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  const first = view.calls("work_result_send_message")[0];
+  await view.reply(first, { structuredContent: { success: false, output: { failure_kind: "invalid_context", error_kind: "session_context_unlinked", state_changed: false }, error: "Session context is not explicitly linked to this Window" } });
+  assert.equal(view.nodes.messageInput.value, "Keep context draft");
+  assert.equal(view.nodes.composerState.textContent, "Context is no longer available");
+  const replacement = { ...baseState, session_id: `wc_sess_${"4".repeat(32)}`, state_version: `wr2_${"4".repeat(64)}` };
+  view.toolResult({ work_result: replacement });
+  await flush();
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  const second = view.calls("work_result_send_message")[1];
+  assert.notEqual(second.params.arguments.delivery_key, first.params.arguments.delivery_key);
+  assert.equal(second.params.arguments.session_id, replacement.session_id);
+});
+
+test("card sends normally before a Session exists", async () => {
+  const windowOnly = { ...baseState, state_version: `wr2_${"5".repeat(64)}` };
+  delete windowOnly.session_id;
+  delete windowOnly.session;
+  const view = app("mcp_work_result_app.html");
+  view.toolInput({ project });
+  view.toolResult({ work_result: windowOnly });
+  await view.initialize();
+  view.nodes.messageInput.value = "Window only";
+  view.nodes.messageInput.oninput();
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  const sendCall = view.calls("work_result_send_message")[0];
+  assert.equal(sendCall.params.arguments.project, project);
+  assert.equal(sendCall.params.arguments.message, "Window only");
+  assert.equal(Object.prototype.hasOwnProperty.call(sendCall.params.arguments, "session_id"), false);
+});
 
 for (const first of ["input", "result"]) {
   test(`Work Result ${first}-first bootstrap renders the initial snapshot without automatic refresh`, async () => {
@@ -92,9 +384,8 @@ for (const first of ["input", "result"]) {
     else view.toolInput(input);
     await flush();
     assert.equal(view.calls("work_result_state").length, 0);
-    assert.equal(view.nodes.changesTitle.textContent, "Changed 1 file");
-    assert.equal(view.nodes.validationStatus.textContent, "Passed");
-    assert.equal(view.nodes.reviewStatus.textContent, "Workspace reviewed · Diff inspected");
+    assert.equal(view.nodes.windowCoverage.textContent, "2 observed events");
+    assert.equal(view.nodes.windowActivity.children.length, 2);
     assert.equal(view.nodes.refresh.disabled, false);
   });
 }
@@ -105,13 +396,13 @@ test("input-only bootstrap waits for a user Refresh before reading state", async
   await view.initialize();
   assert.equal(view.calls("work_result_state").length, 0);
   assert.equal(view.nodes.refresh.disabled, false);
-  assert.match(view.nodes.status.textContent, /Waiting for Work snapshot/);
+  assert.match(view.nodes.status.textContent, /Waiting for Window activity/);
   view.nodes.refresh.onclick();
   await flush();
   assert.equal(view.calls("work_result_state").length, 1);
-  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, input);
+  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, { project, session_id });
   await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: baseState }));
-  assert.equal(view.nodes.changesTitle.textContent, "Changed 1 file");
+  assert.equal(view.nodes.windowCoverage.textContent, "2 observed events");
   assert.equal(view.nodes.status.textContent, "Updated");
 });
 
@@ -120,11 +411,11 @@ test("matching Work input/result identity is idempotent and unchanged initial st
   view.toolResult({ work_result: baseState });
   await view.initialize();
   view.toolInput(input);
-  view.nodes.files.textContent = "sentinel";
+  view.nodes.activityDetail.textContent = "sentinel";
   view.toolResult({ work_result: baseState });
   await flush();
   assert.equal(view.calls("work_result_state").length, 0);
-  assert.equal(view.nodes.files.textContent, "sentinel");
+  assert.equal(view.nodes.activityDetail.textContent, "sentinel");
 });
 
 test("live progress performs bounded app-only polling and adapts to visibility", async () => {
@@ -133,46 +424,42 @@ test("live progress performs bounded app-only polling and adapts to visibility",
   view.toolResult({ work_result: baseState });
   await view.initialize();
   assert.equal(view.calls("work_result_state").length, 0);
-  await view.fireTimers(2500);
+  await view.fireTimers(10000);
   assert.equal(view.calls("work_result_state").length, 1);
-  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, input);
+  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, { project, session_id });
   await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: nextState }));
-  assert.equal(view.nodes.progressStatus.textContent, "cargo_test · completed");
-  assert.match(view.nodes.progressMeta.textContent, /9 session events · live/);
-  await view.fireTimers(2500);
+  assert.equal(view.nodes.activityStatus.textContent, "Running checks");
+  assert.equal(view.nodes.activityAge.textContent, "Active now");
+  assert.equal(view.nodes.badge.textContent, "Working");
+  await view.fireTimers(10000);
   assert.equal(view.calls("work_result_state").length, 2);
   await view.reply(view.calls("work_result_state")[1], toolResult({ work_result: nextState }));
   await view.visibility(true);
-  assert.equal([...view.timers.values()].some(timer => timer.delay === 12000), true);
+  assert.equal(view.timers.size, 0);
+  await view.fireTimers(10000);
+  assert.equal(view.calls("work_result_state").length, 2);
   await view.visibility(false);
   assert.equal([...view.timers.values()].some(timer => timer.delay === 250), true);
   assert.equal(view.timers.size, 1);
 });
 
-test("closed Session stops automatic polling but remains manually refreshable", async () => {
+test("closed linked Session does not stop Window-level automatic polling", async () => {
   const closedState = {
     ...baseState,
-    state_version: `wr1_${"c".repeat(64)}`,
+    state_version: `wr2_${"c".repeat(64)}`,
     session: { ...baseState.session, lifecycle: "closed" },
   };
   const view = app("mcp_work_result_app.html");
   view.toolInput(input);
   view.toolResult({ work_result: closedState });
   await view.initialize();
-  assert.equal(view.timers.size, 0);
-  assert.match(view.nodes.status.textContent, /Closed/);
-  await view.fireTimers(12000);
-  assert.equal(view.calls("work_result_state").length, 0);
-  await view.visibility(false);
-  assert.equal(view.timers.size, 0);
-
-  view.nodes.refresh.onclick();
-  await flush();
+  assert.equal(view.timers.size, 1);
+  await view.fireTimers(10000);
   assert.equal(view.calls("work_result_state").length, 1);
+  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, { project, session_id });
   await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: closedState }));
-  assert.equal(view.timers.size, 0);
   assert.equal(view.nodes.refresh.disabled, false);
-  assert.match(view.nodes.status.textContent, /closed/i);
+  assert.equal(view.nodes.status.textContent, "Live");
 });
 
 test("unchanged active Session pauses automatic polling after bounded idle time and manual Refresh resumes it", async () => {
@@ -185,7 +472,7 @@ test("unchanged active Session pauses automatic polling after bounded idle time 
   view.advanceTime(30 * 60 * 1000);
   await view.visibility(false);
   assert.equal(view.timers.size, 0);
-  assert.match(view.nodes.status.textContent, /auto refresh paused/);
+  assert.match(view.nodes.status.textContent, /Updates paused/);
   assert.equal(view.calls("work_result_state").length, 0);
 
   view.nodes.refresh.onclick();
@@ -193,7 +480,7 @@ test("unchanged active Session pauses automatic polling after bounded idle time 
   assert.equal(view.calls("work_result_state").length, 1);
   await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: baseState }));
   assert.equal(view.nodes.status.textContent, "Up to date");
-  assert.equal([...view.timers.values()].some(timer => timer.delay === 2500), true);
+  assert.equal([...view.timers.values()].some(timer => timer.delay === 10000), true);
 });
 
 test("user Refresh performs one exact state read and updates the snapshot", async () => {
@@ -204,13 +491,12 @@ test("user Refresh performs one exact state read and updates the snapshot", asyn
   view.nodes.refresh.onclick();
   await flush();
   assert.equal(view.calls("work_result_state").length, 1);
-  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, input);
+  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, { project, session_id });
   assert.equal(view.nodes.refresh.disabled, true);
   assert.equal(view.nodes.refresh.textContent, "Refreshing…");
   await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: nextState }));
-  assert.equal(view.nodes.changesTitle.textContent, "Clean");
-  assert.equal(view.nodes.validationStatus.textContent, "Failed");
-  assert.match(view.nodes.reviewStatus.textContent, /Committed range mapped/);
+  assert.equal(view.nodes.windowCoverage.textContent, "3 observed events");
+  assert.equal(view.nodes.windowActivity.children.length, 4);
   assert.equal(view.nodes.status.textContent, "Updated");
   assert.equal(view.nodes.refresh.disabled, false);
 });
@@ -230,7 +516,7 @@ test("in-flight Refresh clicks coalesce and a later user click performs one new 
   view.nodes.refresh.onclick();
   await flush();
   assert.equal(view.calls("work_result_state").length, 2);
-  assert.deepEqual({ ...view.calls("work_result_state")[1].params.arguments }, input);
+  assert.deepEqual({ ...view.calls("work_result_state")[1].params.arguments }, { project, session_id });
 });
 
 test("failed Refresh preserves the last valid snapshot and remains retryable", async () => {
@@ -242,7 +528,7 @@ test("failed Refresh preserves the last valid snapshot and remains retryable", a
   view.nodes.refresh.onclick();
   await flush();
   await view.reply(view.calls("work_result_state")[0], { structuredContent: { success: false, output: { error_kind: "workspace_unavailable" } } });
-  assert.equal(view.nodes.changesTitle.textContent, "Changed 1 file");
+  assert.equal(view.nodes.windowCoverage.textContent, "2 observed events");
   assert.match(view.nodes.status.textContent, /Refresh unavailable/);
   assert.equal(view.nodes.refresh.disabled, false);
 
@@ -250,7 +536,7 @@ test("failed Refresh preserves the last valid snapshot and remains retryable", a
   await flush();
   assert.equal(view.calls("work_result_state").length, 2);
   await view.reject(view.calls("work_result_state")[1]);
-  assert.equal(view.nodes.changesTitle.textContent, "Changed 1 file");
+  assert.equal(view.nodes.windowCoverage.textContent, "2 observed events");
   assert.match(view.nodes.status.textContent, /Refresh unavailable/);
   assert.equal(view.nodes.refresh.disabled, false);
 
@@ -272,7 +558,7 @@ for (const first of ["input", "result"]) {
     else view.toolInput(foreign);
     await flush();
     assert.equal(view.calls("work_result_state").length, 0);
-    assert.equal(view.nodes.status.textContent, "Invalid or conflicting Work identity");
+    assert.equal(view.nodes.status.textContent, "This task card is unavailable");
     assert.equal(view.nodes.refresh.disabled, true);
     assert.equal(view.timers.size, 0);
   });
@@ -286,34 +572,55 @@ test("malformed authoritative Refresh state fails closed", async () => {
   view.nodes.refresh.onclick();
   await flush();
   await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: { ...baseState, state_version: "bad" } }));
-  assert.equal(view.nodes.status.textContent, "Invalid authoritative Work state");
+  assert.equal(view.nodes.status.textContent, "This task card is unavailable");
   assert.equal(view.nodes.refresh.disabled, true);
 });
 
-test("partial evidence stays honest and exact files_total is not decorated as a lower bound", async () => {
-  const files = Array.from({ length: 8 }, (_, index) => ({
-    path: index === 0 ? "src/future.rs" : `src/file_${index}.rs`,
-    status: index === 0 ? "future_status" : "modified",
-    kind: "tracked",
-    staged: false,
-    unstaged: true,
-  }));
+test("collaboration context_project rejects controls and unbounded identities", async () => {
+  for (const context_project of ["agent:special:bad\nproject", "p".repeat(513)]) {
+    const view = app("mcp_work_result_app.html");
+    view.toolResult({ work_result: {
+      ...baseState,
+      state_version: `wr2_${"8".repeat(64)}`,
+      collaboration: {
+        available: true,
+        can_send: true,
+        messages: [{
+          message_id: "wc_msg_context",
+          source: "operator",
+          direction: "inbound",
+          message: "context",
+          created_at_ms: 1,
+          context_session_id: session_id,
+          context_project,
+          requires_ack: true,
+          first_projected_at_ms: null,
+          first_ack_observed_at_ms: null,
+        }],
+      },
+    } });
+    await view.initialize();
+    assert.equal(view.nodes.status.textContent, "This task card is unavailable");
+    assert.equal(view.nodes.refresh.disabled, true);
+  }
+});
+
+test("Window coverage stays explicit when retained activity is truncated", async () => {
   const partialState = {
     ...baseState,
-    state_version: `wr1_${"c".repeat(64)}`,
-    workspace: { ...baseState.workspace, files_total: 14, files, truncated: true, additions: undefined, deletions: undefined, line_stats_partial: true },
-    validation: { ...baseState.validation, status: "unknown", latest_status: "unknown", current_status: "unknown", history_partial: true, successes: 0 },
-    review: { ...baseState.review, available: false, total: 0, history_partial: true, tools: [] },
+    state_version: `wr2_${"c".repeat(64)}`,
+    window_activity: {
+      ...baseState.window_activity,
+      events_observed: 41,
+      events_returned: 2,
+      truncated: true,
+    },
   };
   const view = app("mcp_work_result_app.html");
   view.toolResult({ work_result: partialState });
   await view.initialize();
-  assert.equal(view.nodes.changesTitle.textContent, "Changed 14 files");
-  assert.match(view.nodes.files.textContent, /^\? src\/future\.rs/m);
-  assert.equal(view.nodes.validationStatus.textContent, "Unknown");
-  assert.match(view.nodes.validationMeta.textContent, /history partial/);
-  assert.equal(view.nodes.reviewStatus.textContent, "Review history partial");
-  assert.match(view.nodes.reviewMeta.textContent, /Earlier review evidence/);
+  assert.equal(view.nodes.windowCoverage.textContent, "Showing 2 of 41 observed events");
+  assert.equal(view.nodes.windowActivity.children.length, 2);
   assert.equal(view.calls("work_result_state").length, 0);
 });
 
@@ -331,24 +638,40 @@ for (const method of ["ui/resource-teardown", "pagehide", "beforeunload"]) {
     await view.visibility(false);
     assert.equal(view.calls("work_result_state").length, 1);
     assert.equal(view.timers.size, 0);
-    assert.equal(view.nodes.changesTitle.textContent, "Changed 1 file");
+    assert.equal(view.nodes.windowCoverage.textContent, "2 observed events");
   });
 }
 
-test("invalid Work input never refreshes", async () => {
-  for (const bad of [
-    { project: "", session_id },
-    { project, session_id: "wc_sess_bad!" },
-    { project: [project], session_id },
-  ]) {
+test("invalid Project input never refreshes", async () => {
+  for (const bad of [{ project: "" }, { project: [project] }]) {
     const view = app("mcp_work_result_app.html");
     view.toolInput(bad);
     await flush();
     assert.equal(view.calls("work_result_state").length, 0);
-    assert.equal(view.nodes.status.textContent, "Invalid or conflicting Work identity");
+    assert.equal(view.nodes.status.textContent, "This task card is unavailable");
     assert.equal(view.nodes.refresh.disabled, true);
     assert.equal(view.timers.size, 0);
   }
+});
+
+test("idle unchanged polling backs off without losing hidden-tab teardown", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: baseState }); await view.initialize();
+  let elapsed = 0;
+  while (true) {
+    const timers = [...view.timers.values()];
+    assert.equal(timers.length, 1);
+    const delay = timers[0].delay;
+    if (elapsed + delay > 600000) break;
+    elapsed += delay; view.advanceTime(delay); await view.fireTimers(delay);
+    const call = view.calls("work_result_state").at(-1);
+    await view.reply(call, toolResult({ work_result: baseState }));
+  }
+  assert(view.calls("work_result_state").length <= 8, "steady idle card should not poll every 10/30 seconds forever");
+  assert([...view.timers.values()].some(timer => timer.delay === 120000));
+  await view.visibility(true);
+  assert.equal(view.timers.size, 0);
+  await view.teardown();
 });
 
 // Frozen final changes are a domain of the same Work Result, not a second App.
@@ -372,7 +695,7 @@ const frozenWork = (overrides = {}) => ({ ...baseState, final_changes: { ...fina
 function frozenNodes(view, index = 0) {
   const root = view.nodes.frozenFiles.children[index];
   const button = root.children[0], wrap = root.children[1];
-  return { root, button, wrap, state: wrap.children[0], pre: wrap.children[1] };
+  return { root, button, wrap, state: wrap.children[0], get pre() { return wrap.children[1]; } };
 }
 function frozenDiff(overrides = {}) {
   const diff = overrides.diff ?? "diff --git a/src/file_0.rs b/src/file_0.rs\n@@ -1 +1 @@\n-old\n+new\n";
@@ -403,12 +726,129 @@ for (const first of ["input", "result"]) {
     assert.equal(view.nodes.finalChanges.hidden, false);
     assert.equal(view.nodes.frozenSummary.textContent, "Changed 7 files");
     assert.equal(view.nodes.frozenFiles.children.length, 5);
-    assert.equal(view.nodes.frozenMore.textContent, "Show 2 more files");
+    assert.equal(view.nodes.frozenMore.textContent, "Show more files");
+    assert.equal(frozenNodes(view).pre, undefined, "no diff DOM before expansion");
     assert.match(frozenNodes(view, 3).button.textContent, /src\/old_name.rs → src\/new_name.rs/);
     assert.match(frozenNodes(view, 4).button.textContent, /binary/);
     assert.equal(view.timers.size, 1);
   });
 }
+
+test("both file lists fold independently and show-less preserves cached final nodes", async () => {
+  const view = await frozenView();
+  const row = frozenNodes(view);
+  view.nodes.frozenMore.onclick(); await flush();
+  assert.equal(view.nodes.frozenFiles.children.length, 7);
+  view.nodes.frozenLess.onclick();
+  assert.equal(view.nodes.frozenFiles.children.filter(node => !node.hidden).length, 5);
+  assert.equal(view.nodes.frozenMore.hidden, false);
+  assert.equal(frozenNodes(view).root, row.root);
+  row.button.onclick(); await flush();
+  view.nodes.frozenCollapse.onclick();
+  assert.equal(row.wrap.hidden, true);
+  assert.equal(row.button.getAttribute("aria-expanded"), "false");
+  await view.reply(view.calls("changes_file_diff")[0], frozenDiff());
+  row.button.onclick(); await flush();
+  assert.equal(view.calls("changes_file_diff").length, 1);
+});
+
+test("final file metadata loads subsequent pages only after explicit more", async () => {
+  const files = Array.from({ length: 24 }, (_, index) => frozenFile(index));
+  const view = await frozenView("input", frozenWork({ files, files_total: 30, files_changed: 30, files_returned: 24, files_truncated: true }));
+  for (let i = 0; i < 4; i++) { view.nodes.frozenMore.onclick(); await flush(); }
+  assert.equal(view.calls("work_result_state").length, 0);
+  view.nodes.frozenMore.onclick(); await flush();
+  const request = view.calls("work_result_state")[0];
+  assert.equal(request.params.arguments.files.offset, 24);
+  assert.equal(request.params.arguments.files.snapshot_id, snapshot_id);
+  assert.equal(request.params.arguments.session_id, session_id);
+  await view.reply(request, toolResult({ work_result_files: {
+    project, session_id, snapshot_id, offset: 24, next_offset: null, files_total: 30, source_truncated: false,
+    files: Array.from({ length: 6 }, (_, i) => frozenFile(i + 24)),
+  } }));
+  view.nodes.frozenMore.onclick(); await flush();
+  assert.equal(view.nodes.frozenFiles.children.length, 30);
+  assert.equal(view.nodes.frozenMore.hidden, true);
+  assert.equal(view.calls("changes_file_diff").length, 0);
+});
+
+test("live rows share one snapshot acquisition, load one diff, and keep collapse cached", async () => {
+  const state = structuredClone(baseState);
+  state.workspace.files = Array.from({ length: 8 }, (_, i) => ({ path: `src/file_${i}.rs`, status: "modified" }));
+  state.workspace.files_total = 30; state.workspace.truncated = true;
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: state }); await view.initialize();
+  const first = view.nodes.workspaceFiles.children[0];
+  assert.equal(first.children[1].children.length, 1);
+  assert.equal(view.calls("work_result_state").length, 0);
+  first.children[0].onclick(); first.children[0].onclick(); first.children[0].onclick(); await flush();
+  assert.equal(view.calls("work_result_state").length, 1);
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result_files: {
+    project, session_id: null, snapshot_id, offset: 0, next_offset: 24, files_total: 30, source_truncated: false,
+    files: Array.from({ length: 24 }, (_, i) => frozenFile(i)),
+  } }));
+  const diff = view.calls("work_result_state")[1];
+  assert.equal(diff.params.arguments.files.path, "src/file_0.rs");
+  assert.equal(diff.params.arguments.files.snapshot_id, snapshot_id);
+  await view.reply(diff, toolResult({ work_result_files: {
+    project, session_id: null, snapshot_id, path: "src/file_0.rs", diff: "+literal <text>\n", truncated: false,
+  } }));
+  first.children[0].onclick(); first.children[0].onclick(); await flush();
+  assert.equal(view.calls("work_result_state").length, 2);
+  assert.equal(first.children[1].children[1].children[0].textContent, "+literal <text>");
+  view.nodes.workspaceMore.onclick(); await flush();
+  assert.equal(view.nodes.workspaceFiles.children.length, 10);
+  view.nodes.workspaceLess.onclick();
+  assert.equal(view.nodes.workspaceFiles.children.length, 5);
+  assert.equal(view.nodes.workspaceFiles.children[0], first);
+  view.nodes.workspaceCollapse.onclick();
+  assert.equal(first.children[1].hidden, true);
+  assert.equal(view.calls("work_result_state").length, 2);
+});
+
+test("refreshing file snapshot ignores an older page and leaves the new more button usable", async () => {
+  const state = structuredClone(baseState);
+  state.workspace.files_total = 30; state.workspace.truncated = true;
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: state }); await view.initialize();
+  view.nodes.workspaceMore.onclick(); await flush();
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result_files: {
+    project, session_id: null, snapshot_id, offset: 0, next_offset: 24, files_total: 30, source_truncated: false,
+    files: Array.from({ length: 24 }, (_, i) => frozenFile(i)),
+  } }));
+  for (let i = 0; i < 4; i++) { view.nodes.workspaceMore.onclick(); await flush(); }
+  const oldPage = view.calls("work_result_state")[1];
+  assert.equal(oldPage.params.arguments.files.offset, 24);
+  assert.equal(view.nodes.workspaceMore.disabled, true);
+  view.nodes.workspaceReload.onclick();
+  const row = view.nodes.workspaceFiles.children[0];
+  assert.equal(view.nodes.workspaceMore.disabled, false);
+  await view.reply(oldPage, toolResult({ work_result_files: {
+    project, session_id: null, snapshot_id, offset: 24, next_offset: null, files_total: 30, source_truncated: false,
+    files: Array.from({ length: 6 }, (_, i) => frozenFile(i + 24)),
+  } }));
+  assert.equal(view.nodes.workspaceFiles.children[0], row);
+  assert.equal(view.nodes.workspaceMore.disabled, false);
+  assert.equal(view.calls("work_result_state").length, 2);
+  assert.doesNotMatch(view.nodes.workspaceMeta.textContent, /unavailable/);
+});
+
+test("a file page cannot replace its Project and sealed changes cannot retarget their Session", async () => {
+  const view = await frozenView();
+  view.nodes.workspaceMore.hidden = false;
+  view.nodes.workspaceMore.onclick(); await flush();
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result_files: {
+    project: "agent:special:foreign", session_id: null, snapshot_id, offset: 0, next_offset: null,
+    files_total: 1, source_truncated: false, files: [frozenFile(0)],
+  } }));
+  assert.match(view.nodes.workspaceMeta.textContent, /unavailable/);
+  assert.equal(view.calls("work_result_state").length, 1);
+  view.toolResult({ work_result: { ...frozenWork(), session_id: `wc_sess_${"3".repeat(32)}` } });
+  await flush();
+  assert.equal(view.nodes.status.textContent, "This task card is unavailable");
+  assert.equal(view.nodes.refresh.disabled, true);
+  assert.equal(view.calls("changes_file_diff").length, 0);
+});
 
 test("frozen expansion reads the exact four-part identity once and re-expansion uses the local cache", async () => {
   const view = await frozenView();
@@ -417,8 +857,8 @@ test("frozen expansion reads the exact four-part identity once and re-expansion 
   await flush();
   assert.equal(view.calls("changes_file_diff").length, 1);
   assert.deepEqual({ ...view.calls("changes_file_diff")[0].params.arguments }, { project, session_id, snapshot_id, path: "src/file_0.rs" });
-  await view.reply(view.calls("changes_file_diff")[0], frozenDiff());
-  assert.equal(nodes.state.textContent, "Frozen diff");
+  await view.reply(view.calls("changes_file_diff")[0], contentOnly(frozenDiff()));
+  assert.equal(nodes.state.textContent, "File changes");
   assert.equal(nodes.pre.children.some(line => line.textContent === "+new" && line.className.includes("added")), true);
   assert.equal(nodes.pre.children.some(line => line.textContent === "-old" && line.className.includes("deleted")), true);
   nodes.button.onclick(); nodes.button.onclick();
@@ -438,11 +878,11 @@ test("Show more and live Refresh preserve pending frozen nodes, initial identity
   view.nodes.refresh.onclick();
   await flush();
   await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: nextState }));
-  assert.equal(view.nodes.changesTitle.textContent, "Clean");
+  assert.equal(view.nodes.finalChanges.hidden, false);
   assert.equal(view.nodes.frozenSummary.textContent, "Changed 7 files");
   assert.equal(frozenNodes(view).root, nodes.root);
   await view.reply(view.calls("changes_file_diff")[0], frozenDiff());
-  assert.equal(nodes.state.textContent, "Frozen diff");
+  assert.equal(nodes.state.textContent, "File changes");
   nodes.button.onclick(); nodes.button.onclick();
   assert.equal(view.calls("changes_file_diff").length, 1);
   assert.equal(view.calls("changes_file_diff")[0].params.arguments.snapshot_id, snapshot_id);
@@ -457,16 +897,34 @@ test("initial snapshot is idempotent and its late arrival cannot roll back an ex
   const root = frozenNodes(view).root;
   view.toolResult({ work_result: frozenWork() });
   assert.equal(frozenNodes(view).root, root);
-  assert.equal(view.nodes.changesTitle.textContent, "Clean");
+  assert.equal(view.nodes.finalChanges.hidden, false);
   assert.equal(view.nodes.frozenSummary.textContent, "Changed 7 files");
+});
+
+test("live progress card adopts the first sealed final snapshot from a later state refresh", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: baseState });
+  await view.initialize();
+  assert.equal(view.nodes.finalChanges.hidden, true);
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: frozenWork() }));
+  assert.equal(view.nodes.finalChanges.hidden, false);
+  assert.equal(view.nodes.frozenSummary.textContent, "Changed 7 files");
+  assert.match(view.nodes.status.textContent, /Live · final changes available/);
+  const root = frozenNodes(view).root;
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls("work_result_state")[1], toolResult({ work_result: frozenWork() }));
+  assert.equal(frozenNodes(view).root, root);
+  assert.equal(view.nodes.refresh.disabled, false);
 });
 
 test("metadata and lazy diff truncation remain truthful within bounded initial rows", async () => {
   const view = await frozenView("result", frozenWork({ files_changed: 30, files_total: 30, files_truncated: true }));
-  assert.match(view.nodes.frozenFooter.textContent, /metadata truncated \(7\/30 files advertised\)/);
+  assert.match(view.nodes.frozenFooter.textContent, /showing 5 of 30 files/);
   frozenNodes(view).button.onclick(); await flush();
   await view.reply(view.calls("changes_file_diff")[0], frozenDiff({ truncated: true, bytes_total: 50000, lines_total: 2000 }));
-  assert.match(frozenNodes(view).state.textContent, /truncated \(\d+\/50000 bytes, \d+\/2000 lines\)/);
+  assert.match(frozenNodes(view).state.textContent, /partial \(\d+\/2000 lines\)/);
 });
 
 test("renamed and binary files retain their metadata in lazy frozen responses", async () => {
@@ -474,7 +932,7 @@ test("renamed and binary files retain their metadata in lazy frozen responses", 
   frozenNodes(view, 3).button.onclick(); await flush();
   assert.equal(view.calls("changes_file_diff")[0].params.arguments.path, "src/new_name.rs");
   await view.reply(view.calls("changes_file_diff")[0], frozenDiff({ path: "src/new_name.rs", previous_path: "src/old_name.rs", kind: "renamed" }));
-  assert.equal(frozenNodes(view, 3).state.textContent, "Frozen diff");
+  assert.equal(frozenNodes(view, 3).state.textContent, "File changes");
   frozenNodes(view, 4).button.onclick(); await flush();
   await view.reply(view.calls("changes_file_diff")[1], frozenDiff({ path: "assets/blob.bin", binary: true, diff: "Binary files differ\n" }));
   assert.match(frozenNodes(view, 4).state.textContent, /Binary file/);
@@ -491,7 +949,7 @@ for (const change of [
     const view = await frozenView();
     frozenNodes(view).button.onclick(); await flush();
     await view.reply(view.calls("changes_file_diff")[0], frozenDiff(change));
-    assert.match(view.nodes.status.textContent, /Invalid frozen diff/);
+    assert.match(view.nodes.status.textContent, /task card is unavailable/);
     assert.equal(view.nodes.finalChanges.hidden, true);
     assert.equal(view.nodes.frozenFiles.children.length, 0);
     assert.equal(view.nodes.refresh.disabled, true);
@@ -512,7 +970,7 @@ for (const change of [
     const view = await frozenView("input", frozenWork(change));
     assert.equal(view.calls("changes_file_diff").length, 0);
     assert.equal(view.nodes.refresh.disabled, true);
-    assert.match(view.nodes.status.textContent, /Invalid Work Result/);
+    assert.match(view.nodes.status.textContent, /task card is unavailable/);
   });
 }
 
@@ -520,7 +978,7 @@ test("expired/unavailable snapshots never fall back to live diff or automaticall
   const view = await frozenView();
   frozenNodes(view).button.onclick(); await flush();
   await view.reply(view.calls("changes_file_diff")[0], { structuredContent: { success: false, output: { error_kind: "changes_snapshot_unavailable" } } });
-  assert.match(frozenNodes(view).state.textContent, /snapshot may have expired/);
+  assert.match(frozenNodes(view).state.textContent, /Changes unavailable/);
   await view.fireTimers(10000); await view.visibility(false);
   assert.equal(view.calls("changes_file_diff").length, 1);
   assert.equal(view.calls("work_result_state").length, 0);
@@ -545,7 +1003,7 @@ for (const via of ["initial", "refresh"]) {
 test("same snapshot id cannot smuggle a changed advertised path list", async () => {
   const view = await frozenView();
   view.toolResult({ work_result: frozenWork({ files: finalChanges.files.map((file, index) => index ? file : { ...file, path: "src/other.rs" }) }) });
-  assert.match(view.nodes.status.textContent, /Conflicting frozen Work identity/);
+  assert.match(view.nodes.status.textContent, /task card is unavailable/);
   assert.equal(view.nodes.finalChanges.hidden, true);
 });
 
@@ -553,7 +1011,7 @@ test("cached legacy Changes resource payload is not promoted into authoritative 
   const view = app("mcp_work_result_app.html");
   view.toolInput(input); await view.initialize();
   view.toolResult({ changes: { version: 3, project, session_id, ...finalChanges } });
-  assert.match(view.nodes.status.textContent, /Invalid Work Result state/);
+  assert.match(view.nodes.status.textContent, /task card is unavailable/);
   assert.equal(view.calls("work_result_state").length, 0);
   assert.equal(view.calls("changes_file_diff").length, 0);
 });
@@ -572,3 +1030,455 @@ for (const method of ["ui/resource-teardown", "pagehide", "beforeunload"]) {
     assert.equal(view.timers.size, 0);
   });
 }
+
+
+test("Activity and Collaboration tabs preserve Window activity and drafts across refresh", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: baseState });
+  await view.initialize();
+  assert.equal(view.nodes.projectIdentity.textContent, "Project · " + project);
+  assert.equal(view.nodes.windowIdentity.textContent, "Window · " + "f".repeat(64));
+  assert.equal(view.nodes.sessionIdentity.textContent, "Session · " + session_id);
+  assert.equal(view.nodes.windowSource.textContent, "Source · mcp");
+  assert.equal(view.nodes.windowActivity.children.length, 2);
+  assert.equal(view.nodes.windowActivity.children[0].children[0].children[0].children[0].textContent, "runtime_status");
+  assert.equal(view.nodes.windowActivity.children[0].children[0].children[1].textContent, "Observe · Succeeded");
+  assert.equal(view.nodes.windowActivity.children[1].children[0].children[0].children[0].textContent, "show_changes");
+  assert.equal(view.nodes.windowActivity.children.every(row => row.tagName === "DETAILS" && row.open === false), true);
+  assert.equal(view.calls("work_result_activity_detail").length, 0);
+  view.nodes.messageInput.value = "Keep my draft";
+  view.nodes.tabCollaboration.onclick();
+  assert.equal(view.nodes.panelCollaboration.hidden, false);
+  assert.equal(view.nodes.panelActivity.hidden, true);
+  assert.equal(view.nodes.messageInput.value, "Keep my draft");
+  assert.equal(view.calls("work_result_send_message").length, 0);
+  assert.equal(view.calls("work_result_state").length, 0);
+  view.nodes.tabCollaboration.onkeydown({ key: "ArrowLeft", preventDefault() {} });
+  assert.equal(view.nodes.tabResults.getAttribute("aria-selected"), "true");
+  view.nodes.tabResults.onkeydown({ key: "ArrowLeft", preventDefault() {} });
+  assert.equal(view.nodes.tabActivity.getAttribute("aria-selected"), "true");
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: nextState }));
+  assert.equal(view.nodes.panelActivity.hidden, false);
+  assert.equal(view.nodes.windowActivity.children.length, 4);
+  assert.equal(view.nodes.messageInput.value, "Keep my draft");
+});
+
+for (const workflow of [
+  { history_partial: false, activity: Array.from({ length: 25 }, () => ({})) },
+  { history_partial: false, activity: [{ label: "Untrusted", stage: "invented", state: "success", started_at: 1, finished_at: 2, duration_ms: 1, count: 1 }] },
+]) test("invalid or oversized workflow cannot enter the task card", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: { ...baseState, workflow } });
+  await view.initialize();
+  assert.equal(view.nodes.badge.textContent, "Unavailable");
+  assert.equal(view.calls("work_result_state").length, 0);
+});
+
+test("Window card sends without a Session and keeps pending context on uncertain retry", async () => {
+  const state = { ...baseState, session_id: undefined, session: undefined };
+  const view = app("mcp_work_result_app.html");
+  view.toolInput({ project });
+  view.toolResult({ work_result: state });
+  await view.initialize();
+  assert.equal(view.nodes.messageInput.disabled, false);
+  view.nodes.messageInput.value = "Before any Session";
+  view.nodes.messageInput.oninput();
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  const first = view.calls("work_result_send_message")[0];
+  assert.equal(first.params.arguments.session_id, undefined);
+  await view.fireTimers(10000);
+  view.toolResult({ work_result: { ...baseState, state_version: `wr2_${"a".repeat(64)}` } });
+  view.nodes.composer.onsubmit({ preventDefault() {} });
+  await flush();
+  const retry = view.calls("work_result_send_message")[1];
+  assert.deepEqual(retry.params.arguments, first.params.arguments);
+});
+
+test("unrelated activity refresh preserves message nodes and the user's draft", async () => {
+  const collaboration = { available: true, can_send: true, messages: [
+    { message_id: "wc_msg_reading", created_at_ms: 1_999_999_997_000, message: "Keep reading this reply", source: "window", direction: "outbound", requires_ack: false, first_projected_at_ms: null, first_ack_observed_at_ms: null },
+  ] };
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: { ...baseState, collaboration } });
+  await view.initialize();
+  const article = view.nodes.messages.children[0];
+  view.nodes.messageInput.value = "My draft";
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: { ...nextState, collaboration: { ...collaboration, can_send: false } } }));
+  assert.equal(view.nodes.messages.children[0], article);
+  assert.equal(view.nodes.messageInput.value, "My draft");
+  assert.equal(view.nodes.messageInput.disabled, true);
+});
+
+for (const receipt of [{}, toolResult({}), toolResult({ message_id: 42 })]) {
+  test(`missing or invalid message receipt preserves exact retry: ${JSON.stringify(receipt)}`, async () => {
+    const view = app("mcp_work_result_app.html");
+    view.toolResult({ work_result: baseState });
+    await view.initialize();
+    view.nodes.messageInput.value = "Keep this exact message";
+    view.nodes.messageInput.oninput();
+    view.nodes.composer.onsubmit({ preventDefault() {} });
+    await flush();
+    const first = view.calls("work_result_send_message")[0];
+    await view.reply(first, receipt);
+    assert.equal(view.nodes.sendMessage.textContent, "Retry");
+    assert.equal(view.nodes.messageInput.value, "Keep this exact message");
+    assert.equal(view.nodes.messageInput.disabled, true);
+    view.nodes.composer.onsubmit({ preventDefault() {} });
+    await flush();
+    assert.deepEqual(view.calls("work_result_send_message")[1].params.arguments, first.params.arguments);
+  });
+}
+
+test("Window activity renders oldest-first and keeps the latest call last", async () => {
+  const state = { ...baseState, window_activity: { ...baseState.window_activity,
+    active: true,
+    active_requests: [{ label: "Running checks", tool_name: "run_shell", server_trace_id: "trace-running", started_at_ms: 1_999_999_995_000 }],
+  } };
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: state });
+  await view.initialize();
+  const titles = view.nodes.windowActivity.children.map(row => row.children[0].children[0].children[0].textContent);
+  assert.deepEqual(titles, ["runtime_status", "show_changes", "run_shell"]);
+  assert.equal(view.nodes.windowActivity.children.at(-1).children[0].children[1].textContent, "Running");
+});
+
+test("completed Window call details are folded and loaded once on first expansion", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: baseState });
+  await view.initialize();
+  const row = view.nodes.windowActivity.children.find(item => item.children[0].children[0].children[0].textContent === "show_changes");
+  assert.equal(row.tagName, "DETAILS");
+  assert.equal(row.open, false);
+  assert.equal(view.calls("work_result_activity_detail").length, 0);
+  row.open = true;
+  row.ontoggle();
+  await flush();
+  assert.equal(view.calls("work_result_activity_detail").length, 1);
+  assert.deepEqual(
+    { ...view.calls("work_result_activity_detail")[0].params.arguments },
+    { project, server_trace_id: "trace-reviewed" },
+  );
+  await view.reply(view.calls("work_result_activity_detail")[0], toolResult({
+    activity_detail: {
+      server_trace_id: "trace-reviewed",
+      started_at_ms: 1_999_999_989_000,
+      ended_at_ms: 1_999_999_990_000,
+      duration_ms: 1000,
+      service_ms: 740,
+      method: "tools/call",
+      tool_name: "show_changes",
+      project,
+      status: "success",
+      meaningful: true,
+      observed_job_ids: [],
+      workflow_sessions: [{ workflow_session_id: session_id, project, relation: "recorded" }],
+    },
+  }));
+  assert.equal(row.children[1].children[0].className, "detail-grid");
+  row.open = false; row.ontoggle();
+  row.open = true; row.ontoggle();
+  await flush();
+  assert.equal(view.calls("work_result_activity_detail").length, 1);
+});
+
+test("card renders each concurrent call and reconciles completion by exact trace", async () => {
+  const completed = { ...baseState.window_activity.events[0], tool_name: "read_files", server_trace_id: "trace-completed" };
+  const state = { ...baseState, window_activity: { ...baseState.window_activity,
+    active: true, events: [completed], events_returned: 1, events_observed: 1,
+    active_requests: [
+      { label: "Read files", tool_name: "read_files", server_trace_id: "trace-completed", started_at_ms: completed.started_at_ms },
+      { label: "Read files", tool_name: "read_files", server_trace_id: "trace-2", started_at_ms: completed.started_at_ms },
+      { label: "Read files", tool_name: "read_files", server_trace_id: "trace-3", started_at_ms: completed.started_at_ms },
+    ],
+  } };
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: state }); await view.initialize();
+  const rows = view.nodes.windowActivity.children;
+  assert.equal(rows.length, 3);
+  assert(rows.every(row => row.children[0].children[0].children[0].textContent === "read_files"));
+  assert.equal(rows.filter(row => row.children[0].children[1].textContent === "Running").length, 2);
+});
+
+test("card keeps repeated fast calls as individual rows and exposes the active display bound", async () => {
+  const event = baseState.window_activity.events[0];
+  const state = { ...baseState, window_activity: { ...baseState.window_activity,
+    events: Array.from({ length: 200 }, (_, i) => ({ ...event, tool_name: "observe_jobs", server_trace_id: "trace-" + i })),
+    events_returned: 200, events_observed: 230, truncated: true,
+    active_requests: Array.from({ length: 8 }, (_, i) => ({ label: "Running", tool_name: "run_shell", server_trace_id: "active-" + i, started_at_ms: event.started_at_ms })),
+  } };
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: state }); await view.initialize();
+  assert.equal(view.nodes.windowActivity.children.length, 208);
+  assert.match(view.nodes.windowCoverage.textContent, /Showing 200 of 230/);
+  assert.match(view.nodes.windowCoverage.textContent, /up to 8 active/);
+});
+
+test("long-running calls keep polling and failed automatic reads identify stale snapshots", async () => {
+  const state = { ...baseState, window_activity: { ...baseState.window_activity, active: true,
+    active_requests: [{ label: "Running tests", tool_name: "run_shell", started_at_ms: 1_999_999_990_000 }],
+  } };
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: state }); await view.initialize();
+  view.advanceTime(31 * 60 * 1000);
+  await view.fireTimers(10000);
+  assert.equal(view.calls("work_result_state").length, 1);
+  await view.reject(view.calls("work_result_state")[0]);
+  assert.match(view.nodes.status.textContent, /Refresh unavailable.*last snapshot/);
+  assert([...view.timers.values()].some(timer => timer.delay === 20000));
+});
+
+test("Results shows live file states and checks, preserving nodes on unrelated refresh", async () => {
+  const view = app("mcp_work_result_app.html");
+  const state = structuredClone(baseState);
+  state.workspace.files = [
+    {
+      path: 'src/new.rs', old_path: 'src/old.rs', status: 'renamed', staged: true, unstaged: true, additions: 3, deletions: 2,
+      content_kind: 'diff', content: '@@ -1 +1 @@\n-old\n+new\n', content_truncated: false,
+    },
+    {
+      path: 'notes/<draft>.md', status: 'untracked',
+      content_kind: 'preview', content: '<not markup>\nsecond line', content_truncated: true,
+    },
+    { path: 'src/gone.rs', status: 'deleted', unstaged: true, additions: 0, deletions: 8 },
+  ];
+  state.workspace.files_total = 12;
+  state.workspace.truncated = true;
+  view.toolResult({ work_result: state }); await view.initialize();
+  view.nodes.viewResults.onclick();
+  assert.equal(view.nodes.panelResults.hidden, false);
+  assert.equal(view.nodes.workspaceFiles.children.length, 3);
+  const row = view.nodes.workspaceFiles.children[0];
+  assert.match(row.children[0].textContent, /src\/old.rs → src\/new.rs/);
+  assert.equal(row.children[0].getAttribute('aria-expanded'), 'false');
+  assert.equal(row.children[1].children.length, 1, 'no eager diff DOM');
+  row.children[0].onclick(); await flush();
+  const preview = view.nodes.workspaceFiles.children[1];
+  preview.children[0].onclick(); await flush();
+  assert.equal(row.children[1].children[0].textContent, 'Changed content');
+  assert.equal(row.children[1].children[1].children[1].textContent, '-old');
+  assert.equal(row.children[1].children[1].children[2].textContent, '+new');
+  assert.equal(preview.children[1].children[0].textContent, 'New file preview · partial');
+  assert.equal(preview.children[1].children[1].children[0].textContent, '<not markup>');
+  assert.equal(view.nodes.validationStatus.textContent, 'Checks passed');
+  assert.equal(view.nodes.finalChanges.hidden, true);
+  assert.equal(view.calls('work_result_state').length, 0);
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls('work_result_state')[0], toolResult({ work_result: { ...state, state_version: `wr2_${'b'.repeat(64)}` } }));
+  assert.equal(view.nodes.workspaceFiles.children[0], row);
+  assert.equal(view.nodes.panelResults.hidden, false);
+  view.nodes.messageInput.value = 'Existing draft';
+  view.nodes.discussResults.onclick();
+  assert.equal(view.nodes.panelCollaboration.hidden, false);
+  assert.equal(view.nodes.messageInput.value, 'Existing draft');
+  assert.equal(view.calls('work_result_send_message').length, 0);
+});
+
+test("clean workspace refresh removes old files without claiming success", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: baseState }); await view.initialize();
+  view.nodes.tabResults.onclick();
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls('work_result_state')[0], toolResult({ work_result: nextState }));
+  assert.equal(view.nodes.workspaceFiles.children.length, 0);
+  assert.equal(view.nodes.workspaceStatus.textContent, 'No uncommitted changes');
+  assert.equal(view.nodes.validationStatus.textContent, 'Checks need attention');
+  assert.equal(view.nodes.finalChanges.hidden, true);
+});
+
+for (const reason of ['workspace_unavailable', 'non_git_project']) test(`unavailable files are explicit: ${reason}`, async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: { ...baseState, workspace: { ...baseState.workspace, git_available: false, reason_code: reason } } });
+  await view.initialize();
+  assert.equal(view.nodes.workspaceFiles.children.length, 0);
+  assert.match(view.nodes.workspaceStatus.textContent, /unavailable|not a Git repository/);
+  assert.equal(view.nodes.workspaceStats.children.length, 0);
+});
+
+test("Results works without a Session and does not invent check evidence", async () => {
+  const view = app("mcp_work_result_app.html");
+  const { session, session_id, validation, review, ...state } = baseState;
+  view.toolResult({ work_result: state }); await view.initialize();
+  view.nodes.tabResults.onclick();
+  assert.equal(view.nodes.workspaceFiles.children.length, 1);
+  assert.equal(view.nodes.resultChecks.hidden, true);
+});
+
+test("final results and current workspace remain separate across refresh", async () => {
+  const view = await frozenView();
+  view.nodes.viewResults.onclick();
+  const frozen = frozenNodes(view);
+  assert.equal(view.nodes.panelResults.hidden, false);
+  assert.equal(view.nodes.finalChanges.hidden, false);
+  assert.match(view.nodes.workspaceFiles.children[0].children[0].textContent, /src\/a.rs/);
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls('work_result_state')[0], toolResult({ work_result: { ...nextState, final_changes: finalChanges } }));
+  assert.equal(frozenNodes(view).root, frozen.root);
+  assert.equal(view.nodes.workspaceFiles.children.length, 0);
+  assert.equal(view.nodes.finalChanges.hidden, false);
+  assert.equal(view.calls('changes_file_diff').length, 0);
+});
+
+test("unsafe live file paths fail closed and clear previously displayed results", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: baseState }); await view.initialize();
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls('work_result_state')[0], toolResult({ work_result: { ...nextState, workspace: { ...baseState.workspace, files: [{ path: '../private' }] } } }));
+  assert.equal(view.nodes.workspaceFiles.children.length, 0);
+  assert.equal(view.nodes.workspaceStatus.textContent, 'Changes unavailable');
+  assert.equal(view.nodes.refresh.disabled, true);
+});
+
+const runningJobs = { available: true, active: true, truncated: false, items: [
+  { job_id: "job-one", tool: "cargo_test", status: "running", state: "active" },
+] };
+
+test("exact Session Job transitions through normal refresh without a model tool result", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: { ...baseState, jobs: runningJobs } });
+  await view.initialize();
+  assert.equal(view.nodes.jobsSection.hidden, false);
+  assert.equal(view.nodes.jobsList.children[0].children[0].children[1].textContent, "Running");
+  assert.equal(view.nodes.badge.textContent, "Working");
+  const terminal = { ...baseState, state_version: `wr2_${"c".repeat(64)}`, jobs: {
+    available: true, active: false, truncated: false,
+    items: [{ ...runningJobs.items[0], status: "completed", state: "terminal", outcome: "passed" }],
+  } };
+  await view.fireTimers(10000);
+  const call = view.calls("work_result_state").at(-1);
+  assert.deepEqual({ ...call.params.arguments }, { project, session_id });
+  await view.reply(call, toolResult({ work_result: terminal }));
+  await flush();
+  assert.equal(view.nodes.jobResultsList.children[0].children[0].children[1].textContent, "Passed");
+  assert.equal(view.calls("observe_jobs").length, 0);
+  assert.equal(view.calls("ui/message").length, 0);
+});
+
+test("background executions separate live work from folded outcomes without declaring task completion", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: { ...baseState, jobs: { ...runningJobs, items: [
+    { ...runningJobs.items[0], job_id: "failed-one", state: "terminal", status: "failed", outcome: "failed" },
+    runningJobs.items[0],
+    { ...runningJobs.items[0], job_id: "passed-one", state: "terminal", status: "completed", outcome: "passed" },
+  ] } } });
+  await view.initialize();
+  assert.equal(view.nodes.jobsList.children.length, 1);
+  assert.equal(view.nodes.jobResultsList.children.length, 2);
+  assert.equal(view.nodes.jobResults.hidden, false);
+  assert.equal(view.nodes.jobResults.open, false);
+  assert.equal(view.nodes.jobResultsSummary.textContent, "Recent background results · 1 failed · 1 passed");
+  assert.equal(view.nodes.activityStatus.textContent, "Work continuing in the background");
+  assert.equal(view.nodes.activityAge.textContent, "");
+  view.nodes.jobResults.open = true;
+  view.nodes.refresh.onclick(); await flush();
+  await view.reply(view.calls("work_result_state")[0], toolResult({ work_result: {
+    ...baseState, state_version: nextState.state_version, jobs: { ...runningJobs, active: false, items: [
+      { ...runningJobs.items[0], state: "terminal", status: "completed", outcome: "passed" },
+    ] },
+  } }));
+  assert.equal(view.nodes.jobsList.children.length, 0);
+  assert.equal(view.nodes.jobResults.open, true);
+  assert.equal(view.nodes.activityStatus.textContent, "Reviewed changes");
+  assert.notEqual(view.nodes.badge.textContent, "Working");
+});
+
+test("live Window activity stays primary while background work is visible", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: { ...baseState, jobs: runningJobs, activity: {
+    ...baseState.activity, active: true,
+    current: { label: "Reading files", kind: "read", started_at_ms: 1_999_999_999_000 },
+  } } });
+  await view.initialize();
+  assert.equal(view.nodes.activityStatus.textContent, "Reading files");
+  assert.equal(view.nodes.jobsList.children.length, 1);
+  assert.equal(view.nodes.jobResults.hidden, true);
+});
+
+test("truncated background state does not mistake a terminal visible slice for completion", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: { ...baseState, jobs: { ...runningJobs, truncated: true, items: [
+    { ...runningJobs.items[0], state: "terminal", status: "failed", outcome: "failed" },
+  ] } } });
+  await view.initialize();
+  assert.equal(view.nodes.activityStatus.textContent, "Work continuing in the background");
+  assert.equal(view.nodes.jobsList.children.length, 0);
+  assert.equal(view.nodes.badge.textContent, "Working");
+  assert.match(view.nodes.jobsMeta.textContent, /more may be active or finished/);
+  assert.match(view.nodes.jobResultsSummary.textContent, /1 failed/);
+});
+
+for (const status of ["queued", "recovering", "stop_requested"]) test(`background ${status} does not claim execution is running`, async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: { ...baseState, jobs: { ...runningJobs, items: [
+    { ...runningJobs.items[0], status },
+  ] } } });
+  await view.initialize();
+  assert.equal(view.nodes.activityAge.textContent, "");
+  assert.notEqual(view.nodes.jobsList.children[0].children[0].children[1].textContent, "Running");
+  assert.equal(view.nodes.jobResults.hidden, true);
+});
+
+test("Window-linked Session does not become Job authority on refresh", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput({ project });
+  view.toolResult({ work_result: { ...baseState, jobs: { available: false } } });
+  await view.initialize();
+  assert.equal(view.nodes.jobsSection.hidden, true);
+  await view.fireTimers(10000);
+  assert.deepEqual({ ...view.calls("work_result_state")[0].params.arguments }, { project });
+});
+
+test("Job failures and recovery remain bounded labels and conflicting Session fails closed", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: { ...baseState, jobs: { ...runningJobs, active: false, items: [
+    { ...runningJobs.items[0], state: "terminal", status: "failed", outcome: "failed", recovery_state: "recovered" },
+  ] } } });
+  await view.initialize();
+  assert.equal(view.nodes.jobResultsList.children[0].children[0].children[1].textContent, "Failed · recovered");
+  view.toolInput({ project, session_id: `wc_sess_${"2".repeat(32)}` });
+  assert.equal(view.nodes.badge.textContent, "Unavailable");
+  assert.equal(view.nodes.jobsSection.hidden, true);
+  assert.equal(view.timers.size, 0);
+});
+
+test("active Jobs use the existing timer and preserve hidden and teardown fences", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: { ...baseState, jobs: runningJobs } });
+  await view.initialize();
+  await view.fireTimers(10000);
+  const call = view.calls("work_result_state")[0];
+  view.notification("ui/resource-teardown", {});
+  await view.reply(call, toolResult({ work_result: nextState }));
+  await flush();
+  assert.equal(view.timers.size, 0);
+  assert.equal(view.nodes.jobsList.children[0].children[0].children[1].textContent, "Running");
+});
+
+test("result-first Job state cannot be rebound by a different explicit Session", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolResult({ work_result: { ...baseState, jobs: runningJobs } });
+  view.toolInput({ project, session_id: `wc_sess_${"2".repeat(32)}` });
+  await view.initialize();
+  assert.equal(view.nodes.badge.textContent, "Unavailable");
+  assert.equal(view.calls("work_result_state").length, 0);
+});
+
+for (const jobs of [
+  { ...runningJobs, items: Array.from({ length: 9 }, () => runningJobs.items[0]) },
+  { ...runningJobs, items: [{ ...runningJobs.items[0], state: "guessed" }] },
+]) test("invalid Job state fails closed", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: { ...baseState, jobs } });
+  await view.initialize();
+  assert.equal(view.nodes.badge.textContent, "Unavailable");
+});

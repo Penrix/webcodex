@@ -1,5 +1,5 @@
 use super::RunnerCapabilityRequirement::FileWrite;
-use super::ToolVisibility::ModelVisible;
+use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
     adaptive_runtime_direct, def, model_spec, permission_risk, ToolDefinition,
     PERMISSION_RISK_WRITE, TOOL_CATEGORY_EDIT,
@@ -16,7 +16,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             def(
             "write_project_file",
             super::ToolAuditPolicy::TYPED_CANONICAL,
-            ModelVisible,
+            ModelHidden,
             TOOL_CATEGORY_EDIT,
             Some(FileWrite),
             TOOL_PROVIDER_RUNNER,
@@ -41,7 +41,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         permission_risk(
             model_spec(
                 def(
-                "apply_text_edits",
+                "edit_project_files",
                 super::ToolAuditPolicy::TYPED_CANONICAL,
                 ModelVisible,
                 TOOL_CATEGORY_EDIT,
@@ -60,11 +60,16 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
                 )
-                .with_composition_policy(super::ToolCompositionPolicy::Sequential),
-                "Transactional structured option for small/local exact edits. For multiple independent edits to the same file, use ONE change with multiple entries in edits. Never repeat a source or destination path in changes. All edits in one file change resolve against the same original source snapshot; sequential changes cannot be combined automatically. Shorthand path + old_text + new_text is only for one simple exact replacement. For multiple edits or occurrence/line_scope use canonical kind=edit with edits[]; put occurrence/line_scope inside each edit, not on the change. Globally unique edits may omit expected_read_revision; occurrence or line_scope requires expected_read_revision. Occurrence stays in global source order. Revisions fence whole-file snapshots; model input never needs a digest. Batches are preflighted transactionally; conflicts fail closed; Runner rechecks source before mutation. Failures may include one parser-ready read_files recovery call. Inspect the resulting diff and validate the final source.",
-            ).with_gpt_action_description("Apply 1..16 transactional exact file changes. Globally unique local edits may omit expected_read_revision; delete/rename and positional occurrence/line_scope require it. ToolRuntime resolves revision guards internally and the whole batch preflights before mutation."),
+                .with_composition_policy(super::ToolCompositionPolicy::Sequential)
+                .with_host_orchestration_hint(
+                    super::ToolHostOrchestrationHint::sequential()
+                        .with_native_batch_field("changes"),
+                ),
+                "Primary project editor: read_files → edit_project_files → show_changes → structured validation. Use ONE change per file. edit/delete/rename require expected_read_revision; create requires content. Exact edits fail closed on ambiguity; replace_range edits 1-based inclusive lines from the same original snapshot. Batches are preflighted transactionally and the Runner rechecks source before mutation. dry_run plans only. Stale state returns read_files recovery; outcome_unknown requires workspace observation before another write.",
+            ).with_gpt_action_description("Read files, then edit/create/delete/rename transactionally. Existing sources require expected_read_revision. Exact edits fail closed on ambiguity; stale source requires reread. Optional dry_run. Review changes and validate. Unknown outcomes require workspace observation before another write."),
             PERMISSION_RISK_WRITE,
         ),
         60,
+        super::ToolDirectReason::CoreWorkflow,
     ),
 ];

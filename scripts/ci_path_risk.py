@@ -159,6 +159,13 @@ def _is_main_frontend(path: str) -> bool:
     return path.startswith("frontend/")
 
 
+def _is_desktop_shared_frontend(path: str) -> bool:
+    return path.startswith("frontend/src/ui/") or path in {
+        "frontend/package.json",
+        "frontend/package-lock.json",
+    }
+
+
 def _is_desktop_frontend(path: str) -> bool:
     return path.startswith("apps/desktop/src/") or path in {
         "apps/desktop/index.html",
@@ -196,6 +203,9 @@ def _release_tooling(path: str) -> bool:
             "stage_npm_release.sh",
             "verify_public_release.py",
             "macos_sign_local_runner.sh",
+            "macos_ci_developer_id_setup.sh",
+            "macos_sign_runner.sh",
+            "verify_macos_desktop_identity.sh",
         }
     )
 
@@ -211,11 +221,15 @@ def _classify_path(risk: Risk, path: str) -> None:
         or path.startswith("plugins/repo-info/")
         or path.startswith("plugins/repo-context/")
         or path.startswith("plugins/campus-application/")
+        or path.startswith("plugins/agent-browser/")
     ):
         risk.needs_plugin_sdk = True
         risk.categories.add(
             "plugin-sdk" if path.startswith("npm/plugin-sdk/") else "plugin-sdk-dogfood"
         )
+        return
+    if path.startswith("integrations/codex/") and path.endswith(".py"):
+        _mark_windows_core(risk, "codex-adapter")
         return
     if _is_docs_or_text(path):
         risk.categories.add("docs")
@@ -223,6 +237,9 @@ def _classify_path(risk: Risk, path: str) -> None:
     if _is_main_frontend(path):
         risk.needs_frontend = True
         risk.categories.add("frontend")
+        if _is_desktop_shared_frontend(path):
+            risk.needs_desktop_frontend = True
+            risk.categories.add("desktop-shared-ui")
         return
     if _is_desktop_frontend(path):
         risk.needs_desktop_frontend = True
@@ -577,7 +594,9 @@ def _write_github_output(path: str, outputs: dict[str, str]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--event-name", required=True, choices=("pull_request", "push"))
+    parser.add_argument(
+        "--event-name", required=True, choices=("pull_request", "push", "merge_group")
+    )
     parser.add_argument("--external-contributor", type=_parse_bool, required=True)
     parser.add_argument("--run-ci", type=_parse_bool, required=True)
     parser.add_argument("--base")
@@ -592,13 +611,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     if risk is None:
         if not args.base or not args.head:
-            parser.error("--base and --head are required for path-aware pull requests")
+            parser.error("--base and --head are required for path-aware CI events")
         try:
             risk = classify_git_range(args.base, args.head)
         except GitDiffError as exc:
-            if args.event_name == "push":
-                risk = Risk.full("push-diff-unavailable")
-                risk.categories.add("push-diff-fallback")
+            if args.event_name in {"push", "merge_group"}:
+                risk = Risk.full(f"{args.event_name}-diff-unavailable")
+                risk.categories.add(f"{args.event_name}-diff-fallback")
             else:
                 print(f"ci path risk classification failed: {exc}", file=sys.stderr)
                 return 2

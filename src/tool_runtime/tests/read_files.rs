@@ -3,7 +3,8 @@
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{
-    RunnerCapabilities, RunnerPollRequest, RunnerRegisterRequest, RunnerResultRequest,
+    RunnerCapabilities, RunnerJobUpdateRequest, RunnerPollRequest, RunnerRegisterRequest,
+    RunnerResultRequest,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -501,6 +502,7 @@ async fn replace_runner_project_at_path(
         .runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -762,7 +764,7 @@ async fn read_files_returns_ordered_normalized_successes_after_out_of_order_comp
 
     let mut result = result;
     let projection =
-        super::super::dispatch::ModelFacingProjectionPlan::capture(&ToolCall::ReadFiles {
+        super::super::result_projection::ModelFacingProjectionPlan::capture(&ToolCall::ReadFiles {
             project: runtime_project,
             items: vec![
                 item("src/lib.rs", Some(2), Some(2)),
@@ -1087,7 +1089,7 @@ async fn read_file_dispatch_complete_success_is_sparse_after_session_recording()
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "src/lib.rs".to_string(),
                             start_line: None,
@@ -1186,7 +1188,7 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "src/lib.rs".to_string(),
                             start_line: Some(2),
@@ -1228,6 +1230,9 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
     assert!(item["output"].get("sha256").is_none());
     assert!((1..=9_007_199_254_740_991).contains(&read_revision));
     assert_eq!(suggested["tool"], "read_files");
+    assert_eq!(suggested["follow_up_kind"], "mechanically_followable");
+    webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(suggested)
+        .expect("read_files continuation must pass the registered inputSchema");
     assert_eq!(suggested["arguments"]["session_id"], session_id);
     let next_call = ToolCall::from_tool_name(
         suggested["tool"].as_str().unwrap(),
@@ -1291,7 +1296,7 @@ async fn read_files_continuation_rejects_changed_snapshot() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "src/lib.rs".to_string(),
                             start_line: Some(1),
@@ -1508,7 +1513,7 @@ async fn read_file_dispatch_complete_explicit_range_keeps_full_range_metadata() 
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "src/lib.rs".to_string(),
                             start_line: Some(1),
@@ -1613,8 +1618,8 @@ async fn read_files_dispatch_complete_batch_is_sparse_and_schema_valid() {
     let items = result.output["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
     for item in items {
-        assert_eq!(item["success"], true);
-        assert!(item["error"].is_null());
+        assert!(item.get("success").is_none());
+        assert!(item.get("error").is_none());
         assert_eq!(item["output"]["format"], "numbered");
         assert!(item["output"].get("path").is_none());
         assert!(item["output"].get("sha256").is_none());
@@ -2168,6 +2173,167 @@ async fn read_files_direct_session_overlay_pressure_keeps_final_response_under_h
 }
 
 #[tokio::test]
+async fn ordinary_read_delivers_terminal_attention_without_host_continuation_support() {
+    use crate::client_window::ClientWindow;
+    use crate::tool_runtime::kernel::{
+        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+        ToolProtocolCapabilities, ToolTransport,
+    };
+
+    let runtime = ToolRuntime::new_for_tests();
+    let auth = shared_key_auth_context("read-passive-owner");
+    let client_id = "read-passive-terminal";
+    super::jobs::register_job_agent_for_auth(&runtime, client_id, "repo", &auth).await;
+    let project = format!("agent:{client_id}:repo");
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("same-turn passive job attention".to_string()),
+    );
+    let window = ClientWindow::for_test("read-passive-window");
+
+    let job_id = super::jobs::start_agent_runtime_job_in_session(
+        &runtime,
+        client_id,
+        "repo",
+        Some(&session.session_id),
+        &auth,
+    )
+    .await;
+    assert_eq!(
+        super::jobs::mark_next_agent_job_running(&runtime, client_id).await,
+        job_id
+    );
+
+    let mut initiating_handoff = ToolResult::ok(json!({
+        "execution_state": "pending",
+        "continuation": super::super::jobs::observe_job_continuation(&job_id, None),
+    }));
+    runtime
+        .add_passive_job_attention(
+            &mut initiating_handoff,
+            "run_process",
+            Some(&project),
+            Some(&session.session_id),
+            Some(&window),
+            Some(&auth),
+        )
+        .await;
+    assert!(initiating_handoff.output.get("job_attention").is_none());
+
+    let job = runtime
+        .runner_registry
+        .get_job_for_auth(Some(&crate::test_support::runner_access(&auth)), &job_id)
+        .await
+        .unwrap();
+    runtime
+        .runner_registry
+        .update_job(RunnerJobUpdateRequest {
+            client_id: client_id.into(),
+            runner_instance_id: "inst".into(),
+            job_id: job_id.clone(),
+            request_id: job.request_id,
+            update_seq: Some(2),
+            status: "completed".into(),
+            stdout_chunk: Some("PRIVATE_JOB_OUTPUT".into()),
+            stderr_chunk: None,
+            log_snapshot: None,
+            exit_code: Some(0),
+            duration_ms: Some(50),
+            error: None,
+            command_execution_state: None,
+            validation_progress: None,
+            test_count_evidence: None,
+            activity: None,
+            finished: true,
+        })
+        .await
+        .unwrap();
+
+    let arguments = json!({
+        "project": project,
+        "items": [{"path": "a.rs"}],
+        "session_id": session.session_id,
+    });
+    let read = runtime.call_tool_with_invocation_metadata(
+        ToolCallRequest {
+            tool_name: "read_files".to_string(),
+            arguments,
+        },
+        ToolCallContext {
+            transport: ToolTransport::Mcp,
+            session_id: Some(&session.session_id),
+            auth: Some(&auth),
+            window: Some(&window),
+            record_oauth_scope_denials: false,
+            host_file_import_trust: HostFileImportTrust::Untrusted,
+        },
+        ToolInvocationMetadata::default(),
+        ToolProtocolCapabilities::default(),
+    );
+    tokio::pin!(read);
+    assert!(futures_util::poll!(&mut read).is_pending());
+    let request = next_read_request(&runtime, client_id).await;
+    complete_read(&runtime, client_id, &request, "ordinary read\n").await;
+
+    let outcome = read.await;
+    let result = outcome
+        .result
+        .as_ref()
+        .expect("model-facing ordinary read result");
+    let telemetry = outcome
+        .model_ergonomics
+        .as_ref()
+        .unwrap()
+        .record_for_tool_result(result)
+        .unwrap();
+    assert_eq!(
+        telemetry
+            .job_convergence
+            .as_ref()
+            .unwrap()
+            .passive_terminal_delivery_count,
+        1
+    );
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["items"][0]["output"]["text"], "ordinary read");
+    let attention = &result.output["job_attention"]["items"][0];
+    assert_eq!(attention["job_id"], job_id);
+    assert_eq!(attention["outcome"], "passed");
+    assert_eq!(attention.as_object().unwrap().len(), 3);
+    assert!(!result.output["job_attention"]
+        .to_string()
+        .contains("PRIVATE_JOB_OUTPUT"));
+
+    let second_arguments = json!({
+        "project": project,
+        "items": [{"path": "b.rs"}],
+        "session_id": session.session_id,
+    });
+    let second = runtime.call_tool_with_invocation_metadata(
+        ToolCallRequest {
+            tool_name: "read_files".to_string(),
+            arguments: second_arguments,
+        },
+        ToolCallContext {
+            transport: ToolTransport::Mcp,
+            session_id: Some(&session.session_id),
+            auth: Some(&auth),
+            window: Some(&window),
+            record_oauth_scope_denials: false,
+            host_file_import_trust: HostFileImportTrust::Untrusted,
+        },
+        ToolInvocationMetadata::default(),
+        ToolProtocolCapabilities::default(),
+    );
+    tokio::pin!(second);
+    assert!(futures_util::poll!(&mut second).is_pending());
+    let request = next_read_request(&runtime, client_id).await;
+    complete_read(&runtime, client_id, &request, "next read\n").await;
+    let second = second.await.result.expect("second ordinary read result");
+    assert!(second.output.get("job_attention").is_none());
+}
+
+#[tokio::test]
 async fn read_files_outer_recording_session_preserves_complete_sparse_shape() {
     use crate::tool_runtime::kernel::{
         HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
@@ -2609,4 +2775,64 @@ async fn read_files_outer_recording_session_keeps_final_response_under_hard_cap(
         serialized_len <= MAX_SERIALIZED_OUTPUT_BYTES,
         "outer Session overlays pushed read_files final response above the 512 KiB inspection hard cap: {serialized_len} bytes"
     );
+}
+
+#[tokio::test]
+async fn read_files_complete_item_projection_byte_regression() {
+    for count in [1, 8] {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ToolRuntime::new_for_tests();
+        let client_id = "read-item-bytes";
+        let project =
+            register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+        let items = (0..count)
+            .map(|index| item(&format!("{index}.rs"), None, None))
+            .collect::<Vec<_>>();
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let items = items.clone();
+            async move { runtime.read_files("demo".to_string(), items, None).await }
+        });
+        for _ in 0..count {
+            let request = next_read_request(&runtime, client_id).await;
+            complete_read(&runtime, client_id, &request, "hello\n").await;
+        }
+        let mut result = task.await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let before = serde_json::to_vec(&result.output).unwrap().len();
+        result_projection::ModelFacingProjectionPlan::capture(&ToolCall::ReadFiles {
+            project,
+            items,
+            session_id: None,
+            with_line_numbers: None,
+            max_result_bytes: None,
+        })
+        .project(&mut result);
+        let after = serde_json::to_vec(&result.output).unwrap().len();
+        eprintln!("read_{count}_items: {before} -> {after} bytes");
+        assert!(after < before);
+        let mut previous_wrapper = result.output.clone();
+        for (index, item) in previous_wrapper["items"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            assert_eq!(item["index"], index);
+            assert_eq!(item["path"], format!("{index}.rs"));
+            assert!(item.get("success").is_none());
+            assert!(item.get("error").is_none());
+            item["success"] = json!(true);
+            item["error"] = Value::Null;
+        }
+        assert_eq!(
+            serde_json::to_vec(&previous_wrapper).unwrap().len() - after,
+            28 * count
+        );
+        startup_brief::validate_schema_instance_for_test(
+            &serde_json::to_value(&result).unwrap(),
+            &registry::output_schema_for_tool("read_files"),
+        )
+        .unwrap();
+    }
 }

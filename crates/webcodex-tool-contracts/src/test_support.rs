@@ -10,6 +10,60 @@ pub fn validate_schema_instance(instance: &Value, schema: &Value) -> Result<(), 
     validate_schema_instance_at(instance, schema, "$")
 }
 
+pub fn validate_generated_tool_call_against_registered_input_schema(
+    call: &Value,
+) -> Result<(), String> {
+    let object = call
+        .as_object()
+        .ok_or_else(|| "$: generated follow-up must be an object".to_string())?;
+    let follow_up_kind = object
+        .get("follow_up_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "$.follow_up_kind: missing generated follow-up posture".to_string())?;
+    if !webcodex_core::runtime_contract::GENERATED_FOLLOW_UP_KIND_VALUES.contains(&follow_up_kind) {
+        return Err(format!(
+            "$.follow_up_kind: unsupported generated follow-up posture {follow_up_kind}"
+        ));
+    }
+    let tool = object
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "$.tool: missing generated follow-up target".to_string())?;
+    let arguments = object
+        .get("arguments")
+        .ok_or_else(|| "$.arguments: missing generated follow-up arguments".to_string())?;
+    let schema = crate::input_schema_for_tool(tool);
+    validate_schema_instance(arguments, &schema)
+        .map_err(|error| format!("{tool} generated arguments fail registered inputSchema: {error}"))
+}
+
+pub fn validate_generated_tool_calls_in_value(value: &Value) -> Result<usize, String> {
+    fn visit(value: &Value, path: &str, count: &mut usize) -> Result<(), String> {
+        if let Some(object) = value.as_object() {
+            let looks_like_generated_call = object.contains_key("follow_up_kind")
+                && object.contains_key("tool")
+                && object.contains_key("arguments");
+            if looks_like_generated_call {
+                validate_generated_tool_call_against_registered_input_schema(value)
+                    .map_err(|error| format!("{path}: {error}"))?;
+                *count += 1;
+            }
+            for (name, child) in object {
+                visit(child, &format!("{path}.{}", name), count)?;
+            }
+        } else if let Some(array) = value.as_array() {
+            for (index, child) in array.iter().enumerate() {
+                visit(child, &format!("{path}[{index}]"), count)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut count = 0;
+    visit(value, "$", &mut count)?;
+    Ok(count)
+}
+
 fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> Result<(), String> {
     if let Some(schemas) = schema.get("allOf").and_then(Value::as_array) {
         for child in schemas {
@@ -37,7 +91,7 @@ fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> 
             .map(|variant| validate_schema_instance_at(instance, variant, path))
             .collect::<Vec<_>>();
         let successes = results.iter().filter(|result| result.is_ok()).count();
-        return (successes == 1).then_some(()).ok_or_else(|| {
+        (successes == 1).then_some(()).ok_or_else(|| {
             let errors = results
                 .into_iter()
                 .enumerate()
@@ -49,17 +103,17 @@ fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> 
                 .collect::<Vec<_>>()
                 .join("; ");
             format!("{path}: expected exactly one matching schema, got {successes}; {errors}")
-        });
+        })?;
     }
     if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
-        return variants
+        variants
             .iter()
             .find_map(|variant| {
                 validate_schema_instance_at(instance, variant, path)
                     .ok()
                     .map(|_| ())
             })
-            .ok_or_else(|| format!("{path}: no anyOf variant matched"));
+            .ok_or_else(|| format!("{path}: no anyOf variant matched"))?;
     }
     if let Some(expected) = schema.get("const") {
         if instance != expected {
@@ -71,8 +125,8 @@ fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> 
             return Err(format!("{path}: value is outside the declared enum"));
         }
     }
-    if let Some(expected_type) = schema.get("type").and_then(Value::as_str) {
-        let matches = match expected_type {
+    if let Some(expected_type) = schema.get("type") {
+        let matches_type = |kind: &str| match kind {
             "object" => instance.is_object(),
             "array" => instance.is_array(),
             "string" => instance.is_string(),
@@ -80,7 +134,12 @@ fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> 
             "integer" => instance.as_i64().is_some() || instance.as_u64().is_some(),
             "number" => instance.is_number(),
             "null" => instance.is_null(),
-            _ => true,
+            _ => false,
+        };
+        let matches = match expected_type {
+            Value::String(kind) => matches_type(kind),
+            Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).any(matches_type),
+            _ => false,
         };
         if !matches {
             return Err(format!("{path}: expected {expected_type}"));
@@ -152,27 +211,21 @@ fn validate_schema_instance_at(instance: &Value, schema: &Value, path: &str) -> 
             return Err(format!("{path}: maxLength exceeded"));
         }
     }
-    if let Some(number) = instance.as_i64() {
-        if schema
-            .get("minimum")
-            .and_then(Value::as_i64)
-            .is_some_and(|minimum| number < minimum)
-        {
+    if instance.is_number() {
+        // Preserve exact integer comparisons for revision/fence-sized u64 values.
+        let compare = |bound: &Value| {
+            if let (Some(a), Some(b)) = (instance.as_i64(), bound.as_i64()) {
+                Some(a.cmp(&b))
+            } else if let (Some(a), Some(b)) = (instance.as_u64(), bound.as_u64()) {
+                Some(a.cmp(&b))
+            } else {
+                instance.as_f64()?.partial_cmp(&bound.as_f64()?)
+            }
+        };
+        if schema.get("minimum").and_then(compare) == Some(std::cmp::Ordering::Less) {
             return Err(format!("{path}: below minimum"));
         }
-        if schema
-            .get("maximum")
-            .and_then(Value::as_i64)
-            .is_some_and(|maximum| number > maximum)
-        {
-            return Err(format!("{path}: above maximum"));
-        }
-    } else if let Some(number) = instance.as_u64() {
-        if schema
-            .get("maximum")
-            .and_then(Value::as_u64)
-            .is_some_and(|maximum| number > maximum)
-        {
+        if schema.get("maximum").and_then(compare) == Some(std::cmp::Ordering::Greater) {
             return Err(format!("{path}: above maximum"));
         }
     }
@@ -273,3 +326,6 @@ mod tests {
         }
     }
 }
+
+mod samples;
+pub use samples::{sample_schema_value, sample_tool_args, sample_tool_args_for_spec};

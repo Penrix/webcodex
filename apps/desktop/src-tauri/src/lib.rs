@@ -1,24 +1,36 @@
 mod activity;
+mod coding_agents;
 mod commands;
 mod connection_id;
 mod connections;
 mod deadline;
+mod desktop_data_dir;
 mod desktop_shell;
+mod diagnostics;
 mod error;
+mod managed_instructions;
 mod mcp_providers;
 mod models;
 mod operation;
 mod platform;
 mod process;
+mod project_inventory;
+mod runner_capability_grant;
+mod runtime_selection;
+mod ssh_resources;
 mod state;
 mod tray;
 mod tunnel_config;
+mod updates;
 mod webcodex;
 mod workspace;
 
 use state::AppState;
 use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
+
+/// The no-window CLI probe and Tauri command share one build-info source.
+pub use commands::get_desktop_build_info as desktop_build_info;
 
 pub fn run() {
     let app = tauri::Builder::default()
@@ -34,9 +46,19 @@ pub fn run() {
             Some(vec!["--background"]),
         ))
         .setup(|app| {
-            let data_dir = app.path().app_local_data_dir()?;
+            let logical_data_dir = app.path().app_local_data_dir()?;
+            let data_dir = desktop_data_dir::resolve(logical_data_dir)?;
+            eprintln!(
+                "WebCodex Desktop data root source={} physical_resolution={}",
+                data_dir.source.label(),
+                if data_dir.physical_resolution_changed {
+                    "changed"
+                } else {
+                    "unchanged"
+                }
+            );
             let resource_dir = app.path().resource_dir()?;
-            app.manage(AppState::new(data_dir, resource_dir)?);
+            app.manage(AppState::new_resolved(data_dir, resource_dir)?);
             app.manage(desktop_shell::DesktopShellState::default());
             app.manage(tray::TrayPresentationCache::default());
             tray::setup(app.handle())?;
@@ -50,12 +72,36 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_desktop_state,
+            commands::get_runtime_settings,
+            commands::get_desktop_build_info,
+            commands::check_for_updates,
+            commands::get_update_download_state,
+            commands::download_update,
+            commands::cancel_update_download,
+            commands::set_automatic_update_download,
+            commands::install_verified_update,
+            commands::remind_update_later,
+            commands::open_latest_release,
+            commands::get_diagnostics,
+            commands::set_tool_request_tracing,
+            commands::open_diagnostic_resource,
+            commands::copy_runtime_console_credential,
+            commands::copy_diagnostic_report,
+            commands::export_support_bundle,
+            commands::probe_runtime,
+            commands::recheck_runtime,
+            commands::switch_runtime,
+            commands::restore_previous_configuration,
             commands::workspace_query,
             commands::get_computer_permissions,
             commands::request_computer_permission,
             commands::get_runner_settings,
+            commands::managed_instructions_read,
+            commands::managed_instructions_save,
+            commands::managed_instructions_enable,
             commands::add_runner_plugin,
             commands::update_runner_settings,
+            commands::update_runner_allowed_roots,
             commands::restart_owned_runner,
             commands::open_powershell_install_guide,
             commands::get_launch_at_login,
@@ -63,15 +109,28 @@ pub fn run() {
             commands::refresh_runtime_status,
             commands::observe_chatgpt_activity,
             commands::resume_saved_runtime,
+            commands::resume_saved_connections,
             commands::update_tunnel_proxy,
             commands::update_tunnel_config,
             commands::save_tunnel_profile,
             commands::save_mcp_provider,
             commands::remove_mcp_provider,
+            commands::save_coding_agent,
+            commands::remove_coding_agent,
+            commands::ssh_resource_list,
+            commands::ssh_resource_register,
+            commands::ssh_resource_remove,
+            commands::authorize_runner_capabilities,
+            commands::runner_capability_authorization,
             commands::tunnel_profile_action,
             commands::inspect_project,
             commands::configure_local_setup,
+            commands::configure_environment,
+            commands::environment_service_action,
+            commands::repair_environment_user_credential,
             commands::activate_local_project,
+            commands::prepare_project_unregister,
+            commands::unregister_project,
             commands::configure_remote_setup,
             commands::start_quick_share,
             commands::stop_quick_share,

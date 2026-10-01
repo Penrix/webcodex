@@ -5,7 +5,13 @@ Quick trial:\n\
   share                         Temporarily share one project; ends when the command exits\n\
   (no command)                  Interactive Git repo shortcut for `share` on Linux/macOS\n\n\
 Daily self-hosted setup:\n\
+  environment configure         Create or join an environment; optionally select local projects\n\
+  environment add-project       Add a project using this machine's existing Runner identity\n\
+  environment status|doctor     View the authorized fleet and diagnose this machine\n\
+  See `webcodex environment --help` for services, invitations, recovery and upgrades.\n\n\
+Advanced component commands:\n\
   server                        Configure and operate the Server\n\
+  controller                    WSL/Linux terminal control plane for Server, Runner, and Tunnel\n\
   pairing create                Create a one-time login code\n\
   login                         Log the project machine in with that code\n\
   project register              Add an existing project for a stopped/legacy Runner\n\
@@ -32,6 +38,36 @@ Advanced / operator:\n\
 Options:\n\
   -h, --help                    Print help and exit\n\
   -V, --version                 Print version and exit\n"
+}
+
+pub(crate) fn controller_usage() -> &'static str {
+    "Usage: webcodex controller <COMMAND> [OPTIONS]\n\n\
+WSL/Linux terminal control plane for a local or remote WebCodex Server, local Runner, and optional local OpenAI Tunnel.\n\n\
+Commands:\n\
+  init       Create controller.toml with local defaults\n\
+  run        Run the Controller in the foreground and own child processes\n\
+  install    Install and optionally start the systemd user service\n\
+  start      Start the installed systemd user service\n\
+  status     Show live runtime state or installed systemd user-service state\n\
+  doctor     Validate topology, config, binaries, Runner target, and Tunnel credentials\n\
+  stop       Stop a foreground Controller or installed systemd user service\n\
+  restart    Restart the systemd Controller/foreground runtime, or one managed component\n\
+  logs       Read live in-memory logs, falling back to the systemd user journal\n\
+  uninstall  Stop/disable/remove only the Controller systemd user service (--confirm)\n\
+  project    List, register, or unregister projects through an online Runner\n\n\
+Project commands: project list | project register PATH | project remove ID-OR-PATH\n\
+  --user-token-file PATH   User API credential [default: matching Runner connection's webcodex-user-token]\n\
+  All project commands require the configured Runner online; no local registry fallback.\n\n\
+Common options:\n\
+  --config PATH   Controller config [default: ~/.config/webcodex/controller.toml]\n\
+  --service-file PATH      systemd user unit [default: ~/.config/systemd/user/webcodex-controller.service]\n\
+  --environment-file PATH  optional service environment file [default: ~/.config/webcodex/controller.env]\n\
+  --overwrite     Replace an existing managed Controller unit during install\n\
+  --no-start      Install/enable the unit without starting it\n\
+  --confirm       Required by controller uninstall\n\
+  --json          Machine-readable output for status/doctor/project\n\
+  -h, --help      Print help and exit\n\n\
+Controller V0 does not modify Desktop and uses existing Server, Runner, and Tunnel process contracts.\n"
 }
 
 pub(crate) fn connect_usage() -> &'static str {
@@ -131,6 +167,7 @@ pub(crate) fn pairing_create_usage() -> &'static str {
        --ttl-secs SECS           Pairing code lifetime [default: 600; range: 60..3600]\n\
        --user-token-name NAME    Name for the user API token created during enroll\n\
        --runner-token-name NAME  Name for the Runner transport token created during enroll\n\
+       --runner-capabilities    Explicitly grant SSH resource management and ACP coding runs\n\
        --json                    Print machine-readable output\n\
        -h, --help                Print help and exit\n\n\
      Server/admin-side command:\n\
@@ -393,13 +430,13 @@ For start/stop/restart/logs/uninstall, --service-file PATH targets a custom mana
 }
 
 pub(crate) fn server_tunnel_usage() -> &'static str {
-    "Usage: webcodex server tunnel --provider openai --env-file PATH --json --stop-on-stdin-eof\n\n\
+    "Usage: webcodex server tunnel --provider openai --env-file PATH --json [--stop-on-stdin-eof]\n\n\
 Run the canonical OpenAI Secure Tunnel for an already-running local WebCodex Server.\n\n\
 Options:\n\
   --provider openai          Required provider; regular Cloudflare remains a separate future contract\n\
   --env-file PATH            Local Server env file used for loopback address and bootstrap authority\n\
   --json                     Emit the safe machine readiness event\n\
-  --stop-on-stdin-eof        Stop when the owning integration closes stdin\n\
+  --stop-on-stdin-eof        Stop when the owning integration closes stdin (default: keep running)\n\
   -h, --help                 Print help and exit\n\n\
 The Tunnel exposes only the local Server MCP endpoint and authenticates it with the effective Server bootstrap credential (process environment overrides the env file). The ready event contains only provider/readiness/clipboard metadata; credentials are never printed.\n"
 }
@@ -412,10 +449,13 @@ Options:\n\
   --env-file PATH        Server env file\n\
   --public-url URL       Optional public URL\n\
   --open                 Allow anonymous access for trusted demos\n\
+  --allow-remote-shared-key\n\
+                         Explicitly allow remote shared-key auth across a non-loopback/public boundary\n\
   --overwrite            Update an existing env file while preserving its token\n\
   --json                 Print a summary without the full token\n\
   -h, --help             Print help and exit\n\n\
-Shared-key mode is enabled. The full bootstrap token is saved only in the env file.\n"
+The full bootstrap token is saved only in the env file. Shared-key quick start is enabled for loopback-only setups.\n\
+Any non-loopback HTTP/QUIC listener or public URL requires --allow-remote-shared-key.\n"
 }
 
 pub(crate) fn server_install_service_usage() -> &'static str {
@@ -481,7 +521,6 @@ pub(crate) fn runner_init_usage() -> &'static str {
        --transport NAME           websocket (default), polling, quic, or auto\n\
        --poll-interval-ms N       Minimum idle polling interval; default 1000, max 30000 for polling/auto\n\
        --project-registry-dir PATH  Runner project registry directory [default: profile project-registry]\n\
-       --projects-dir PATH        Deprecated legacy alias for --project-registry-dir\n\
        --allowed-root PATH        Allowed project/root path; repeatable\n\
        --allow-cwd-anywhere BOOL  Allow cwd outside allowed_roots; default false\n\
        --output PATH|-            Output config path, or '-' for stdout [default: profile runner.toml]\n\

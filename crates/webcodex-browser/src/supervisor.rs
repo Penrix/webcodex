@@ -2,21 +2,32 @@ use crate::cdp::{
     BackendFactory, BackendNode, BackendPage, BackendScreenshot, BrowserBackend, ChromiumFactory,
 };
 use crate::types::{
-    clip_bytes, clip_chars, validate_navigation_url, BrowserError, BrowserKey, BrowserResult,
-    BrowserShutdownReport, BrowserSummary, PageSummary, Screenshot, SemanticNode, SemanticSnapshot,
-    BROWSER_IDLE_TIMEOUT, MAX_BROWSERS, MAX_BROWSER_LIFETIME, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION,
-    MAX_INPUT_TEXT_BYTES, MAX_NODE_TEXT_BYTES, MAX_PAGES_PER_BROWSER, MAX_PAGE_SUMMARIES,
-    MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_NODES, SHUTDOWN_TIMEOUT,
+    clip_bytes, clip_chars, validate_navigation_url, AdmittedBrowserAction, BatchOperation,
+    BatchResult, BrowserError, BrowserKey, BrowserResult, BrowserShutdownReport, BrowserStability,
+    BrowserSummary, ControlCapability, ExecutionState, PageSummary, Screenshot, SemanticNode,
+    SemanticSnapshot, SnapshotMode, BROWSER_IDLE_TIMEOUT, MAX_BATCH_OPERATIONS, MAX_BROWSERS,
+    MAX_BROWSER_LIFETIME, MAX_IMAGE_BYTES, MAX_IMAGE_DIMENSION, MAX_INPUT_TEXT_BYTES,
+    MAX_NODE_TEXT_BYTES, MAX_PAGES_PER_BROWSER, MAX_PAGE_SUMMARIES, MAX_SNAPSHOT_BYTES,
+    MAX_SNAPSHOT_NODES, SHUTDOWN_TIMEOUT,
 };
 use base64::{engine::general_purpose, Engine as _};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(test)]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+// Keep non-image Browser observations below the Server's ordinary 256 KiB
+// Runner-result retention boundary, with explicit room for the Runner envelope.
+const MAX_BROWSER_OBSERVATION_RESULT_BYTES: usize = 192 * 1024;
+const BROWSER_OBSERVATION_ENVELOPE_RESERVE_BYTES: usize = 8 * 1024;
+const BROWSER_OBSERVATION_ENTRIES_BYTES: usize =
+    MAX_BROWSER_OBSERVATION_RESULT_BYTES - BROWSER_OBSERVATION_ENVELOPE_RESERVE_BYTES;
+const DIAGNOSTIC_SECTION_ENTRIES_BYTES: usize = BROWSER_OBSERVATION_ENTRIES_BYTES / 2;
+const AUTO_SNAPSHOT_COMPACT_NODES: usize = 128;
+const DEFAULT_SNAPSHOT_DEPTH: u32 = 32;
+const ACTION_STABILITY_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone)]
 pub struct BrowserSupervisor {
@@ -42,7 +53,7 @@ struct ElementIdentity {
     document_id: String,
     snapshot_generation: u64,
     backend_node_id: i64,
-    actionable: bool,
+    capability: ControlCapability,
 }
 
 struct BrowserRuntime {
@@ -230,15 +241,32 @@ impl BrowserSupervisor {
         })
     }
 
-    pub fn snapshot(&self, browser_id: &str, page_id: &str) -> BrowserResult<SemanticSnapshot> {
+    pub fn snapshot(
+        &self,
+        browser_id: &str,
+        page_id: &str,
+        mode: SnapshotMode,
+        max_nodes: usize,
+        max_depth: u32,
+    ) -> BrowserResult<SemanticSnapshot> {
         self.touch_current(browser_id)?;
+        let max_nodes = max_nodes.clamp(1, MAX_SNAPSHOT_NODES);
+        let max_depth = max_depth.clamp(1, DEFAULT_SNAPSHOT_DEPTH);
         let mut state = self.operation_state()?;
         let runtime = state
             .browsers
             .get_mut(browser_id)
             .ok_or_else(|| stale_browser(browser_id))?;
         let target_id = runtime.page_target(page_id)?;
-        let snapshot = runtime.backend.snapshot(&target_id)?;
+        let snapshot = runtime.backend.snapshot(&target_id, max_depth)?;
+        let auto_compacted = mode == SnapshotMode::Auto
+            && should_auto_compact_snapshot(&snapshot.nodes, snapshot.truncated, max_nodes);
+        let effective_mode = match mode {
+            SnapshotMode::Auto if auto_compacted => SnapshotMode::Interactive,
+            SnapshotMode::Auto => SnapshotMode::Full,
+            other => other,
+        };
+
         runtime.generation = runtime.generation.saturating_add(1);
         let generation = runtime.generation;
         runtime.elements.clear();
@@ -246,12 +274,25 @@ impl BrowserSupervisor {
             page.document_id = snapshot.document_id.clone();
             page.snapshot_generation = generation;
         }
+
+        let source_nodes = snapshot
+            .nodes
+            .into_iter()
+            .filter(|node| {
+                effective_mode != SnapshotMode::Interactive
+                    || retained_in_interactive_snapshot(node)
+            })
+            .collect::<Vec<_>>();
         let mut nodes = Vec::new();
         let mut aggregate_bytes = 0usize;
-        let mut truncated = snapshot.truncated;
+        let mut truncated = if effective_mode == SnapshotMode::Interactive {
+            source_nodes.len() > max_nodes
+        } else {
+            snapshot.truncated || source_nodes.len() > max_nodes
+        };
         let mut group_ids = HashMap::<String, String>::new();
         let mut next_group_id = 1usize;
-        for node in snapshot.nodes.into_iter().take(MAX_SNAPSHOT_NODES) {
+        for node in source_nodes.into_iter().take(max_nodes) {
             let group_id = node.group_key.as_ref().map(|key| {
                 group_ids
                     .entry(key.clone())
@@ -278,6 +319,10 @@ impl BrowserSupervisor {
             browser_id: browser_id.to_string(),
             page_id: page_id.to_string(),
             snapshot_generation: generation,
+            snapshot_mode: effective_mode.as_str().to_string(),
+            auto_compacted,
+            max_nodes,
+            max_depth,
             node_count: nodes.len(),
             truncated,
             nodes,
@@ -296,7 +341,208 @@ impl BrowserSupervisor {
         screenshot_result(browser_id, page_id, shot)
     }
 
-    pub fn navigate(&self, browser_id: &str, page_id: &str, url: &str) -> BrowserResult<()> {
+    pub fn console(&self, browser_id: &str, page_id: &str) -> BrowserResult<serde_json::Value> {
+        self.touch_current(browser_id)?;
+        let mut state = self.operation_state()?;
+        let runtime = state
+            .browsers
+            .get_mut(browser_id)
+            .ok_or_else(|| stale_browser(browser_id))?;
+        let target_id = runtime.page_target(page_id)?;
+        let snapshot = runtime.backend.console(&target_id)?;
+        let retained_count = snapshot.entries.len();
+        let entries = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| serde_json::json!({
+                "level": entry.level, "text": entry.text, "source": entry.source, "timestamp": entry.timestamp
+            }))
+            .collect::<Vec<_>>();
+        let (entries, projection_truncated) =
+            bounded_recent_json_entries(entries, BROWSER_OBSERVATION_ENTRIES_BYTES);
+        Ok(serde_json::json!({
+            "cursor": snapshot.cursor,
+            "retained_count": retained_count,
+            "count": entries.len(),
+            "truncated": snapshot.truncated || projection_truncated,
+            "entries": entries,
+        }))
+    }
+
+    pub fn network(&self, browser_id: &str, page_id: &str) -> BrowserResult<serde_json::Value> {
+        self.touch_current(browser_id)?;
+        let mut state = self.operation_state()?;
+        let runtime = state
+            .browsers
+            .get_mut(browser_id)
+            .ok_or_else(|| stale_browser(browser_id))?;
+        let target_id = runtime.page_target(page_id)?;
+        let snapshot = runtime.backend.network(&target_id)?;
+        let retained_count = snapshot.entries.len();
+        let entries = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| serde_json::json!({
+                "method": entry.method, "url": entry.url, "resource_type": entry.resource_type,
+                "status": entry.status, "failed_reason": entry.failed_reason, "timestamp": entry.timestamp
+            }))
+            .collect::<Vec<_>>();
+        let (entries, projection_truncated) =
+            bounded_recent_json_entries(entries, BROWSER_OBSERVATION_ENTRIES_BYTES);
+        Ok(serde_json::json!({
+            "cursor": snapshot.cursor,
+            "retained_count": retained_count,
+            "count": entries.len(),
+            "truncated": snapshot.truncated || projection_truncated,
+            "entries": entries,
+        }))
+    }
+
+    pub fn diagnostics(
+        &self,
+        browser_id: &str,
+        page_id: &str,
+        include_all_console: bool,
+        include_all_network: bool,
+        since_cursor: Option<u64>,
+    ) -> BrowserResult<serde_json::Value> {
+        self.touch_current(browser_id)?;
+        let mut state = self.operation_state()?;
+        let runtime = state
+            .browsers
+            .get_mut(browser_id)
+            .ok_or_else(|| stale_browser(browser_id))?;
+        let target_id = runtime.page_target(page_id)?;
+        let snapshot = runtime.backend.diagnostics(&target_id)?;
+        let since_cursor = since_cursor.unwrap_or(0);
+        if since_cursor > snapshot.cursor {
+            return Err(BrowserError::not_started(
+                "invalid_diagnostics_cursor",
+                "diagnostics cursor is newer than the current page event stream",
+            ));
+        }
+
+        let console_retained = snapshot.console.entries.len();
+        let network_retained = snapshot.network.entries.len();
+        let backend_delta_truncated = since_cursor > 0
+            && (since_cursor < snapshot.cleared_through_cursor
+                || (snapshot.console.truncated
+                    && snapshot
+                        .console
+                        .oldest_sequence
+                        .is_some_and(|oldest| since_cursor.saturating_add(1) < oldest))
+                || (snapshot.network.truncated
+                    && snapshot
+                        .network
+                        .oldest_sequence
+                        .is_some_and(|oldest| since_cursor.saturating_add(1) < oldest)));
+
+        let new_console_entries = snapshot
+            .console
+            .entries
+            .into_iter()
+            .filter(|entry| entry.sequence > since_cursor)
+            .collect::<Vec<_>>();
+        let new_network_entries = snapshot
+            .network
+            .entries
+            .into_iter()
+            .filter(|entry| entry.sequence > since_cursor)
+            .collect::<Vec<_>>();
+
+        let new_console_errors = new_console_entries
+            .iter()
+            .filter(|entry| matches!(entry.level.as_str(), "error" | "exception"))
+            .count();
+        let new_console_warnings = new_console_entries
+            .iter()
+            .filter(|entry| matches!(entry.level.as_str(), "warning" | "warn"))
+            .count();
+        let new_failed_requests = new_network_entries
+            .iter()
+            .filter(|entry| entry.failed_reason.is_some())
+            .count();
+        let new_4xx = new_network_entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .status
+                    .is_some_and(|status| (400..500).contains(&status))
+            })
+            .count();
+        let new_5xx = new_network_entries
+            .iter()
+            .filter(|entry| entry.status.is_some_and(|status| status >= 500))
+            .count();
+
+        let console = new_console_entries
+            .into_iter()
+            .filter(|entry| {
+                include_all_console
+                    || matches!(
+                        entry.level.as_str(),
+                        "error" | "warning" | "warn" | "exception"
+                    )
+            })
+            .map(|entry| serde_json::json!({
+                "level": entry.level, "text": entry.text, "source": entry.source, "timestamp": entry.timestamp
+            }))
+            .collect::<Vec<_>>();
+        let network = new_network_entries
+            .into_iter()
+            .filter(|entry| {
+                include_all_network
+                    || entry.failed_reason.is_some()
+                    || entry.status.is_some_and(|status| status >= 400)
+                    || matches!(entry.resource_type.as_deref(), Some("XHR") | Some("Fetch"))
+            })
+            .map(|entry| serde_json::json!({
+                "method": entry.method, "url": entry.url, "resource_type": entry.resource_type,
+                "status": entry.status, "failed_reason": entry.failed_reason, "timestamp": entry.timestamp
+            }))
+            .collect::<Vec<_>>();
+        let (console, console_truncated) =
+            bounded_recent_json_entries(console, DIAGNOSTIC_SECTION_ENTRIES_BYTES);
+        let (network, network_truncated) =
+            bounded_recent_json_entries(network, DIAGNOSTIC_SECTION_ENTRIES_BYTES);
+        let delta_truncated = backend_delta_truncated || console_truncated || network_truncated;
+        Ok(serde_json::json!({
+            "cursor": snapshot.cursor,
+            "since_cursor": since_cursor,
+            "delta_truncated": delta_truncated,
+            "new_console_errors": new_console_errors,
+            "new_console_warnings": new_console_warnings,
+            "new_failed_requests": new_failed_requests,
+            "new_4xx": new_4xx,
+            "new_5xx": new_5xx,
+            "console_retained": console_retained,
+            "console_count": console.len(),
+            "console_truncated": snapshot.console.truncated || console_truncated,
+            "console": console,
+            "network_retained": network_retained,
+            "network_count": network.len(),
+            "network_truncated": snapshot.network.truncated || network_truncated,
+            "network": network,
+        }))
+    }
+
+    pub fn clear_diagnostics(&self, browser_id: &str, page_id: &str) -> BrowserResult<()> {
+        self.touch_current(browser_id)?;
+        let mut state = self.operation_state()?;
+        let runtime = state
+            .browsers
+            .get_mut(browser_id)
+            .ok_or_else(|| stale_browser(browser_id))?;
+        let target_id = runtime.page_target(page_id)?;
+        runtime.backend.clear_diagnostics(&target_id)
+    }
+
+    pub fn navigate(
+        &self,
+        browser_id: &str,
+        page_id: &str,
+        url: &str,
+    ) -> BrowserResult<BrowserStability> {
         self.touch_current(browser_id)?;
         validate_navigation_url(url)?;
         let mut state = self.operation_state()?;
@@ -308,14 +554,37 @@ impl BrowserSupervisor {
         // Navigation can replace the document. Fence prior element authority before
         // dispatch; uncertain outcomes remain stale rather than silently retargeting.
         runtime.invalidate_elements_for_page(page_id);
-        runtime.backend.navigate(&target_id, url)
+        runtime.backend.navigate(&target_id, url)?;
+        Ok(runtime.wait_after_effect(&target_id))
     }
 
-    pub fn click(&self, browser_id: &str, page_id: &str, element_id: &str) -> BrowserResult<()> {
+    pub fn reload(&self, browser_id: &str, page_id: &str) -> BrowserResult<BrowserStability> {
         self.touch_current(browser_id)?;
-        self.element_effect(browser_id, page_id, element_id, |backend, target, node| {
-            backend.click(target, node)
-        })
+        let mut state = self.operation_state()?;
+        let runtime = state
+            .browsers
+            .get_mut(browser_id)
+            .ok_or_else(|| stale_browser(browser_id))?;
+        let target_id = runtime.page_target(page_id)?;
+        runtime.invalidate_elements_for_page(page_id);
+        runtime.backend.reload(&target_id)?;
+        Ok(runtime.wait_after_effect(&target_id))
+    }
+
+    pub fn click(
+        &self,
+        browser_id: &str,
+        page_id: &str,
+        element_id: &str,
+    ) -> BrowserResult<BrowserStability> {
+        self.touch_current(browser_id)?;
+        self.element_effect(
+            browser_id,
+            page_id,
+            element_id,
+            AdmittedBrowserAction::Click,
+            |backend, target, node| backend.click(target, node),
+        )
     }
 
     pub fn input_text(
@@ -324,7 +593,7 @@ impl BrowserSupervisor {
         page_id: &str,
         element_id: &str,
         text: &str,
-    ) -> BrowserResult<()> {
+    ) -> BrowserResult<BrowserStability> {
         self.touch_current(browser_id)?;
         if text.is_empty() || text.contains('\0') || text.len() > MAX_INPUT_TEXT_BYTES {
             return Err(BrowserError::not_started(
@@ -332,9 +601,13 @@ impl BrowserSupervisor {
                 "input text must be non-empty, NUL-free, and within the Browser UTF-8 byte bound",
             ));
         }
-        self.element_effect(browser_id, page_id, element_id, |backend, target, node| {
-            backend.input_text(target, node, text)
-        })
+        self.element_effect(
+            browser_id,
+            page_id,
+            element_id,
+            AdmittedBrowserAction::InputText,
+            |backend, target, node| backend.input_text(target, node, text),
+        )
     }
 
     pub fn select_option(
@@ -343,7 +616,7 @@ impl BrowserSupervisor {
         page_id: &str,
         element_id: &str,
         option: &str,
-    ) -> BrowserResult<()> {
+    ) -> BrowserResult<BrowserStability> {
         self.touch_current(browser_id)?;
         if option.is_empty() || option.contains('\0') || option.len() > MAX_INPUT_TEXT_BYTES {
             return Err(BrowserError::not_started(
@@ -351,9 +624,13 @@ impl BrowserSupervisor {
                 "select option must be non-empty, NUL-free, and within the Browser UTF-8 byte bound",
             ));
         }
-        self.element_effect(browser_id, page_id, element_id, |backend, target, node| {
-            backend.select_option(target, node, option)
-        })
+        self.element_effect(
+            browser_id,
+            page_id,
+            element_id,
+            AdmittedBrowserAction::SelectOption,
+            |backend, target, node| backend.select_option(target, node, option),
+        )
     }
 
     pub fn set_value(
@@ -362,7 +639,7 @@ impl BrowserSupervisor {
         page_id: &str,
         element_id: &str,
         value: &str,
-    ) -> BrowserResult<()> {
+    ) -> BrowserResult<BrowserStability> {
         self.touch_current(browser_id)?;
         if value.is_empty() || value.contains('\0') || value.len() > MAX_INPUT_TEXT_BYTES {
             return Err(BrowserError::not_started(
@@ -370,9 +647,13 @@ impl BrowserSupervisor {
                 "form value must be non-empty, NUL-free, and within the Browser UTF-8 byte bound",
             ));
         }
-        self.element_effect(browser_id, page_id, element_id, |backend, target, node| {
-            backend.set_value(target, node, value)
-        })
+        self.element_effect(
+            browser_id,
+            page_id,
+            element_id,
+            AdmittedBrowserAction::SetValue,
+            |backend, target, node| backend.set_value(target, node, value),
+        )
     }
 
     pub fn upload_file(
@@ -381,14 +662,23 @@ impl BrowserSupervisor {
         page_id: &str,
         element_id: &str,
         path: &std::path::Path,
-    ) -> BrowserResult<()> {
+    ) -> BrowserResult<BrowserStability> {
         self.touch_current(browser_id)?;
-        self.element_effect(browser_id, page_id, element_id, |backend, target, node| {
-            backend.upload_file(target, node, path)
-        })
+        self.element_effect(
+            browser_id,
+            page_id,
+            element_id,
+            AdmittedBrowserAction::UploadFile,
+            |backend, target, node| backend.upload_file(target, node, path),
+        )
     }
 
-    pub fn key(&self, browser_id: &str, page_id: &str, key: BrowserKey) -> BrowserResult<()> {
+    pub fn key(
+        &self,
+        browser_id: &str,
+        page_id: &str,
+        key: BrowserKey,
+    ) -> BrowserResult<BrowserStability> {
         self.touch_current(browser_id)?;
         let mut state = self.operation_state()?;
         let runtime = state
@@ -397,7 +687,8 @@ impl BrowserSupervisor {
             .ok_or_else(|| stale_browser(browser_id))?;
         let target_id = runtime.page_target(page_id)?;
         runtime.refresh_document_fence(page_id, &target_id)?;
-        runtime.backend.key(&target_id, key)
+        runtime.backend.key(&target_id, key)?;
+        Ok(runtime.wait_after_effect(&target_id))
     }
 
     pub fn close_page(&self, browser_id: &str, page_id: &str) -> BrowserResult<()> {
@@ -501,13 +792,117 @@ impl BrowserSupervisor {
         }
     }
 
+    pub fn batch(
+        &self,
+        browser_id: &str,
+        page_id: &str,
+        operations: &[BatchOperation],
+    ) -> BrowserResult<BatchResult> {
+        if operations.is_empty() || operations.len() > MAX_BATCH_OPERATIONS {
+            return Err(BrowserError::not_started(
+                "invalid_batch_count",
+                "batch requires 1..32 operations",
+            ));
+        }
+        self.touch_current(browser_id)?;
+        let mut state = self.operation_state()?;
+        let runtime = state
+            .browsers
+            .get_mut(browser_id)
+            .ok_or_else(|| stale_browser(browser_id))?;
+        let target = runtime.page_target(page_id)?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut result = BatchResult {
+            execution_state: ExecutionState::NotStarted,
+            requested_count: operations.len(),
+            completed_count: 0,
+            stopped_at_index: None,
+            remaining_count: operations.len(),
+            needs_snapshot: false,
+            stability: None,
+            error: None,
+        };
+        for (index, operation) in operations.iter().enumerate() {
+            let attempt = (|| {
+                if Instant::now() >= deadline {
+                    return Err(BrowserError::not_started(
+                        "batch_deadline",
+                        "batch dispatch budget exhausted",
+                    ));
+                }
+                operation.validate()?;
+                let (element_id, action) = operation.authority();
+                let element = runtime.authorized_element(page_id, &target, element_id, action)?;
+                let node = element.backend_node_id;
+                match operation {
+                    BatchOperation::Click { .. } => runtime.backend.click(&target, node),
+                    BatchOperation::InputText { text, .. } => {
+                        runtime.backend.input_text(&target, node, text)
+                    }
+                    BatchOperation::SelectOption { option, .. } => {
+                        runtime.backend.select_option(&target, node, option)
+                    }
+                    BatchOperation::SetValue { value, .. } => {
+                        runtime.backend.set_value(&target, node, value)
+                    }
+                    BatchOperation::UploadFile { path, .. } => {
+                        runtime.backend.upload_file(&target, node, path)
+                    }
+                }
+            })();
+            if let Err(error) = attempt {
+                // Backend observed errors can still describe an explicitly completed effect.
+                if error.execution_state == ExecutionState::Completed {
+                    result.completed_count += 1;
+                }
+                if error.execution_state == ExecutionState::OutcomeUnknown {
+                    result.execution_state = ExecutionState::OutcomeUnknown;
+                }
+                result.remaining_count = operations.len()
+                    - result.completed_count
+                    - usize::from(error.execution_state == ExecutionState::OutcomeUnknown);
+                result.stopped_at_index = Some(index);
+                result.error = Some(error);
+                break;
+            }
+            result.completed_count += 1;
+            result.remaining_count -= 1;
+            // All field handlers may synchronously navigate, not just clicks.
+            // Reconcile even the final operation before reporting reusable authority.
+            if let Err(mut error) = runtime.refresh_document_fence(page_id, &target) {
+                error.execution_state = ExecutionState::Completed;
+                result.stopped_at_index = Some(index);
+                result.error = Some(error);
+                break;
+            }
+        }
+        if result.execution_state != ExecutionState::OutcomeUnknown && result.completed_count > 0 {
+            result.execution_state = ExecutionState::Completed;
+        }
+        if result.error.is_none() {
+            result.stability = Some(runtime.wait_after_effect(&target));
+            if let Err(mut error) = runtime.refresh_document_fence(page_id, &target) {
+                error.execution_state = ExecutionState::Completed;
+                result.stopped_at_index = Some(operations.len() - 1);
+                result.error = Some(error);
+            }
+        }
+        result.needs_snapshot =
+            result.error.is_some() || result.stability.as_ref().is_some_and(|s| !s.stable);
+        if let Some(error) = &mut result.error {
+            error.recovery_action.get_or_insert("snapshot");
+        }
+        Ok(result)
+    }
+
     fn element_effect<F>(
         &self,
         browser_id: &str,
         page_id: &str,
         element_id: &str,
+        action: AdmittedBrowserAction,
         effect: F,
-    ) -> BrowserResult<()>
+    ) -> BrowserResult<BrowserStability>
     where
         F: FnOnce(&mut dyn BrowserBackend, &str, i64) -> BrowserResult<()>,
     {
@@ -517,28 +912,13 @@ impl BrowserSupervisor {
             .get_mut(browser_id)
             .ok_or_else(|| stale_browser(browser_id))?;
         let target_id = runtime.page_target(page_id)?;
-        runtime.refresh_document_fence(page_id, &target_id)?;
-        let element = runtime
-            .elements
-            .get(element_id)
-            .cloned()
-            .ok_or_else(stale_element)?;
-        let page = runtime
-            .pages
-            .get(page_id)
-            .ok_or_else(|| stale_page(page_id))?;
-        if element.page_id != page_id
-            || element.document_id != page.document_id
-            || element.snapshot_generation != page.snapshot_generation
-            || !element.actionable
-        {
-            return Err(stale_element());
-        }
+        let element = runtime.authorized_element(page_id, &target_id, element_id, action)?;
         effect(
             runtime.backend.as_mut(),
             &target_id,
             element.backend_node_id,
-        )
+        )?;
+        Ok(runtime.wait_after_effect(&target_id))
     }
 
     fn reject_if_shutting_down(&self) -> BrowserResult<()> {
@@ -573,6 +953,32 @@ impl BrowserSupervisor {
 }
 
 impl BrowserRuntime {
+    fn authorized_element(
+        &mut self,
+        page_id: &str,
+        target_id: &str,
+        element_id: &str,
+        action: AdmittedBrowserAction,
+    ) -> BrowserResult<ElementIdentity> {
+        self.refresh_document_fence(page_id, target_id)?;
+        let element = self
+            .elements
+            .get(element_id)
+            .cloned()
+            .ok_or_else(stale_element)?;
+        let page = self.pages.get(page_id).ok_or_else(|| stale_page(page_id))?;
+        if element.page_id != page_id
+            || element.document_id != page.document_id
+            || element.snapshot_generation != page.snapshot_generation
+        {
+            return Err(stale_element());
+        }
+        if !element.capability.admits(action) {
+            return Err(unsupported_element_action());
+        }
+        Ok(element)
+    }
+
     fn new(backend: Box<dyn BrowserBackend>) -> Self {
         let now = Instant::now();
         Self {
@@ -589,6 +995,16 @@ impl BrowserRuntime {
 
     fn page_count(&self) -> usize {
         self.pages.len().max(self.page_count_floor)
+    }
+
+    fn wait_after_effect(&mut self, target_id: &str) -> BrowserStability {
+        self.backend
+            .wait_for_stable(target_id, ACTION_STABILITY_TIMEOUT)
+            .unwrap_or_else(|_| BrowserStability {
+                stable: false,
+                waited_ms: 0,
+                reason: "observation_failed".to_string(),
+            })
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -659,7 +1075,9 @@ impl BrowserRuntime {
         group_id: Option<String>,
     ) -> SemanticNode {
         let mut element_id = None;
-        if node.actionable {
+        let actions = node.capability.action_names();
+        let actionable = node.capability.admits_any();
+        if actionable {
             if let Some(backend_node_id) = node.backend_node_id {
                 let id = opaque_id("element");
                 self.elements.insert(
@@ -669,7 +1087,7 @@ impl BrowserRuntime {
                         document_id: document_id.to_string(),
                         snapshot_generation,
                         backend_node_id,
-                        actionable: true,
+                        capability: node.capability,
                     },
                 );
                 element_id = Some(id);
@@ -696,8 +1114,13 @@ impl BrowserRuntime {
             required: node.required,
             disabled: node.disabled,
             read_only: node.read_only,
+            actions: if element_id.is_some() {
+                actions
+            } else {
+                Vec::new()
+            },
+            actionable: element_id.is_some(),
             element_id,
-            actionable: node.actionable,
         }
     }
 
@@ -727,6 +1150,33 @@ impl BrowserRuntime {
         }
         Ok(())
     }
+}
+
+fn retained_in_interactive_snapshot(node: &BackendNode) -> bool {
+    if node.select_choice {
+        return true;
+    }
+    node.capability.admits_any() && node.backend_node_id.is_some()
+}
+
+fn should_auto_compact_snapshot(
+    nodes: &[BackendNode],
+    backend_truncated: bool,
+    max_nodes: usize,
+) -> bool {
+    if backend_truncated || nodes.len() > max_nodes || nodes.len() > AUTO_SNAPSHOT_COMPACT_NODES {
+        return true;
+    }
+    let estimated = nodes.iter().fold(0usize, |total, node| {
+        total
+            .saturating_add(node.role.len())
+            .saturating_add(node.name.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(node.description.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(node.value.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(node.group_label.as_deref().map(str::len).unwrap_or(0))
+            .saturating_add(160)
+    });
+    estimated > (MAX_SNAPSHOT_BYTES * 3 / 4)
 }
 
 fn screenshot_result(
@@ -770,6 +1220,30 @@ fn screenshot_result(
     })
 }
 
+fn bounded_recent_json_entries(
+    entries: Vec<serde_json::Value>,
+    max_serialized_bytes: usize,
+) -> (Vec<serde_json::Value>, bool) {
+    let total = entries.len();
+    let mut kept = Vec::new();
+    // Exact JSON-array accounting: brackets plus one comma between entries.
+    let mut used = 2usize;
+    for entry in entries.into_iter().rev() {
+        let entry_bytes = serde_json::to_vec(&entry)
+            .map(|encoded| encoded.len())
+            .unwrap_or(max_serialized_bytes.saturating_add(1));
+        let separator = usize::from(!kept.is_empty());
+        if used.saturating_add(separator).saturating_add(entry_bytes) > max_serialized_bytes {
+            break;
+        }
+        used = used.saturating_add(separator).saturating_add(entry_bytes);
+        kept.push(entry);
+    }
+    kept.reverse();
+    let truncated = kept.len() < total;
+    (kept, truncated)
+}
+
 fn pre_effect_revalidation_error(mut error: BrowserError) -> BrowserError {
     error.execution_state = crate::types::ExecutionState::NotStarted;
     if error.recovery_action.is_none() {
@@ -786,9 +1260,18 @@ fn stale_browser(browser_id: &str) -> BrowserError {
 }
 
 fn stale_page(page_id: &str) -> BrowserError {
-    BrowserError::not_started(
+    let mut error = BrowserError::not_started(
         "stale_page",
         format!("page_id '{page_id}' is no longer current"),
+    );
+    error.recovery_action = Some("pages");
+    error
+}
+
+fn unsupported_element_action() -> BrowserError {
+    BrowserError::not_started(
+        "element_action_unsupported",
+        "snapshot element does not admit this Browser action",
     )
 }
 
@@ -807,10 +1290,39 @@ fn opaque_id(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod batch;
     use super::*;
-    use crate::cdp::{BackendFactory, BackendSnapshot, BrowserBackend};
+    use crate::cdp::{
+        BackendConsoleEntry, BackendDiagnosticsSnapshot, BackendEventSnapshot, BackendFactory,
+        BackendNetworkEntry, BackendSnapshot, BrowserBackend,
+    };
     use crate::types::ExecutionState;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn fixture_node(
+        role: &str,
+        name: &str,
+        backend_node_id: Option<i64>,
+        capability: ControlCapability,
+    ) -> crate::cdp::BackendNode {
+        crate::cdp::BackendNode {
+            role: role.to_string(),
+            name: Some(name.to_string()),
+            description: None,
+            value: None,
+            group_key: None,
+            group_role: None,
+            group_label: None,
+            checked: None,
+            selected: None,
+            required: None,
+            disabled: None,
+            read_only: None,
+            backend_node_id,
+            capability,
+            select_choice: false,
+        }
+    }
 
     #[derive(Default)]
     struct FakeFactory {
@@ -829,11 +1341,19 @@ mod tests {
     }
 
     struct FakeBackend {
+        batch_probe: Option<Arc<Mutex<batch::BatchProbe>>>,
         pages: Vec<BackendPage>,
         document_generation: u64,
         snapshot_node_count: usize,
+        mixed_snapshot: bool,
+        diagnostic_calls: usize,
+        diagnostics_cleared_through_cursor: u64,
+        large_diagnostics: bool,
+        wait_fails: bool,
         fail_pages_after_create: bool,
         page_created: bool,
+        structured_controls: bool,
+        compact_select_page: bool,
     }
 
     impl FakeBackend {
@@ -843,6 +1363,7 @@ mod tests {
 
         fn with_snapshot_nodes(snapshot_node_count: usize) -> Self {
             Self {
+                batch_probe: None,
                 pages: vec![BackendPage {
                     target_id: "private-target".to_string(),
                     title: "Fixture".to_string(),
@@ -851,9 +1372,28 @@ mod tests {
                 }],
                 document_generation: 1,
                 snapshot_node_count,
+                mixed_snapshot: false,
+                diagnostic_calls: 0,
+                diagnostics_cleared_through_cursor: 0,
+                large_diagnostics: false,
+                wait_fails: false,
                 fail_pages_after_create: false,
                 page_created: false,
+                structured_controls: false,
+                compact_select_page: false,
             }
+        }
+
+        fn with_compact_select_page() -> Self {
+            let mut backend = Self::new();
+            backend.compact_select_page = true;
+            backend
+        }
+
+        fn with_structured_controls() -> Self {
+            let mut backend = Self::new();
+            backend.structured_controls = true;
+            backend
         }
 
         fn with_new_page_reconcile_failure() -> Self {
@@ -861,10 +1401,39 @@ mod tests {
             backend.fail_pages_after_create = true;
             backend
         }
+
+        fn with_mixed_snapshot() -> Self {
+            let mut backend = Self::with_snapshot_nodes(6);
+            backend.mixed_snapshot = true;
+            backend
+        }
+
+        fn with_wait_failure() -> Self {
+            let mut backend = Self::new();
+            backend.wait_fails = true;
+            backend
+        }
+
+        fn with_large_diagnostics() -> Self {
+            let mut backend = Self::new();
+            backend.large_diagnostics = true;
+            backend
+        }
     }
 
     impl BrowserBackend for FakeBackend {
         fn pages(&mut self) -> BrowserResult<Vec<BackendPage>> {
+            if self
+                .batch_probe
+                .as_ref()
+                .is_some_and(|p| p.lock().unwrap().fail_freshness)
+            {
+                return Err(BrowserError::observed(
+                    "fixture_pages_failed",
+                    "freshness observation failed",
+                    None,
+                ));
+            }
             if self.fail_pages_after_create && self.page_created {
                 return Err(BrowserError::observed(
                     "fixture_pages_failed",
@@ -885,23 +1454,74 @@ mod tests {
             self.page_created = true;
             Ok(target_id)
         }
-        fn snapshot(&mut self, _target_id: &str) -> BrowserResult<BackendSnapshot> {
+        fn snapshot(
+            &mut self,
+            _target_id: &str,
+            _max_depth: u32,
+        ) -> BrowserResult<BackendSnapshot> {
+            if self.batch_probe.is_some() {
+                return Ok(BackendSnapshot {
+                    document_id: self.pages[0].document_id.clone(),
+                    nodes: batch::form_nodes(),
+                    truncated: false,
+                });
+            }
+            if self.compact_select_page {
+                let (nodes, truncated) = crate::cdp::project_ax_nodes(
+                    &compact_select_ax_nodes(),
+                    Some(&compact_select_dom()),
+                );
+                return Ok(BackendSnapshot {
+                    document_id: format!("doc-{}", self.document_generation),
+                    nodes,
+                    truncated,
+                });
+            }
+            if self.structured_controls {
+                return Ok(BackendSnapshot {
+                    document_id: format!("doc-{}", self.document_generation),
+                    nodes: vec![
+                        fixture_node("button", "Go", Some(7), ControlCapability::click()),
+                        fixture_node(
+                            "spinbutton",
+                            "Qty",
+                            Some(8),
+                            ControlCapability::exact_value(),
+                        ),
+                        fixture_node("option", "Alpha", Some(9), ControlCapability::default()),
+                        fixture_node("slider", "Vol", Some(10), ControlCapability::exact_value()),
+                    ],
+                    truncated: false,
+                });
+            }
             let nodes = (0..self.snapshot_node_count)
-                .map(|index| BackendNode {
-                    role: "button".to_string(),
-                    name: Some(format!("Go {index}")),
-                    description: None,
-                    value: Some("x".repeat(MAX_NODE_TEXT_BYTES * 2)),
-                    group_key: None,
-                    group_role: None,
-                    group_label: None,
-                    checked: None,
-                    selected: None,
-                    required: None,
-                    disabled: None,
-                    read_only: None,
-                    backend_node_id: Some(index as i64 + 7),
-                    actionable: true,
+                .map(|index| {
+                    let actionable = !self.mixed_snapshot || index % 2 == 0;
+                    BackendNode {
+                        role: if actionable { "button" } else { "paragraph" }.to_string(),
+                        name: Some(if actionable {
+                            format!("Go {index}")
+                        } else {
+                            format!("Static {index}")
+                        }),
+                        description: None,
+                        value: Some("x".repeat(MAX_NODE_TEXT_BYTES * 2)),
+                        group_key: None,
+                        group_role: None,
+                        group_label: None,
+                        checked: None,
+                        selected: None,
+                        required: None,
+                        disabled: None,
+                        read_only: None,
+                        backend_node_id: actionable.then_some(index as i64 + 7),
+                        select_choice: false,
+                        capability: if actionable {
+                            ControlCapability::click()
+                        } else {
+                            ControlCapability::default()
+                        },
+                    }
                 })
                 .collect::<Vec<_>>();
             Ok(BackendSnapshot {
@@ -917,6 +1537,131 @@ mod tests {
                 height: 600,
             })
         }
+        fn console(
+            &mut self,
+            _target_id: &str,
+        ) -> BrowserResult<BackendEventSnapshot<BackendConsoleEntry>> {
+            Ok(BackendEventSnapshot {
+                entries: Vec::new(),
+                truncated: false,
+                cursor: 0,
+                oldest_sequence: None,
+            })
+        }
+        fn network(
+            &mut self,
+            _target_id: &str,
+        ) -> BrowserResult<BackendEventSnapshot<BackendNetworkEntry>> {
+            Ok(BackendEventSnapshot {
+                entries: Vec::new(),
+                truncated: false,
+                cursor: 0,
+                oldest_sequence: None,
+            })
+        }
+        fn diagnostics(&mut self, _target_id: &str) -> BrowserResult<BackendDiagnosticsSnapshot> {
+            if self.large_diagnostics {
+                let console = (1..=200)
+                    .map(|sequence| BackendConsoleEntry {
+                        sequence,
+                        level: "error".into(),
+                        text: format!(
+                            "error-{sequence}-{}",
+                            "x".repeat(crate::types::MAX_DIAGNOSTIC_TEXT_BYTES)
+                        ),
+                        source: None,
+                        timestamp: Some(sequence as f64),
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(BackendDiagnosticsSnapshot {
+                    console: BackendEventSnapshot {
+                        entries: console,
+                        truncated: false,
+                        cursor: 200,
+                        oldest_sequence: Some(1),
+                    },
+                    network: BackendEventSnapshot {
+                        entries: Vec::new(),
+                        truncated: false,
+                        cursor: 200,
+                        oldest_sequence: None,
+                    },
+                    cursor: 200,
+                    cleared_through_cursor: self.diagnostics_cleared_through_cursor,
+                });
+            }
+            self.diagnostic_calls += 1;
+            let cursor = if self.diagnostic_calls == 1 { 3 } else { 5 };
+            let mut console = vec![BackendConsoleEntry {
+                sequence: 1,
+                level: "warning".into(),
+                text: "first warning".into(),
+                source: None,
+                timestamp: Some(1.0),
+            }];
+            let mut network = vec![
+                BackendNetworkEntry {
+                    sequence: 2,
+                    method: "GET".into(),
+                    url: "https://example.test/api/first".into(),
+                    resource_type: Some("Fetch".into()),
+                    status: Some(200),
+                    failed_reason: None,
+                    timestamp: Some(2.0),
+                },
+                BackendNetworkEntry {
+                    sequence: 3,
+                    method: "GET".into(),
+                    url: "https://example.test/api/fail".into(),
+                    resource_type: Some("XHR".into()),
+                    status: Some(500),
+                    failed_reason: None,
+                    timestamp: Some(3.0),
+                },
+            ];
+            if self.diagnostic_calls > 1 {
+                console.push(BackendConsoleEntry {
+                    sequence: 4,
+                    level: "error".into(),
+                    text: "new error".into(),
+                    source: None,
+                    timestamp: Some(4.0),
+                });
+                network.push(BackendNetworkEntry {
+                    sequence: 5,
+                    method: "POST".into(),
+                    url: "https://example.test/api/new".into(),
+                    resource_type: Some("Fetch".into()),
+                    status: Some(404),
+                    failed_reason: None,
+                    timestamp: Some(5.0),
+                });
+            }
+            Ok(BackendDiagnosticsSnapshot {
+                console: BackendEventSnapshot {
+                    entries: console,
+                    truncated: false,
+                    cursor,
+                    oldest_sequence: Some(1),
+                },
+                network: BackendEventSnapshot {
+                    entries: network,
+                    truncated: false,
+                    cursor,
+                    oldest_sequence: Some(2),
+                },
+                cursor,
+                cleared_through_cursor: self.diagnostics_cleared_through_cursor,
+            })
+        }
+        fn clear_diagnostics(&mut self, _target_id: &str) -> BrowserResult<()> {
+            self.diagnostics_cleared_through_cursor = match self.diagnostic_calls {
+                0 => 0,
+                1 => 3,
+                _ => 5,
+            };
+            Ok(())
+        }
         fn navigate(&mut self, _target_id: &str, _url: &str) -> BrowserResult<()> {
             self.document_generation += 1;
             for page in &mut self.pages {
@@ -924,8 +1669,15 @@ mod tests {
             }
             Ok(())
         }
-        fn click(&mut self, _target_id: &str, _backend_node_id: i64) -> BrowserResult<()> {
+        fn reload(&mut self, _target_id: &str) -> BrowserResult<()> {
+            self.document_generation += 1;
+            for page in &mut self.pages {
+                page.document_id = format!("doc-{}", self.document_generation);
+            }
             Ok(())
+        }
+        fn click(&mut self, _target_id: &str, _backend_node_id: i64) -> BrowserResult<()> {
+            self.record_batch_effect(format!("click:{_backend_node_id}"))
         }
         fn input_text(
             &mut self,
@@ -933,7 +1685,7 @@ mod tests {
             _backend_node_id: i64,
             _text: &str,
         ) -> BrowserResult<()> {
-            Ok(())
+            self.record_batch_effect(format!("input:{_backend_node_id}:{_text}"))
         }
         fn select_option(
             &mut self,
@@ -941,7 +1693,7 @@ mod tests {
             _backend_node_id: i64,
             _option: &str,
         ) -> BrowserResult<()> {
-            Ok(())
+            self.record_batch_effect(format!("select:{_backend_node_id}:{_option}"))
         }
         fn set_value(
             &mut self,
@@ -949,7 +1701,7 @@ mod tests {
             _backend_node_id: i64,
             _value: &str,
         ) -> BrowserResult<()> {
-            Ok(())
+            self.record_batch_effect(format!("value:{_backend_node_id}:{_value}"))
         }
         fn upload_file(
             &mut self,
@@ -957,10 +1709,35 @@ mod tests {
             _backend_node_id: i64,
             _path: &std::path::Path,
         ) -> BrowserResult<()> {
-            Ok(())
+            self.record_batch_effect(format!("upload:{_backend_node_id}:{}", _path.display()))
         }
         fn key(&mut self, _target_id: &str, _key: BrowserKey) -> BrowserResult<()> {
             Ok(())
+        }
+        fn wait_for_stable(
+            &mut self,
+            _target_id: &str,
+            _timeout: Duration,
+        ) -> BrowserResult<BrowserStability> {
+            if let Some(probe) = &self.batch_probe {
+                let mut probe = probe.lock().unwrap();
+                probe.waits += 1;
+                if probe.replace_on_settle {
+                    self.pages[0].document_id = "replaced-during-settle".into();
+                }
+            }
+            if self.wait_fails {
+                return Err(BrowserError::observed(
+                    "fixture_wait_failed",
+                    "fixture stability observation failed",
+                    None,
+                ));
+            }
+            Ok(BrowserStability {
+                stable: true,
+                waited_ms: 0,
+                reason: "fixture_stable".to_string(),
+            })
         }
         fn close_page(&mut self, target_id: &str) -> BrowserResult<()> {
             self.pages.retain(|page| page.target_id != target_id);
@@ -968,6 +1745,133 @@ mod tests {
         }
         fn shutdown(&mut self, _timeout: Duration) -> BrowserResult<()> {
             Ok(())
+        }
+    }
+
+    fn compact_select_dom() -> serde_json::Value {
+        let mut children = vec![
+            serde_json::json!({
+                "nodeType": 1,
+                "localName": "select",
+                "backendNodeId": 10,
+                "attributes": ["aria-label", "Fruit"],
+                "children": [
+                    {
+                        "nodeType": 1,
+                        "localName": "option",
+                        "backendNodeId": 11,
+                        "attributes": ["value", "a"]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "option",
+                        "backendNodeId": 12,
+                        "attributes": ["value", "b"]
+                    },
+                    {
+                        "nodeType": 1,
+                        "localName": "optgroup",
+                        "backendNodeId": 13,
+                        "attributes": ["label", "More"],
+                        "children": [{
+                            "nodeType": 1,
+                            "localName": "option",
+                            "backendNodeId": 14,
+                            "attributes": ["value", "c"]
+                        }]
+                    }
+                ]
+            }),
+            serde_json::json!({
+                "nodeType": 1,
+                "localName": "div",
+                "backendNodeId": 20
+            }),
+            serde_json::json!({
+                "nodeType": 1,
+                "localName": "input",
+                "backendNodeId": 30,
+                "attributes": ["type", "date", "aria-label", "When"],
+                "shadowRoots": [{
+                    "nodeType": 11,
+                    "shadowRootType": "user-agent",
+                    "children": [{
+                        "nodeType": 1,
+                        "localName": "button",
+                        "backendNodeId": 31
+                    }]
+                }]
+            }),
+        ];
+        for index in 0..130 {
+            children.push(serde_json::json!({
+                "nodeType": 1,
+                "localName": "p",
+                "backendNodeId": 1000 + index
+            }));
+        }
+        serde_json::json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "body",
+                "backendNodeId": 1,
+                "children": children
+            }]
+        })
+    }
+
+    fn compact_select_ax_node(
+        name: &str,
+        role: &str,
+        backend_node_id: i64,
+        value: Option<&str>,
+        parent_id: Option<&str>,
+    ) -> serde_json::Value {
+        let mut node = serde_json::json!({
+            "nodeId": format!("ax-{name}"),
+            "role": {"value": role},
+            "name": {"value": name},
+            "backendDOMNodeId": backend_node_id
+        });
+        if let Some(value) = value {
+            node["value"] = serde_json::json!({"value": value});
+        }
+        if let Some(parent_id) = parent_id {
+            node["parentId"] = serde_json::json!(parent_id);
+        }
+        node
+    }
+
+    fn compact_select_ax_nodes() -> Vec<serde_json::Value> {
+        let mut nodes = vec![
+            compact_select_ax_node("Fruit", "combobox", 10, None, Some("ax-root")),
+            compact_select_ax_node("Apple", "option", 11, Some("a"), Some("ax-Fruit")),
+            compact_select_ax_node("Beta", "option", 12, Some("b"), Some("ax-Fruit")),
+            compact_select_ax_node("Cherry", "option", 14, Some("c"), Some("ax-Fruit")),
+            compact_select_ax_node("Stray", "option", 20, Some("nope"), Some("ax-root")),
+            compact_select_ax_node("When", "Date", 30, None, Some("ax-root")),
+            compact_select_ax_node("Open calendar", "button", 31, None, Some("ax-When")),
+        ];
+        for index in 0..130 {
+            nodes.push(compact_select_ax_node(
+                &format!("Static {index}"),
+                "paragraph",
+                1000 + index,
+                None,
+                Some("ax-root"),
+            ));
+        }
+        nodes
+    }
+
+    struct CompactSelectFactory;
+    impl BackendFactory for CompactSelectFactory {
+        fn available(&self) -> bool {
+            true
+        }
+        fn launch(&self) -> BrowserResult<Box<dyn BrowserBackend>> {
+            Ok(Box::new(FakeBackend::with_compact_select_page()))
         }
     }
 
@@ -980,6 +1884,46 @@ mod tests {
             Ok(Box::new(FakeBackend::with_snapshot_nodes(
                 MAX_SNAPSHOT_NODES + 64,
             )))
+        }
+    }
+
+    struct StructuredControlsFactory;
+    impl BackendFactory for StructuredControlsFactory {
+        fn available(&self) -> bool {
+            true
+        }
+        fn launch(&self) -> BrowserResult<Box<dyn BrowserBackend>> {
+            Ok(Box::new(FakeBackend::with_structured_controls()))
+        }
+    }
+
+    struct MixedSnapshotFactory;
+    impl BackendFactory for MixedSnapshotFactory {
+        fn available(&self) -> bool {
+            true
+        }
+        fn launch(&self) -> BrowserResult<Box<dyn BrowserBackend>> {
+            Ok(Box::new(FakeBackend::with_mixed_snapshot()))
+        }
+    }
+
+    struct LargeDiagnosticsFactory;
+    impl BackendFactory for LargeDiagnosticsFactory {
+        fn available(&self) -> bool {
+            true
+        }
+        fn launch(&self) -> BrowserResult<Box<dyn BrowserBackend>> {
+            Ok(Box::new(FakeBackend::with_large_diagnostics()))
+        }
+    }
+
+    struct WaitFailureFactory;
+    impl BackendFactory for WaitFailureFactory {
+        fn available(&self) -> bool {
+            true
+        }
+        fn launch(&self) -> BrowserResult<Box<dyn BrowserBackend>> {
+            Ok(Box::new(FakeBackend::with_wait_failure()))
         }
     }
 
@@ -1019,7 +1963,13 @@ mod tests {
         assert!(page.page_id.starts_with("page_"));
         assert!(!page.page_id.contains("private-target"));
         let snapshot = supervisor
-            .snapshot(&browser.browser_id, &page.page_id)
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
             .unwrap();
         let element = snapshot.nodes[0].element_id.as_ref().unwrap();
         assert!(element.starts_with("element_"));
@@ -1031,7 +1981,13 @@ mod tests {
         let browser = supervisor.launch().unwrap();
         let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
         let element = supervisor
-            .snapshot(&browser.browser_id, &page.page_id)
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
             .unwrap()
             .nodes[0]
             .element_id
@@ -1053,19 +2009,60 @@ mod tests {
     }
 
     #[test]
-    fn newer_snapshot_invalidates_prior_snapshot_elements() {
+    fn reload_invalidates_prior_element_authority() {
         let supervisor = fixture();
         let browser = supervisor.launch().unwrap();
         let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
         let element = supervisor
-            .snapshot(&browser.browser_id, &page.page_id)
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
             .unwrap()
             .nodes[0]
             .element_id
             .clone()
             .unwrap();
         supervisor
-            .snapshot(&browser.browser_id, &page.page_id)
+            .reload(&browser.browser_id, &page.page_id)
+            .unwrap();
+        let error = supervisor
+            .click(&browser.browser_id, &page.page_id, &element)
+            .unwrap_err();
+        assert_eq!(error.kind, "stale_element");
+        assert_eq!(error.execution_state, ExecutionState::NotStarted);
+        assert_eq!(error.recovery_action, Some("snapshot"));
+    }
+
+    #[test]
+    fn newer_snapshot_invalidates_prior_snapshot_elements() {
+        let supervisor = fixture();
+        let browser = supervisor.launch().unwrap();
+        let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
+        let element = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap()
+            .nodes[0]
+            .element_id
+            .clone()
+            .unwrap();
+        supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
             .unwrap();
         assert_eq!(
             supervisor
@@ -1126,12 +2123,248 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_snapshot_compacts_large_pages_and_respects_explicit_modes() {
+        let supervisor = BrowserSupervisor::with_factory(Arc::new(ManyNodesFactory));
+        let browser = supervisor.launch().unwrap();
+        let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
+        let snapshot = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Auto,
+                64,
+                12,
+            )
+            .unwrap();
+        assert_eq!(snapshot.snapshot_mode, "interactive");
+        assert!(snapshot.auto_compacted);
+        assert_eq!(snapshot.max_nodes, 64);
+        assert_eq!(snapshot.max_depth, 12);
+        assert!(snapshot.node_count <= 64);
+
+        let mixed = BrowserSupervisor::with_factory(Arc::new(MixedSnapshotFactory));
+        let browser = mixed.launch().unwrap();
+        let page = mixed.pages(&browser.browser_id, 8).unwrap().remove(0);
+        let full = mixed
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                4,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        assert_eq!(full.snapshot_mode, "full");
+        assert!(!full.auto_compacted);
+        assert_eq!(full.node_count, 4);
+        assert!(full.truncated);
+        assert!(full.nodes.iter().any(|node| !node.actionable));
+
+        let interactive = mixed
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Interactive,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        assert_eq!(interactive.snapshot_mode, "interactive");
+        assert_eq!(interactive.node_count, 3);
+        assert!(interactive.nodes.iter().all(|node| node.actionable));
+    }
+
+    #[test]
+    fn compact_snapshot_keeps_native_select_options_without_giving_them_effects() {
+        let supervisor = BrowserSupervisor::with_factory(Arc::new(CompactSelectFactory));
+        let browser = supervisor.launch().unwrap();
+        let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
+        let full = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        assert!(full.node_count > AUTO_SNAPSHOT_COMPACT_NODES);
+        assert!(full
+            .nodes
+            .iter()
+            .any(|node| node.name.as_deref() == Some("Stray")));
+        assert!(full
+            .nodes
+            .iter()
+            .any(|node| node.name.as_deref() == Some("Open calendar")));
+
+        let snapshot = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Auto,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        assert_eq!(snapshot.snapshot_mode, "interactive");
+        assert!(snapshot.auto_compacted);
+        assert!(!snapshot.truncated);
+        let find = |name: &str| {
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let fruit = find("Fruit");
+        assert_eq!(fruit.role, "combobox");
+        assert_eq!(fruit.actions, ["select_option"]);
+        assert!(fruit.element_id.is_some());
+        assert!(fruit.actionable);
+        for (name, value) in [("Apple", "a"), ("Beta", "b"), ("Cherry", "c")] {
+            let option = find(name);
+            assert_eq!(option.role, "option");
+            assert_eq!(option.value.as_deref(), Some(value));
+            assert!(option.element_id.is_none(), "{name} must stay semantic");
+            assert!(option.actions.is_empty(), "{name} must not admit an effect");
+            assert!(
+                !option.actionable,
+                "{name} must not receive element authority"
+            );
+        }
+        let when = find("When");
+        assert_eq!(when.actions, ["set_value"]);
+        assert!(snapshot
+            .nodes
+            .iter()
+            .all(|node| node.name.as_deref() != Some("Stray")));
+        assert!(snapshot
+            .nodes
+            .iter()
+            .all(|node| node.name.as_deref() != Some("Open calendar")));
+        assert!(snapshot.nodes.iter().all(|node| node
+            .name
+            .as_deref()
+            .is_none_or(|name| !name.starts_with("Static "))));
+
+        let interactive = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Interactive,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        assert!(interactive
+            .nodes
+            .iter()
+            .any(|node| node.name.as_deref() == Some("Apple") && node.actions.is_empty()));
+        assert!(
+            interactive
+                .nodes
+                .iter()
+                .any(|node| node.name.as_deref() == Some("Fruit")
+                    && node.actions == ["select_option"])
+        );
+    }
+
+    #[test]
+    fn diagnostics_cursor_returns_only_new_events_and_summary() {
+        let supervisor = fixture();
+        let browser = supervisor.launch().unwrap();
+        let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
+
+        let first = supervisor
+            .diagnostics(&browser.browser_id, &page.page_id, false, false, None)
+            .unwrap();
+        assert_eq!(first["cursor"], 3);
+        assert_eq!(first["new_console_warnings"], 1);
+        assert_eq!(first["new_5xx"], 1);
+
+        let second = supervisor
+            .diagnostics(&browser.browser_id, &page.page_id, false, false, Some(3))
+            .unwrap();
+        assert_eq!(second["cursor"], 5);
+        assert_eq!(second["since_cursor"], 3);
+        assert_eq!(second["new_console_errors"], 1);
+        assert_eq!(second["new_4xx"], 1);
+        assert_eq!(second["console_count"], 1);
+        assert_eq!(second["network_count"], 1);
+        assert_eq!(second["delta_truncated"], false);
+
+        supervisor
+            .clear_diagnostics(&browser.browser_id, &page.page_id)
+            .unwrap();
+        let after_clear = supervisor
+            .diagnostics(&browser.browser_id, &page.page_id, false, false, Some(3))
+            .unwrap();
+        assert_eq!(after_clear["delta_truncated"], true);
+
+        let error = supervisor
+            .diagnostics(&browser.browser_id, &page.page_id, false, false, Some(99))
+            .unwrap_err();
+        assert_eq!(error.kind, "invalid_diagnostics_cursor");
+        assert_eq!(error.execution_state, ExecutionState::NotStarted);
+    }
+
+    #[test]
+    fn diagnostics_delta_reports_projection_truncation_before_advancing_cursor() {
+        let supervisor = BrowserSupervisor::with_factory(Arc::new(LargeDiagnosticsFactory));
+        let browser = supervisor.launch().unwrap();
+        let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
+
+        let diagnostics = supervisor
+            .diagnostics(&browser.browser_id, &page.page_id, true, false, Some(1))
+            .unwrap();
+        assert_eq!(diagnostics["cursor"], 200);
+        assert_eq!(diagnostics["since_cursor"], 1);
+        assert_eq!(diagnostics["new_console_errors"], 199);
+        assert_eq!(diagnostics["console_truncated"], true);
+        assert_eq!(diagnostics["delta_truncated"], true);
+        assert!(diagnostics["console_count"].as_u64().unwrap() < 199);
+    }
+
+    #[test]
+    fn post_effect_stability_observation_never_changes_effect_certainty() {
+        let supervisor = BrowserSupervisor::with_factory(Arc::new(WaitFailureFactory));
+        let browser = supervisor.launch().unwrap();
+        let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
+        let element = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap()
+            .nodes[0]
+            .element_id
+            .clone()
+            .unwrap();
+
+        let stability = supervisor
+            .click(&browser.browser_id, &page.page_id, &element)
+            .unwrap();
+        assert!(!stability.stable);
+        assert_eq!(stability.reason, "observation_failed");
+    }
+
+    #[test]
     fn semantic_snapshot_and_text_are_bounded() {
         let supervisor = BrowserSupervisor::with_factory(Arc::new(ManyNodesFactory));
         let browser = supervisor.launch().unwrap();
         let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
         let snapshot = supervisor
-            .snapshot(&browser.browser_id, &page.page_id)
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
             .unwrap();
         assert!(snapshot.truncated);
         assert!(snapshot.node_count <= MAX_SNAPSHOT_NODES);
@@ -1150,7 +2383,13 @@ mod tests {
         let browser = supervisor.launch().unwrap();
         let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
         let element = supervisor
-            .snapshot(&browser.browser_id, &page.page_id)
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
             .unwrap()
             .nodes[0]
             .element_id
@@ -1181,7 +2420,13 @@ mod tests {
         let browser = supervisor.launch().unwrap();
         let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
         let element = supervisor
-            .snapshot(&browser.browser_id, &page.page_id)
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
             .unwrap()
             .nodes[0]
             .element_id
@@ -1228,6 +2473,86 @@ mod tests {
     }
 
     #[test]
+    fn structured_control_identity_rejects_unadmitted_actions_and_keeps_fences() {
+        let supervisor = BrowserSupervisor::with_factory(Arc::new(StructuredControlsFactory));
+        let browser = supervisor.launch().unwrap();
+        let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
+        let snapshot = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        let qty = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.name.as_deref() == Some("Qty"))
+            .unwrap();
+        assert_eq!(qty.actions, ["set_value"]);
+        assert!(qty.element_id.is_some());
+        let option = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.name.as_deref() == Some("Alpha"))
+            .unwrap();
+        assert!(!option.actionable);
+        assert!(option.element_id.is_none());
+        assert!(option.actions.is_empty());
+
+        let qty_id = qty.element_id.clone().unwrap();
+        let click = supervisor
+            .click(&browser.browser_id, &page.page_id, &qty_id)
+            .unwrap_err();
+        assert_eq!(click.kind, "element_action_unsupported");
+        assert_eq!(click.execution_state, ExecutionState::NotStarted);
+        assert_eq!(click.recovery_action, None);
+        supervisor
+            .set_value(&browser.browser_id, &page.page_id, &qty_id, "4")
+            .unwrap();
+        let button_id = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.name.as_deref() == Some("Go"))
+            .unwrap()
+            .element_id
+            .clone()
+            .unwrap();
+        let wrong_value = supervisor
+            .set_value(&browser.browser_id, &page.page_id, &button_id, "4")
+            .unwrap_err();
+        assert_eq!(wrong_value.kind, "element_action_unsupported");
+        assert_eq!(wrong_value.execution_state, ExecutionState::NotStarted);
+
+        let refreshed = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Interactive,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        assert!(refreshed.nodes.iter().all(|node| node.actionable));
+        assert!(refreshed
+            .nodes
+            .iter()
+            .all(|node| !node.actions.is_empty() && node.element_id.is_some()));
+        assert!(!refreshed
+            .nodes
+            .iter()
+            .any(|node| node.name.as_deref() == Some("Alpha")));
+        let stale = supervisor
+            .set_value(&browser.browser_id, &page.page_id, &qty_id, "5")
+            .unwrap_err();
+        assert_eq!(stale.kind, "stale_element");
+        assert_eq!(stale.execution_state, ExecutionState::NotStarted);
+        assert_eq!(stale.recovery_action, Some("snapshot"));
+    }
+
+    #[test]
     fn screenshot_bytes_are_bounded_before_projection() {
         let error = screenshot_result(
             "browser_test",
@@ -1257,6 +2582,40 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind, "invalid_image_dimensions");
         assert_eq!(error.execution_state, ExecutionState::Completed);
+    }
+
+    #[test]
+    fn diagnostic_projection_is_serialized_bounded_and_keeps_newest_entries() {
+        let entries = (0..200)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "text": format!("{index}-{}", "\"".repeat(2048)),
+                })
+            })
+            .collect::<Vec<_>>();
+        let (console, console_truncated) =
+            bounded_recent_json_entries(entries.clone(), DIAGNOSTIC_SECTION_ENTRIES_BYTES);
+        let (network, network_truncated) =
+            bounded_recent_json_entries(entries, DIAGNOSTIC_SECTION_ENTRIES_BYTES);
+        assert!(console_truncated);
+        assert!(network_truncated);
+        assert_eq!(console.last().unwrap()["index"], 199);
+        assert_eq!(network.last().unwrap()["index"], 199);
+        let output = serde_json::json!({
+            "console_retained": 200,
+            "console_count": console.len(),
+            "console_truncated": console_truncated,
+            "console": console,
+            "network_retained": 200,
+            "network_count": network.len(),
+            "network_truncated": network_truncated,
+            "network": network,
+        });
+        assert!(
+            serde_json::to_vec(&output).unwrap().len() <= MAX_BROWSER_OBSERVATION_RESULT_BYTES,
+            "diagnostics result exceeded the ordinary Runner retention-safe budget"
+        );
     }
 
     #[test]
@@ -1292,4 +2651,245 @@ mod tests {
         assert_eq!(report.browsers, 1);
         assert_eq!(report.failures, 0);
     }
+
+    #[test]
+    #[ignore = "requires a local Chromium-family browser; CI uses deterministic DOM fixtures"]
+    fn chromium_structured_form_controls_are_addressable() {
+        let supervisor = BrowserSupervisor::new();
+        let _shutdown = ShutdownOnDrop(&supervisor);
+        assert!(
+            supervisor.available(),
+            "local Chromium-family browser is required"
+        );
+        let form = FormPage::serve();
+        let upload_path = std::env::temp_dir().join("webcodex-browser-upload.txt");
+        std::fs::write(&upload_path, b"resume").unwrap();
+        let browser = supervisor.launch().expect("chromium launch");
+        let page = supervisor.pages(&browser.browser_id, 8).unwrap().remove(0);
+        supervisor
+            .navigate(
+                &browser.browser_id,
+                &page.page_id,
+                &format!("http://127.0.0.1:{}/controls.html", form.port),
+            )
+            .unwrap();
+        let snapshot = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        let describe = snapshot
+            .nodes
+            .iter()
+            .map(|node| {
+                format!(
+                    "{} name={:?} actions={:?} actionable={}",
+                    node.role, node.name, node.actions, node.actionable
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let find = |name: &str| {
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.name.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("missing {name}\n{describe}"))
+        };
+        let qty = find("Qty");
+        assert_eq!(qty.role, "spinbutton");
+        assert_eq!(qty.actions, ["set_value"]);
+        let vol = find("Vol");
+        assert_eq!(vol.role, "slider");
+        assert_eq!(vol.actions, ["set_value"]);
+        for name in ["When", "Month", "Time"] {
+            assert_eq!(find(name).actions, ["set_value"], "{name}");
+        }
+        assert_eq!(find("File").actions, ["upload_file"]);
+        assert_eq!(find("Pick").actions, ["select_option"]);
+        for name in ["Alpha", "Beta", "ARIA spin", "ARIA slider", "Shadow spin"] {
+            let node = find(name);
+            assert!(!node.actionable, "{name} received generic authority");
+            assert!(node.element_id.is_none(), "{name}");
+            assert!(node.actions.is_empty(), "{name}");
+        }
+        let click_buttons = snapshot
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.role == "button" && node.actions.iter().any(|action| action == "click")
+            })
+            .map(|node| node.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(click_buttons, [Some("Author shadow".to_string())]);
+
+        let qty_id = qty.element_id.clone().unwrap();
+        let rejected = supervisor
+            .click(&browser.browser_id, &page.page_id, &qty_id)
+            .unwrap_err();
+        assert_eq!(rejected.kind, "element_action_unsupported");
+        assert_eq!(rejected.execution_state, ExecutionState::NotStarted);
+        supervisor
+            .set_value(&browser.browser_id, &page.page_id, &qty_id, "4")
+            .unwrap();
+        supervisor
+            .set_value(
+                &browser.browser_id,
+                &page.page_id,
+                &vol.element_id.clone().unwrap(),
+                "55",
+            )
+            .unwrap();
+        supervisor
+            .set_value(
+                &browser.browser_id,
+                &page.page_id,
+                &find("When").element_id.clone().unwrap(),
+                "2026-10-02",
+            )
+            .unwrap();
+        supervisor
+            .set_value(
+                &browser.browser_id,
+                &page.page_id,
+                &find("Month").element_id.clone().unwrap(),
+                "2026-10",
+            )
+            .unwrap();
+        supervisor
+            .set_value(
+                &browser.browser_id,
+                &page.page_id,
+                &find("Time").element_id.clone().unwrap(),
+                "10:15",
+            )
+            .unwrap();
+        supervisor
+            .select_option(
+                &browser.browser_id,
+                &page.page_id,
+                &find("Pick").element_id.clone().unwrap(),
+                "Beta",
+            )
+            .unwrap();
+        supervisor
+            .upload_file(
+                &browser.browser_id,
+                &page.page_id,
+                &find("File").element_id.clone().unwrap(),
+                &upload_path,
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&upload_path);
+
+        let refreshed = supervisor
+            .snapshot(
+                &browser.browser_id,
+                &page.page_id,
+                SnapshotMode::Full,
+                MAX_SNAPSHOT_NODES,
+                DEFAULT_SNAPSHOT_DEPTH,
+            )
+            .unwrap();
+        let refreshed_qty = refreshed
+            .nodes
+            .iter()
+            .find(|node| node.name.as_deref() == Some("Qty"))
+            .expect("qty after set_value");
+        assert_eq!(refreshed_qty.actions, ["set_value"]);
+        // set_value already required the DOM value to remain "4". Chromium's
+        // spinbutton accessibility node does not always repeat that value.
+        assert!(matches!(refreshed_qty.value.as_deref(), None | Some("4")));
+        let stale = supervisor
+            .set_value(&browser.browser_id, &page.page_id, &qty_id, "5")
+            .unwrap_err();
+        assert_eq!(stale.kind, "stale_element");
+        assert_eq!(stale.recovery_action, Some("snapshot"));
+    }
+
+    struct ShutdownOnDrop<'a>(&'a BrowserSupervisor);
+
+    impl Drop for ShutdownOnDrop<'_> {
+        fn drop(&mut self) {
+            let _ = self
+                .0
+                .shutdown_until(Instant::now() + Duration::from_secs(2));
+        }
+    }
+
+    struct FormPage {
+        port: u16,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FormPage {
+        fn serve() -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread_stop = std::sync::Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    if thread_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut request = [0u8; 2048];
+                    let _ = std::io::Read::read(&mut stream, &mut request);
+                    let body = FORM_PAGE_HTML.as_bytes();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+                    let _ = std::io::Write::write_all(&mut stream, body);
+                }
+            });
+            Self {
+                port,
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for FormPage {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    const FORM_PAGE_HTML: &str = r#"<!doctype html><meta charset="utf-8"><title>controls</title>
+<input id="number" type="number" aria-label="Qty" min="0" max="10" value="3">
+<input id="range" type="range" aria-label="Vol" min="0" max="100" value="40">
+<input id="date" type="date" aria-label="When" value="2026-09-26">
+<input id="month" type="month" aria-label="Month" value="2026-09">
+<input id="time" type="time" aria-label="Time" value="09:30">
+<input id="file" type="file" aria-label="File">
+<select id="select" aria-label="Pick"><option value="a">Alpha</option><option value="b">Beta</option></select>
+<div role="spinbutton" aria-label="ARIA spin" aria-valuenow="1" aria-valuemin="0" aria-valuemax="5" tabindex="0">ARIA spin</div>
+<div role="slider" aria-label="ARIA slider" aria-valuenow="2" aria-valuemin="0" aria-valuemax="10" tabindex="0">ARIA slider</div>
+<div id="host"></div>
+<script>
+customElements.define("ua-like", class extends HTMLElement {
+  constructor() {
+    super();
+    const root = this.attachShadow({mode:"open"});
+    root.innerHTML = '<button aria-label="Author shadow">Go</button><div role="spinbutton" aria-label="Shadow spin" tabindex="0">x</div>';
+  }
+});
+document.getElementById("host").append(document.createElement("ua-like"));
+</script>"#;
 }

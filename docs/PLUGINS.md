@@ -15,7 +15,17 @@ contain, sign, or otherwise make an untrusted executable safe. A Plugin has the
 same practical local-process trust implications as launching that executable
 directly with the prepared Runner environment.
 
+> **Terminology:** ChatGPT may call a developer MCP/custom app a “plugin”. That
+> Host-side MCP connection is different from a WebCodex **Native Tool Plugin**.
+> A ChatGPT error such as `FORBIDDEN: This conversation does not support
+> developer MCPs` happens before `plugin_tool` when the Host refuses the MCP
+> connection; it is not a Native Tool Plugin health result. Use
+> [Troubleshooting](TROUBLESHOOTING.md) for that case. Use the `plugin_tool`
+> diagnostics in this document only after the request reaches WebCodex.
+
 ## Configure a Plugin
+
+Desktop exposes **Extensions → Native Plugins** separately from MCP servers. Add a trusted executable with **Add a native Tool Plugin**. Saved registrations are shown independently of live availability; select a Project in the lower preview to inspect the tools exposed by its Runner. The preview shows the Runner’s reported provider loading state; a failed Plugin includes recovery guidance and its safe diagnostic code. It does not imply a Project-affine tool catalog or invent tool counts that the provider-list response does not supply. Saving does not launch the Plugin. Apply the saved registration by explicitly restarting the owned Runner; reload operates only on the selected Project’s authorized Plugin.
 
 Plugins have their own `runner.toml` section; they are not MCP providers:
 
@@ -360,8 +370,9 @@ external dependency contract. That prerequisite is now satisfied:
 adds the local scaffold using that exact compatibility pin. A generated project
 therefore works independently of a WebCodex source checkout. Repository first-party
 dogfood such as `plugins/safe-delete`, [`plugins/repo-info`](../plugins/repo-info/README.md),
-and [`plugins/campus-application`](../plugins/campus-application/README.md) intentionally
-continues to use the local SDK source so it tests the checkout under development;
+[`plugins/campus-application`](../plugins/campus-application/README.md), and
+[`plugins/agent-browser`](../plugins/agent-browser/README.md) intentionally continues
+to use the local SDK source so it tests the checkout under development;
 external projects created by `plugin init` use the published package.
 
 ## TypeScript Plugin SDK
@@ -476,10 +487,13 @@ project-root-fenced Plugin that moves one file or directory to the operating sys
 Trash/Recycle Bin without adding permanent deletion to WebCodex's built-in tool
 surface; [`plugins/repo-info`](../plugins/repo-info/README.md) is a read-only authoring
 example whose single `git_summary` tool observes only the provider's configured
-repository `cwd`; and [`plugins/campus-application`](../plugins/campus-application/README.md)
+repository `cwd`; [`plugins/campus-application`](../plugins/campus-application/README.md)
 turns bounded Browser semantic snapshots into structured resume-form plans, supports
 repeated and multi-step application flows, and deliberately stops before final
-submission.
+submission; and [`plugins/agent-browser`](../plugins/agent-browser/README.md) uses an
+operator-installed local Agent Browser to inherit native profiles/configuration or
+attach to an explicitly authorized running Chrome while keeping opaque page/snapshot
+identities, tab ownership, and uncertain-effect handling inside the Plugin boundary.
 
 ## Calling and failure semantics
 

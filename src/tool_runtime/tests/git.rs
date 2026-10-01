@@ -43,6 +43,253 @@ async fn register_structured_git_agent_at_path(
     crate::tool_runtime::runner_project_runtime_id(client_id, project_id)
 }
 
+async fn collect_review_task(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    task: tokio::task::JoinHandle<ToolResult>,
+) -> ToolResult {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !task.is_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "review fixture timed out"
+        );
+        if let Some(request) = probe_patch_agent_request(runtime, client_id).await {
+            complete_agent_request_by_running_locally(runtime, client_id, request).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    task.await.unwrap()
+}
+
+async fn observe_review_source(runtime: &ToolRuntime, project: &str) -> Value {
+    let client_id = project.split(':').nth(1).unwrap();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.to_string();
+        async move {
+            match runtime.workspace_review_source_identity(&project).await {
+                Ok(source) => ToolResult::ok(source.presentation_value()),
+                Err(error) => error,
+            }
+        }
+    });
+    let result = collect_review_task(runtime, client_id, task).await;
+    assert!(result.success, "{result:?}");
+    result.output
+}
+
+#[tokio::test]
+async fn review_snapshot_identity_fences_index_only_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    fs::write(tmp.path().join("a.txt"), "base\n").unwrap();
+    git_test_command_ok(tmp.path(), "git add a.txt && git commit -m base");
+    fs::write(tmp.path().join("a.txt"), "worktree\n").unwrap();
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "review-index-fence", "repo", tmp.path())
+            .await;
+    let index_before = fs::read(tmp.path().join(".git/index")).unwrap();
+    let unstaged = observe_review_source(&runtime, &project).await;
+    assert_eq!(
+        index_before,
+        fs::read(tmp.path().join(".git/index")).unwrap()
+    );
+    assert_eq!(unstaged, observe_review_source(&runtime, &project).await);
+    git_test_command_ok(tmp.path(), "git add a.txt");
+    let staged = observe_review_source(&runtime, &project).await;
+    assert_eq!(unstaged["head_commit"], staged["head_commit"]);
+    assert_eq!(unstaged["frozen_tree"], staged["frozen_tree"]);
+    assert_ne!(
+        unstaged, staged,
+        "staging must invalidate cached review metadata"
+    );
+
+    fs::write(tmp.path().join("a.txt"), "index-one\n").unwrap();
+    git_test_command_ok(tmp.path(), "git add a.txt");
+    fs::write(tmp.path().join("a.txt"), "worktree\n").unwrap();
+    let first = observe_review_source(&runtime, &project).await;
+    fs::write(tmp.path().join("a.txt"), "index-two\n").unwrap();
+    git_test_command_ok(tmp.path(), "git add a.txt");
+    fs::write(tmp.path().join("a.txt"), "worktree\n").unwrap();
+    let second = observe_review_source(&runtime, &project).await;
+    assert_eq!(first["frozen_tree"], second["frozen_tree"]);
+    assert_ne!(
+        first, second,
+        "equal MM status still needs staged object identity"
+    );
+}
+
+#[tokio::test]
+async fn review_snapshot_status_fingerprint_keeps_large_status_bounded() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    for n in 0..1024 {
+        fs::write(
+            tmp.path().join(format!("{n:04}-{}.txt", "x".repeat(96))),
+            "content\n",
+        )
+        .unwrap();
+    }
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "review-large-status", "repo", tmp.path())
+            .await;
+    let source = observe_review_source(&runtime, &project).await;
+    assert!(
+        source["head_commit"].is_null(),
+        "unborn HEAD stays supported"
+    );
+    assert!(source["status_fingerprint"].as_str().is_some());
+    assert!(serde_json::to_vec(&source).unwrap().len() < 512);
+    assert!(
+        !tmp.path().join(".git/index").exists(),
+        "observation must not create the real index"
+    );
+}
+
+#[tokio::test]
+async fn review_snapshot_identity_fences_branch_only_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    fs::write(tmp.path().join("a.txt"), "base\n").unwrap();
+    git_test_command_ok(tmp.path(), "git add a.txt && git commit -m base");
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "review-branch-fence", "repo", tmp.path())
+            .await;
+    let before = observe_review_source(&runtime, &project).await;
+    git_test_command_ok(tmp.path(), "git switch -c review-other-branch");
+    let after = observe_review_source(&runtime, &project).await;
+    assert_eq!(before["head_commit"], after["head_commit"]);
+    assert_eq!(before["frozen_tree"], after["frozen_tree"]);
+    assert_ne!(
+        before, after,
+        "branch changes must invalidate cached branch metadata"
+    );
+}
+
+fn start_review_page(
+    runtime: &ToolRuntime,
+    project: &str,
+    continuation: Option<String>,
+) -> tokio::task::JoinHandle<ToolResult> {
+    let runtime = runtime.clone();
+    let project = project.to_string();
+    tokio::spawn(async move {
+        runtime
+            .review_changes(
+                project,
+                webcodex_tool_contracts::tool_call::GitReviewScopeInput::Workspace,
+                None,
+                None,
+                Some(1),
+                None,
+                None,
+                continuation,
+                None,
+            )
+            .await
+    })
+}
+
+fn review_paging_repo() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(tmp.path().join(name), "base\n").unwrap();
+    }
+    git_test_command_ok(
+        tmp.path(),
+        "git add a.txt b.txt c.txt && git commit -m base",
+    );
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        fs::write(tmp.path().join(name), "changed\n").unwrap();
+    }
+    tmp
+}
+
+#[tokio::test]
+async fn review_snapshot_next_call_omits_absent_optional_arguments() {
+    let tmp = review_paging_repo();
+    let runtime = test_runtime();
+    let project =
+        register_structured_git_agent_at_path(&runtime, "review-next-call", "repo", tmp.path())
+            .await;
+    let schema = registered_tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "review_changes")
+        .unwrap()
+        .input_schema;
+    let mut continuation = None;
+    for page in 0..3 {
+        let task = start_review_page(&runtime, &project, continuation);
+        let result = collect_review_task(&runtime, "review-next-call", task).await;
+        assert!(result.success, "{result:?}");
+        if page == 2 {
+            assert!(result.output["continuation"].is_null(), "{result:?}");
+            break;
+        }
+        let arguments = &result.output["next_call"]["arguments"];
+        for (key, value) in arguments.as_object().unwrap() {
+            assert!(
+                !value.is_null(),
+                "generated next_call violates non-null schema: {key}"
+            );
+        }
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(arguments, &schema)
+            .unwrap_or_else(|error| panic!("next_call is not directly callable: {error}"));
+        ToolCall::from_tool_name("review_changes", arguments.clone()).unwrap();
+        continuation = Some(arguments["continuation"].as_str().unwrap().to_string());
+    }
+}
+
+#[tokio::test]
+async fn review_snapshot_continuation_rechecks_source_after_diff() {
+    let tmp = review_paging_repo();
+    let runtime = test_runtime();
+    let client = "review-page-race";
+    let project = register_structured_git_agent_at_path(&runtime, client, "repo", tmp.path()).await;
+    let first = collect_review_task(
+        &runtime,
+        client,
+        start_review_page(&runtime, &project, None),
+    )
+    .await;
+    assert!(first.success, "{first:?}");
+    let continuation = first.output["continuation"].as_str().unwrap().to_string();
+    let next = start_review_page(&runtime, &project, Some(continuation));
+    let before = wait_for_patch_agent_request(&runtime, client).await;
+    assert!(before
+        .script
+        .as_ref()
+        .unwrap()
+        .script
+        .contains("WEBCODEX_WORKSPACE_STATUS="));
+    complete_agent_request_by_running_locally(&runtime, client, before).await;
+    let diff = wait_for_patch_agent_request(&runtime, client).await;
+    let (exit_code, stdout, stderr) = run_runner_shell_request_locally(&diff);
+    assert_eq!(exit_code, 0, "{stderr}");
+    // Change only the branch after the page was produced, before its response
+    // reaches Runtime. Neither the worktree nor the inner diff cursor changes.
+    git_test_command_ok(tmp.path(), "git switch -c review-concurrent-branch");
+    complete_patch_agent_request(
+        &runtime,
+        client,
+        &diff.request_id,
+        exit_code,
+        &stdout,
+        &stderr,
+    )
+    .await;
+    let result = collect_review_task(&runtime, client, next).await;
+    assert!(!result.success, "{result:?}");
+    assert_eq!(result.output["reason_code"], "snapshot_stale");
+    assert!(result.output["diff"].is_null());
+}
+
 async fn run_runner_git_commit_paths(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -1245,11 +1492,16 @@ async fn run_runner_git_diff_hunks_committed_page_with_options(
             assert!(script.contains("GIT_OPTIONAL_LOCKS=0"));
             assert!(script.contains("GIT_CONFIG_GLOBAL=/dev/null"));
             assert!(script.contains("attributesFile = /dev/null"));
+            assert!(script.contains("git read-tree "));
+            assert!(script.contains("git ls-files -z -- .gitattributes ':(glob)**/.gitattributes'"));
+            assert!(script.contains("git checkout-index -z --stdin --prefix=\"$view/worktree/\""));
+            assert!(!script.contains("checkout-index -a"));
+            assert!(!script.contains("checkout-index --all"));
             for forbidden in [
                 "git fetch",
                 "git apply",
                 "git commit",
-                "git checkout",
+                "git checkout ",
                 "git reset",
                 "git push",
                 "git stash",
@@ -1427,7 +1679,7 @@ async fn git_diff_hunks_committed_exact_range_isolated_targeted_and_head_attribu
 async fn git_diff_hunks_ignores_external_diff_helpers_in_worktree_and_cached_modes() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     init_git_repo(tmp.path());
     write_git_review_fixture_file(tmp.path(), "safe.txt", "safe-old\n");
     write_git_review_fixture_file(tmp.path(), ".env", "FAKE_PRIVATE_MARKER_117\n");
@@ -2960,7 +3212,7 @@ async fn git_diff_hunks_committed_drains_bounded_consumer_and_preserves_producer
         .clone();
     let head_q = shell_escape_simple(&head);
     let needle = format!(
-        "git --no-pager -c core.quotePath=false -c attr.tree={head_q} diff --no-ext-diff --no-textconv --find-renames --unified=80 {} {head_q} -- 'file.txt'",
+        "git --no-pager -c core.quotePath=false diff --no-ext-diff --no-textconv --find-renames --unified=80 {} {head_q} -- 'file.txt'",
         shell_escape_simple(&base),
     );
     assert_eq!(
@@ -3029,6 +3281,9 @@ fn assert_git_diff_hunks_sparse_recovery_calls_parse(recovery: &Value) {
                 .keys()
                 .all(|key| key == "next_call" || (lane == "current_hunk" && key == "reason_code")));
             if let Some(call) = value.get("next_call") {
+                assert_eq!(call["follow_up_kind"], "mechanically_followable");
+                webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(call)
+                    .expect("git_diff_hunks recovery next_call must pass registered inputSchema");
                 ToolCall::from_tool_name(call["tool"].as_str().unwrap(), call["arguments"].clone())
                     .expect("each recovery lane must parse directly");
             }
@@ -3037,6 +3292,9 @@ fn assert_git_diff_hunks_sparse_recovery_calls_parse(recovery: &Value) {
 }
 
 fn assert_git_diff_hunks_recovery_call_parses(recovery: &Value) {
+    assert_eq!(recovery["follow_up_kind"], "mechanically_followable");
+    webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(recovery)
+        .expect("git_diff_hunks generated follow-up must pass registered inputSchema");
     let tool = recovery["tool"]
         .as_str()
         .expect("recovery tool must be a string");
@@ -5449,9 +5707,10 @@ fn show_changes_diff_respects_max_hunks() {
     );
     assert_git_diff_hunks_recovery_call_parses(next_call);
     assert!(
-        crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
+        !crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
             next_call["tool"].as_str().unwrap()
-        )
+        ),
+        "git_diff_hunks stays an exact/gateway specialist"
     );
     let actions = output["suggested_next_actions"].as_array().unwrap();
     assert!(!actions
@@ -6179,6 +6438,22 @@ async fn show_changes_untracked_sensitive_path_preview_is_skipped() {
     );
 }
 
+#[tokio::test]
+async fn show_changes_untracked_public_dotenv_template_preview_is_visible() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    fs::write(
+        tmp.path().join(".env.example"),
+        "PUBLIC_EXAMPLE_MARKER=fake\n",
+    )
+    .unwrap();
+
+    let output = show_changes_output_from_command(tmp.path(), true);
+    let preview = preview_for_path(&output, ".env.example");
+    assert_eq!(preview["kind"], "text");
+    assert_eq!(preview["lines"][0]["text"], "PUBLIC_EXAMPLE_MARKER=fake");
+}
+
 #[test]
 fn git_diff_hunks_command_is_read_only_and_scoped_to_paths() {
     let command = git_diff_hunks_command(&["src/lib.rs".to_string()], false).unwrap();
@@ -6226,7 +6501,7 @@ async fn show_changes_with_session_id_returns_session_block_and_records_call() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
@@ -6485,11 +6760,20 @@ async fn run_git_review_summary_via_agent(
             assert!(payload.script.contains("GIT_ATTR_NOSYSTEM=1"));
             assert!(payload.script.contains("attributesFile = /dev/null"));
             assert!(payload.script.contains("GIT_CONFIG_GLOBAL=/dev/null"));
+            assert!(payload.script.contains("git read-tree "));
+            assert!(payload
+                .script
+                .contains("git ls-files -z -- .gitattributes ':(glob)**/.gitattributes'"));
+            assert!(payload
+                .script
+                .contains("git checkout-index -z --stdin --prefix=\"$view/worktree/\""));
+            assert!(!payload.script.contains("checkout-index -a"));
+            assert!(!payload.script.contains("checkout-index --all"));
             for forbidden in [
                 "git fetch",
                 "git apply",
                 "git commit",
-                "git checkout",
+                "git checkout ",
                 "git reset",
                 "git push",
                 "git stash",
@@ -6763,6 +7047,98 @@ async fn git_review_summary_uses_reviewed_head_committed_attributes() {
     let result =
         run_git_review_summary_via_agent(&runtime, "review-head-attributes", project, base, head)
             .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["stats"]["files_changed"], 2);
+    assert_eq!(result.output["stats"]["binary_files"], 1);
+    let data = result.output["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "data.txt")
+        .unwrap();
+    assert_eq!(data["binary"], true);
+    assert_eq!(data["symbol_inspection"], "skipped_binary");
+}
+
+#[tokio::test]
+async fn git_review_summary_uses_nested_reviewed_head_attributes_without_mutable_leakage() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    write_git_review_fixture_file(tmp.path(), "src/nested/data.txt", "a\nb\n");
+    let base = commit_git_review_fixture(tmp.path(), "nested base");
+
+    write_git_review_fixture_file(tmp.path(), "src/nested/.gitattributes", "data.txt -diff\n");
+    write_git_review_fixture_file(tmp.path(), "src/nested/data.txt", "a\nc\n");
+    let head = commit_git_review_fixture(tmp.path(), "nested head attributes");
+
+    write_git_review_fixture_file(tmp.path(), "src/nested/.gitattributes", "data.txt diff\n");
+    fs::create_dir_all(tmp.path().join(".git/info")).unwrap();
+    fs::write(
+        tmp.path().join(".git/info/attributes"),
+        "src/nested/data.txt diff\n",
+    )
+    .unwrap();
+
+    let runtime = test_runtime();
+    let project = register_structured_git_agent_at_path(
+        &runtime,
+        "review-nested-head-attributes",
+        "repo",
+        tmp.path(),
+    )
+    .await;
+    let result = run_git_review_summary_via_agent(
+        &runtime,
+        "review-nested-head-attributes",
+        project,
+        base,
+        head,
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["stats"]["files_changed"], 2);
+    assert_eq!(result.output["stats"]["binary_files"], 1);
+    let data = result.output["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "src/nested/data.txt")
+        .unwrap();
+    assert_eq!(data["binary"], true);
+    assert_eq!(data["symbol_inspection"], "skipped_binary");
+}
+
+#[tokio::test]
+async fn git_review_summary_exact_range_prefers_reviewed_head_over_dirty_and_info_attributes() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    write_git_review_fixture_file(tmp.path(), "data.txt", "a\nb\n");
+    let base = commit_git_review_fixture(tmp.path(), "root base");
+
+    write_git_review_fixture_file(tmp.path(), ".gitattributes", "data.txt -diff\n");
+    write_git_review_fixture_file(tmp.path(), "data.txt", "a\nc\n");
+    let head = commit_git_review_fixture(tmp.path(), "root head attributes");
+
+    write_git_review_fixture_file(tmp.path(), ".gitattributes", "data.txt diff\n");
+    fs::create_dir_all(tmp.path().join(".git/info")).unwrap();
+    fs::write(tmp.path().join(".git/info/attributes"), "data.txt diff\n").unwrap();
+
+    let runtime = test_runtime();
+    let project = register_structured_git_agent_at_path(
+        &runtime,
+        "review-root-head-attributes",
+        "repo",
+        tmp.path(),
+    )
+    .await;
+    let result = run_git_review_summary_via_agent(
+        &runtime,
+        "review-root-head-attributes",
+        project,
+        base,
+        head,
+    )
+    .await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["stats"]["files_changed"], 2);
     assert_eq!(result.output["stats"]["binary_files"], 1);
@@ -7284,7 +7660,10 @@ fn git_review_summary_tool_schema_metadata_and_oauth_are_read_only() {
         .expect("git_review_summary public spec");
     assert!(spec
         .description
-        .contains("Deterministic bounded committed-range review map"));
+        .contains("Specialist exact committed-range review map"));
+    assert!(spec
+        .description
+        .contains("Ordinary review uses review_changes"));
     for field in ["base_commit", "head_commit"] {
         assert_eq!(spec.input_schema["properties"][field]["minLength"], 40);
         assert_eq!(spec.input_schema["properties"][field]["maxLength"], 40);
@@ -7441,6 +7820,43 @@ async fn run_show_changes_via_agent(
                 .script
                 .as_ref()
                 .expect("show_changes must carry a typed internal script");
+            assert_eq!(
+                payload.language,
+                crate::runner_protocol::ShellScriptLanguage::Sh
+            );
+            assert!(payload.args.is_empty());
+            complete_agent_request_by_running_locally(runtime, client_id, req).await;
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+    task.await.unwrap()
+}
+
+async fn run_show_changes_for_presentation_via_agent(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: String,
+) -> ToolResult {
+    let runtime_for_task = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_for_task
+            .workspace_metadata_for_presentation(project)
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !task.is_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "show_changes_for_presentation did not finish within 10 seconds for client {client_id}"
+        );
+        if let Some(req) = probe_patch_agent_request(runtime, client_id).await {
+            assert_eq!(req.kind, "run_internal_posix_script");
+            assert!(req.command.is_empty());
+            let payload = req
+                .script
+                .as_ref()
+                .expect("show_changes_for_presentation must carry a typed internal script");
             assert_eq!(
                 payload.language,
                 crate::runner_protocol::ShellScriptLanguage::Sh
@@ -7620,7 +8036,7 @@ async fn show_changes_agent_untracked_preview_uses_internal_posix_runtime() {
 fn show_changes_preserves_sentinel_text_from_external_diff() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "external.txt", "before\n", "initial");
     std::fs::write(tmp.path().join("external.txt"), "after\n").unwrap();
@@ -7909,12 +8325,12 @@ async fn show_changes_degrades_gracefully_for_non_git_project() {
     assert_reason_list_contains(
         &result.output["verdict"],
         "warning_reasons",
-        "git_unavailable",
+        "non_git_project",
     );
     let actions = result.output["suggested_next_actions"].as_array().unwrap();
     assert!(actions
         .iter()
-        .any(|a| a.as_str().unwrap().contains("unavailable")));
+        .any(|a| a.as_str().unwrap().contains("not applicable")));
     assert_eq!(result.output["status_observation"]["status"], "non_git");
     assert_eq!(
         result.output["head"],
@@ -8019,6 +8435,28 @@ async fn show_changes_real_git_repo_include_diff_true_matches_schema() {
     assert_eq!(result.output["clean"], false);
     assert!(result.output["hunk_count"].as_u64().unwrap_or(0) > 0);
     assert_show_changes_envelope_matches_schema("git include_diff=true", &result);
+}
+
+#[tokio::test]
+async fn show_changes_presentation_preserves_staging_without_eager_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    std::fs::write(tmp.path().join("README.md"), "hello\nstaged\n").unwrap();
+    let (exit_code, _, stderr, _) = run_command_sync("git add README.md", tmp.path(), 30);
+    assert_eq!(exit_code, 0, "git add failed: {stderr}");
+
+    let runtime = test_runtime();
+    let project = register_runner_project_at_path(&runtime, "grp", "demo", tmp.path()).await;
+    let result = run_show_changes_for_presentation_via_agent(&runtime, "grp", project).await;
+
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["clean"], false);
+    assert_eq!(result.output["files"][0]["path"], "README.md");
+    assert_eq!(result.output["files"][0]["staged"], true);
+    assert_eq!(result.output["hunk_count"].as_u64().unwrap_or(0), 0);
+    assert!(result.output["hunks"].as_array().is_none_or(Vec::is_empty));
+    assert!(!result.output.to_string().contains("+staged"));
 }
 
 #[tokio::test]
@@ -8159,11 +8597,11 @@ fn non_git_show_changes_preserves_unobserved_state() {
     assert_eq!(output["clean"], Value::Null);
     assert_eq!(output["counts"]["conflicted"], Value::Null);
     assert_eq!(output["upstream_status"], "unobserved");
-    assert_eq!(output["upstream_reason_code"], "git_unavailable");
+    assert_eq!(output["upstream_reason_code"], "non_git_project");
     assert_eq!(output["upstream"], Value::Null);
     assert_eq!(output["ahead"], Value::Null);
     assert_eq!(output["behind"], Value::Null);
-    assert_reason_list_contains(&output["verdict"], "warning_reasons", "git_unavailable");
+    assert_reason_list_contains(&output["verdict"], "warning_reasons", "non_git_project");
 }
 
 #[test]
@@ -8453,7 +8891,7 @@ fn bounded_show_changes_output_from_frames(
 fn show_changes_oversized_no_hunk_preamble_is_bounded_and_drained() {
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_support::executable_tempdir();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "before\n", "initial");
     std::fs::write(tmp.path().join("README.md"), "after\n").unwrap();
@@ -8659,7 +9097,7 @@ async fn show_changes_runtime_rejects_stat_only_failure_for_both_diff_modes() {
     let real_git = real_git.trim();
     assert!(!real_git.is_empty());
 
-    let wrapper_dir = tempfile::tempdir().unwrap();
+    let wrapper_dir = crate::test_support::executable_tempdir();
     let wrapper_path = wrapper_dir.path().join("git");
     std::fs::write(
         &wrapper_path,

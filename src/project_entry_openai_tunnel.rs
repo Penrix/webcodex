@@ -12,7 +12,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::process::{Child, Command};
 
 #[cfg(windows)]
@@ -27,6 +27,7 @@ const TUNNEL_CLIENT_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const TUNNEL_CLIENT_DOCTOR_TIMEOUT: Duration = Duration::from_secs(30);
 const TUNNEL_CLIENT_CONTROL_PLANE_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const TUNNEL_CLIENT_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const TUNNEL_CLIENT_STALE_INSTALL_AGE: Duration = Duration::from_secs(5 * 60);
 const TUNNEL_CLIENT_HEALTH_URL_BYTES: usize = 512;
 const TUNNEL_CLIENT_OVERRIDE: &str = "WEBCODEX_TUNNEL_CLIENT_BIN";
 #[cfg(windows)]
@@ -65,7 +66,7 @@ impl OpenAiTunnel {
                 tunnel_runtime_error("OpenAI tunnel-client could not be supervised")
             })?;
         Err(ProductError::new(
-            "tunnel_unavailable",
+            "tunnel_daemon_not_ready",
             format!("OpenAI Secure MCP Tunnel stopped unexpectedly ({status})"),
             Some("Check the OpenAI tunnel-client and network connectivity, then retry webcodex share --tunnel openai."),
         ))
@@ -117,7 +118,7 @@ pub(super) async fn start_openai_tunnel(
         .kill_on_drop(true);
     let mut child = command
         .spawn()
-        .map_err(|_| tunnel_runtime_error("OpenAI tunnel-client could not start"))?;
+        .map_err(|_| daemon_start_error("OpenAI tunnel-client could not start"))?;
 
     if let Err(error) = wait_until_ready(&mut child, &health_url_file, deadline).await {
         let _ = child.start_kill();
@@ -185,12 +186,12 @@ async fn run_doctor(
         .kill_on_drop(true);
     let mut child = command
         .spawn()
-        .map_err(|_| tunnel_runtime_error("OpenAI tunnel-client doctor could not start"))?;
+        .map_err(|_| doctor_error("OpenAI tunnel-client doctor could not start"))?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         let _ = child.start_kill();
         let _ = child.wait().await;
-        return Err(tunnel_runtime_error(
+        return Err(doctor_error(
             "OpenAI tunnel-client doctor had no startup budget remaining",
         ));
     }
@@ -200,23 +201,21 @@ async fn run_doctor(
         Ok(Err(_)) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(tunnel_runtime_error(
+            return Err(doctor_error(
                 "OpenAI tunnel-client doctor could not be supervised",
             ));
         }
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(tunnel_runtime_error(
+            return Err(doctor_error(
                 "OpenAI tunnel-client doctor timed out before validating the connection",
             ));
         }
     };
     if !status.success() {
-        return Err(ProductError::new(
-            "tunnel_unavailable",
+        return Err(doctor_error(
             "OpenAI tunnel-client doctor rejected the Secure MCP Tunnel configuration",
-            Some("Check CONTROL_PLANE_TUNNEL_ID, CONTROL_PLANE_API_KEY, Tunnel workspace scope, and network access, then retry."),
         ));
     }
     Ok(())
@@ -244,13 +243,13 @@ async fn run_control_plane_probe(
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let mut child = command.spawn().map_err(|_| {
-        tunnel_runtime_error("OpenAI tunnel-client control-plane probe could not start")
+        control_plane_unreachable_error("OpenAI tunnel-client control-plane probe could not start")
     })?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         let _ = child.start_kill();
         let _ = child.wait().await;
-        return Err(tunnel_runtime_error(
+        return Err(control_plane_unreachable_error(
             "OpenAI tunnel-client control-plane probe had no startup budget remaining",
         ));
     }
@@ -260,25 +259,21 @@ async fn run_control_plane_probe(
         Ok(Err(_)) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(tunnel_runtime_error(
+            return Err(control_plane_unreachable_error(
                 "OpenAI tunnel-client control-plane probe could not be supervised",
             ));
         }
         Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(ProductError::new(
-                "tunnel_unavailable",
+            return Err(control_plane_unreachable_error(
                 "OpenAI Secure MCP Tunnel could not reach the OpenAI control plane before the startup timeout",
-                Some("Check the Tunnel proxy, api.openai.com network access, Tunnel ID, and Runtime Key permissions, then retry."),
             ));
         }
     };
     if !status.success() {
-        return Err(ProductError::new(
-            "tunnel_unavailable",
+        return Err(control_plane_probe_error(
             "OpenAI Secure MCP Tunnel could not verify the selected Tunnel with the Runtime Key",
-            Some("Check the Tunnel proxy, Tunnel workspace, and Tunnels Read + Use permissions, then retry."),
         ));
     }
     Ok(())
@@ -295,20 +290,18 @@ async fn wait_until_ready(
         .no_proxy()
         .build()
         .map_err(|_| {
-            tunnel_runtime_error("WebCodex could not initialize the local tunnel readiness probe")
+            daemon_not_ready_error("WebCodex could not initialize the local tunnel readiness probe")
         })?;
     let mut health_base = None;
 
     loop {
         if let Some(status) = child
             .try_wait()
-            .map_err(|_| tunnel_runtime_error("OpenAI tunnel-client could not be supervised"))?
+            .map_err(|_| daemon_not_ready_error("OpenAI tunnel-client could not be supervised"))?
         {
-            return Err(ProductError::new(
-                "tunnel_unavailable",
-                format!("OpenAI tunnel-client exited before becoming ready ({status})"),
-                Some("Check the Tunnel ID, runtime API key permissions, local WebCodex authentication, and network access, then retry."),
-            ));
+            return Err(daemon_not_ready_error(format!(
+                "OpenAI tunnel-client exited before becoming ready ({status})"
+            )));
         }
 
         if health_base.is_none() && health_url_file.is_file() {
@@ -331,10 +324,8 @@ async fn wait_until_ready(
         }
 
         if Instant::now() >= deadline {
-            return Err(ProductError::new(
-                "tunnel_unavailable",
+            return Err(daemon_not_ready_error(
                 "OpenAI Secure MCP Tunnel did not become ready before the startup timeout",
-                Some("Check CONTROL_PLANE_TUNNEL_ID, CONTROL_PLANE_API_KEY, Tunnel workspace scope, and local MCP reachability, then retry."),
             ));
         }
         tokio::time::sleep(
@@ -555,6 +546,7 @@ async fn ensure_managed_tunnel_client_at(
     let destination = managed_binary_path(root, asset);
     let install_dir = destination.parent().ok_or_else(managed_tool_path_error)?;
     create_private_tool_dir(install_dir)?;
+    cleanup_stale_install_dirs(install_dir);
     if managed_binary_is_valid(&destination, asset).await {
         return Ok(destination);
     }
@@ -576,7 +568,7 @@ async fn ensure_managed_tunnel_client_at(
         verify_tunnel_client_version(&candidate).await?;
         fs::rename(&candidate, &destination).map_err(|_| {
             ProductError::new(
-                "tunnel_unavailable",
+                "tunnel_client_install_failed",
                 "WebCodex could not install its managed OpenAI tunnel-client atomically",
                 Some("Check user-state filesystem permissions, then retry webcodex share --tunnel openai."),
             )
@@ -589,6 +581,54 @@ async fn ensure_managed_tunnel_client_at(
     .await;
     let _ = fs::remove_dir_all(&temporary);
     result
+}
+
+fn cleanup_stale_install_dirs(install_dir: &Path) {
+    let Some(cutoff) = SystemTime::now().checked_sub(TUNNEL_CLIENT_STALE_INSTALL_AGE) else {
+        return;
+    };
+    cleanup_stale_install_dirs_before(install_dir, cutoff);
+}
+
+fn cleanup_stale_install_dirs_before(install_dir: &Path, cutoff: SystemTime) {
+    let Ok(entries) = fs::read_dir(install_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !is_managed_install_staging_name(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        #[cfg(windows)]
+        if super::windows_private_state::protect_private_directory(&path).is_err() {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified <= cutoff {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn is_managed_install_staging_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(id) = name.strip_prefix(".install-") else {
+        return false;
+    };
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 async fn managed_binary_is_valid(path: &Path, asset: TunnelClientAsset) -> bool {
@@ -754,12 +794,28 @@ fn sha256_file(path: &Path) -> Result<String, ProductError> {
 fn verify_sha256(path: &Path, expected: &str, label: &str) -> Result<(), ProductError> {
     if sha256_file(path)? != expected {
         return Err(ProductError::new(
-            "tunnel_unavailable",
+            "tunnel_client_verification_failed",
             format!("{label} failed SHA-256 verification"),
             Some("Retry webcodex share --tunnel openai; if the failure persists, set WEBCODEX_TUNNEL_CLIENT_BIN to the pinned trusted binary."),
         ));
     }
     Ok(())
+}
+
+fn tunnel_client_version_output_is_pinned(
+    status_success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> bool {
+    if !status_success {
+        return false;
+    }
+    let version_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    version_text.starts_with(TUNNEL_CLIENT_VERSION)
 }
 
 async fn verify_tunnel_client_version(path: &Path) -> Result<(), ProductError> {
@@ -770,12 +826,11 @@ async fn verify_tunnel_client_version(path: &Path) -> Result<(), ProductError> {
         .await
         .map_err(|_| verification_error())?
         .map_err(|_| verification_error())?;
-    let version_text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() || !version_text.starts_with(TUNNEL_CLIENT_VERSION) {
+    if !tunnel_client_version_output_is_pinned(
+        output.status.success(),
+        &output.stdout,
+        &output.stderr,
+    ) {
         return Err(verification_error());
     }
     Ok(())
@@ -806,7 +861,7 @@ fn managed_user_root_error(name: &str) -> ProductError {
 
 fn managed_tool_path_error() -> ProductError {
     ProductError::new(
-        "tunnel_unavailable",
+        "tunnel_client_install_failed",
         "WebCodex could not create or protect its managed OpenAI tunnel-client files",
         Some("Check user-state filesystem permissions, then retry webcodex share --tunnel openai."),
     )
@@ -814,7 +869,7 @@ fn managed_tool_path_error() -> ProductError {
 
 fn download_error(detail: &str) -> ProductError {
     ProductError::new(
-        "tunnel_unavailable",
+        "tunnel_client_download_failed",
         format!("WebCodex could not download verified OpenAI tunnel-client: {detail}"),
         Some("Check network/proxy connectivity and retry, or set WEBCODEX_TUNNEL_CLIENT_BIN to the pinned trusted binary."),
     )
@@ -822,7 +877,7 @@ fn download_error(detail: &str) -> ProductError {
 
 fn extraction_error(detail: &str) -> ProductError {
     ProductError::new(
-        "tunnel_unavailable",
+        "tunnel_client_install_failed",
         format!("WebCodex could not unpack verified OpenAI tunnel-client: {detail}"),
         Some("Retry webcodex share --tunnel openai or set WEBCODEX_TUNNEL_CLIENT_BIN to the pinned trusted binary."),
     )
@@ -830,9 +885,49 @@ fn extraction_error(detail: &str) -> ProductError {
 
 fn verification_error() -> ProductError {
     ProductError::new(
-        "tunnel_unavailable",
+        "tunnel_client_verification_failed",
         format!("OpenAI tunnel-client failed pinned {TUNNEL_CLIENT_VERSION} verification"),
         Some("Remove the managed tunnel-client file and retry, or set WEBCODEX_TUNNEL_CLIENT_BIN to the pinned trusted binary."),
+    )
+}
+
+fn doctor_error(message: impl Into<String>) -> ProductError {
+    ProductError::new(
+        "tunnel_doctor_failed",
+        message,
+        Some("Check the Tunnel configuration, local MCP prerequisites, proxy/network access, and retry."),
+    )
+}
+
+fn control_plane_unreachable_error(message: impl Into<String>) -> ProductError {
+    ProductError::new(
+        "tunnel_control_plane_unreachable",
+        message,
+        Some("Check the Tunnel proxy and api.openai.com network access, then retry."),
+    )
+}
+
+fn control_plane_probe_error(message: impl Into<String>) -> ProductError {
+    ProductError::new(
+        "tunnel_control_plane_probe_failed",
+        message,
+        Some("Check the Tunnel ID, workspace, Runtime Key permissions, proxy/network path, then retry."),
+    )
+}
+
+fn daemon_start_error(message: impl Into<String>) -> ProductError {
+    ProductError::new(
+        "tunnel_daemon_start_failed",
+        message,
+        Some("Check the verified OpenAI tunnel-client installation and retry."),
+    )
+}
+
+fn daemon_not_ready_error(message: impl Into<String>) -> ProductError {
+    ProductError::new(
+        "tunnel_daemon_not_ready",
+        message,
+        Some("Check the Tunnel configuration, local MCP reachability, and network access, then retry."),
     )
 }
 

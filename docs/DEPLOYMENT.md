@@ -2,14 +2,19 @@
 
 [English](DEPLOYMENT.md) | [简体中文](DEPLOYMENT.zh-CN.md)
 
-This guide is for **production and advanced self-hosting**: long-lived Servers, multiple machines/users, system services, reverse proxies, Docker, and operator-managed networking. If you are installing WebCodex on a normal Windows or macOS workstation, **do not start here**; the recommended path is [WebCodex Desktop + the official OpenAI Secure Tunnel](desktop-install.md). For CLI or an existing Server, use the [Full Setup guide](PERSONAL_SETUP.md). For a few-minute one-repository trial, use the [Quick Trial](QUICK_START.md).
+This guide is for **production and advanced self-hosting**: long-lived Servers, multiple machines/users, system services, reverse proxies, Docker, and operator-managed networking. For personal and multi-computer setup, start with [Unified installation](unified-installation.md) and its release/validation status. For existing published Desktop artifacts, use the [legacy installation guide](desktop-install.md); the [Full Setup guide](PERSONAL_SETUP.md) retains the advanced CLI procedures. For a few-minute one-repository trial, use the [Quick Trial](QUICK_START.md).
+
+## Unified installation status
+
+For personal or multi-computer installation, start with [Unified installation](unified-installation.md). Its Windows NSIS, macOS package, and Debian 12 / Ubuntu 22.04+ `.deb` installer targets for x64 and arm64 are defined in the build pipeline; the six installer variants have not yet received native build and installation acceptance or a unified release. Real-machine installation, reboot persistence, GUI behavior, and upgrade have not yet been accepted on all three platforms; see the [validation checklist](unified-deployment-validation.md).
+
+The npm/runtime archive, Docker, and platform-specific procedures below are retained as advanced compatibility and historical operational guidance. They do not redefine the unified installer workflow.
 
 ## Components
 
 - `webcodex` — the unified CLI for project workflows, Server/Runner lifecycle,
   enrollment, and operations.
-- `webcodex-server` — the Server process exposing REST, GPT Actions OpenAPI,
-  MCP, and Runner endpoints.
+- `webcodex-server` — the Server process exposing REST, MCP, and Runner endpoints; the legacy GPT Actions OpenAPI adapter is available only in feature-enabled builds.
 - `webcodex-runner` — the long-lived worker on the machine that owns the
   repositories.
 
@@ -22,13 +27,13 @@ writable data directory, not a separate legacy `uploads` directory.
 
 ## Build and install
 
-The documented distribution path is the npm thin installer/wrapper:
+For existing published runtime/CLI artifacts, the npm thin installer/wrapper remains available:
 
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
 
-Supported package platforms are Linux x64, Linux arm64, macOS x64, macOS arm64, Windows x64, and Windows arm64. Windows supports CLI + Runner, explicit foreground Server, and explicit local `webcodex share --tunnel cloudflare|openai|none`. Windows x64 supports managed Cloudflare acquisition; Windows ARM64 Cloudflare requires a trusted explicit/PATH binary because the pinned upstream release has no official ARM64 artifact. Managed OpenAI `tunnel-client` supports Windows x64/arm64. WebCodex-managed Windows Server and Runner services remain unsupported; run them explicitly in the foreground instead. The npm wrapper
+Supported package platforms are Linux x64, Linux arm64, macOS x64, macOS arm64, Windows x64, and Windows arm64. Windows supports CLI + Runner, explicit foreground Server, and explicit local `webcodex share --tunnel cloudflare|openai|none`. Windows x64 supports managed Cloudflare acquisition; Windows ARM64 Cloudflare requires a trusted explicit/PATH binary because the pinned upstream release has no official ARM64 artifact. Managed OpenAI `tunnel-client` supports Windows x64/arm64. The legacy `server install` / `runner install` commands do not manage Windows services; the foreground examples below remain available. The new `environment` workflow implements SCM services with explicit account requirements; see [Unified installation](unified-installation.md#services-and-credentials) and its pending native acceptance. The npm wrapper
 requires Node.js 18 or newer. The native Linux x64 artifact targets glibc 2.17
 or newer.
 
@@ -67,7 +72,7 @@ webcodex login http://127.0.0.1:8080 --code <wc_pair_...> --allowed-root C:\src 
 webcodex runner run --config <login-reported-runner-config>
 ```
 
-When Server and Runner are on different machines, replace the loopback URL with the Server's reachable HTTPS URL and configure the Server listener/public URL plus a trusted reverse proxy or tunnel as described below. Do not copy the Server bootstrap token or env file to the Runner machine. `webcodex server install/start/stop/restart/logs/uninstall` and `webcodex runner install` remain unsupported on Windows; Ctrl-C or Ctrl-Break ends the foreground runtime.
+When Server and Runner are on different machines, replace the loopback URL with the Server's reachable HTTPS URL and configure the Server listener/public URL plus a trusted reverse proxy or network route as described below. An OpenAI Secure MCP Tunnel carries ChatGPT-to-MCP traffic and is not a Runner enrollment URL. Do not copy the Server bootstrap token or env file to the Runner machine. The legacy `webcodex server install/start/stop/restart/logs/uninstall` and `webcodex runner install` commands remain unsupported on Windows; Ctrl-C or Ctrl-Break ends the foreground runtime.
 
 To keep a Windows Server loopback-only while exposing MCP privately through an OpenAI Secure MCP Tunnel and operating an independent Runner like a normal long-lived Runner, see the [Windows + OpenAI Secure MCP Tunnel deep dive](WINDOWS_OPENAI_TUNNEL.md). It is advanced setup/troubleshooting material; ordinary users do not need it before understanding the full setup path.
 
@@ -108,8 +113,7 @@ minimum production path:
    `webcodex login <server-url> --code <code>` on the machine that owns the
    repositories.
 5. Install the `webcodex-runner` service on that repository machine.
-6. Run `webcodex ops status --strict`; only then import the GPT Actions schema
-   or add the MCP connector.
+6. Run `webcodex ops status --strict`; only then add the MCP connector. If an existing Custom GPT still requires the legacy Actions adapter, use a `legacy-gpt-actions` build and import its schema separately.
 
 ### Server setup
 
@@ -173,6 +177,26 @@ pair. Migrating an already-active legacy direct-bind `webcodex.service` is a
 one-time migration boundary: the installer fails closed rather than competing
 for the live address. Stop the legacy Server first, then rerun the install with
 `--overwrite`. This boundary does not provide a gap-free first migration.
+
+### MCP Host timing profile
+
+MCP call waiting is a Server-side Host adaptation and is configured independently of Runner execution timeouts. Ordinary MCP Hosts use the default `direct` profile, so no setting is normally required:
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=direct
+```
+
+For a Host that provides native Code Mode/orchestration with an approximately 55-second wall-clock budget for the whole composition, select:
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=host_code_mode
+# Optional: host_code_mode already defaults to 55 seconds.
+WEBCODEX_MCP_HOST_BUDGET_SECS=55
+```
+
+`WEBCODEX_MCP_HOST_BUDGET_SECS` describes the Host-side MCP call/composition budget, not command runtime. Tool `timeout_secs` remains the execution lifetime and may be much larger. WebCodex never infers the profile from `clientInfo`, User-Agent, or a Host product name.
+
+`host_code_mode` describes orchestration supplied by the external MCP Host. It is separate from WebCodex's experimental internal Code Mode feature and its own nested-execution safeguards. `runtime_status.effective_config.mcp_host` reports the non-secret **deployment default**. Mixed clients can override their request strategy with `X-WebCodex-MCP-Profile` and reduce their waiting budget with `X-WebCodex-MCP-Budget-Secs`; configure these headers on each client connection, not as model arguments. See [request-local client policy](MCP.md#request-local-client-policy). No header means the deployment default; client brand is never auto-detected.
 
 ### Tool invocation tracing
 
@@ -309,9 +333,7 @@ published image before creating an administrator secret. It then advances the
 private `.webcodex-bootstrap.receipt` through `AssetsPrepared`,
 `SecretCommitted`, `ContainerStarted`, `ServerHealthy`, and `PairingReady`. The
 receipt contains hashes and state, not the administrator token. `.env` is written
-through a 0600 temporary file, synced, and atomically renamed. Success is printed
-only after the Compose healthcheck and `/openapi.json` verification succeed; a
-short-lived pairing code is created only after that readiness barrier.
+through a 0600 temporary file, synced, and atomically renamed. Success is printed only after the Compose healthcheck and `/healthz` readiness verification succeed; a short-lived pairing code is created only after that readiness barrier.
 
 If an install is interrupted or a startup/health check fails, keep `.env` and use
 the same downloaded bootstrap in that directory:
@@ -364,7 +386,7 @@ Client enrollment generates the Runner config. Important settings in
 | `transport` | Prefer `auto` with `[quic]` configured. |
 | `project_registry_dir` | Directory of project registry files. |
 | `[policy]` | Local execution boundary (`allowed_roots`, etc.). |
-| `[skills].roots` | Optional absolute Runner-local live Skill roots. WebCodex does not modify them; supported scripts may execute via `run_skill_resource`; content is not copied into the managed Skill Store. |
+| `[skills].roots` | **Available since v0.4.2.** Optional absolute Runner-local live Skill roots. WebCodex does not modify them; supported scripts may execute via `run_skill_resource`; content is not copied into the managed Skill Store. |
 | `[instructions].files` | Optional absolute Runner-local instruction files applied to every Project on this Runner. No implicit default path; the list is hot-reloadable and file contents are live. |
 | `[shell]` | Optional shell profile definitions and bounded persistent-shell limits. |
 | `[ssh.resources.<name>]` | Optional named SSH target for Session-bound `run_shell` / `run_job`. |
@@ -412,14 +434,20 @@ manual config generation uses `webcodex runner init`.
 
 ## OAuth2
 
-OAuth2 remains disabled by default when a Server has no public origin. `webcodex server init --public-url https://your-domain.example` writes the public URL, enables OAuth with that exact issuer, and enables the shared-key OAuth bridge for ordinary hosted connect. For a hand-managed env file, the equivalent settings are:
+OAuth2 remains disabled by default when a Server has no public origin. `webcodex server init --public-url https://your-domain.example` writes the public URL and enables OAuth with that exact issuer. Direct shared-key auth and the shared-key OAuth bridge remain disabled across that public boundary unless you explicitly add `--allow-remote-shared-key`.
+
+For a hand-managed env file that intentionally enables remote shared-key auth and the shared-key OAuth bridge, configure:
 
 ```text
 WEBCODEX_PUBLIC_URL=https://your-domain.example
 WEBCODEX_OAUTH2_ENABLED=true
 WEBCODEX_OAUTH2_ISSUER=https://your-domain.example
+WEBCODEX_SHARED_KEY_ENABLED=true
+WEBCODEX_SHARED_KEY_REMOTE_ENABLED=true
 WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE=true
 ```
+
+The same remote opt-in is required when direct shared-key auth is configured and an enabled QUIC Runner listener binds a non-loopback address; the default QUIC listen address is `0.0.0.0:8443`.
 
 For ordinary repository machines, no managed login is required. Connect with the MCP client's exact callback:
 
@@ -453,14 +481,17 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` limits what an OAuth client may request. Existing clients are not silently widened when WebCodex adds new permissions. To change an existing client, submit the complete desired non-empty allow-list to `POST /api/oauth/clients/update_scopes`. A real change invalidates the client's old OAuth grants and requires reauthorization; submitting the same canonical list is a no-op. See [Authentication](AUTH_MODEL.md#oauth2) for the security model.
 
-ChatGPT MCP host-file import uses two trust tiers. An active authenticated OAuth client may import only from `files.oaiusercontent.com` or its subdomains; those URLs still require HTTPS, public DNS resolution with address pinning, port 443, no userinfo, no redirects, and the normal bounded download/write policy. Configure an exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS` only when that client must also import from arbitrary public HTTPS hosts under the same SSRF controls. Reprovisioning changes the client id but does not break ordinary OpenAI-host attachment import; update the setting to restore the broader Tier 1 trust. Client display names and redirect URIs never grant Tier 1 trust.
+ChatGPT MCP host-file import uses two trust tiers. An active authenticated OAuth client may import only from OpenAI attachment hosts: `files.oaiusercontent.com` and its subdomains, plus the narrowly matched Sediment Azure Blob accounts `oaisdmntpr<region>.blob.core.windows.net`; those URLs still require HTTPS, public DNS resolution with address pinning, port 443, no userinfo, no redirects, and the normal bounded download/write policy. Configure an exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS` only when that client must also import from arbitrary public HTTPS hosts under the same SSRF controls. Reprovisioning changes the client id but does not break ordinary OpenAI-host attachment import; update the setting to restore the broader Tier 1 trust. Client display names and redirect URIs never grant Tier 1 trust.
 
 A separate local-only exception exists for an operator-controlled Server that is
-bound to loopback and reached through OpenAI Secure Tunnel with a locally
-injected user API token. Set
+bound to loopback and reached through OpenAI Secure Tunnel. Set
 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` to trust ChatGPT
-host-file rewrites on that path. The flag is ignored for non-loopback binds and
-for non-user API credentials; leave it unset on network-accessible Servers.
+host-file rewrites only when that request is authenticated by an allowed local
+credential: a normal user API token, or the configured Server bootstrap credential
+used by the regular Desktop Tunnel. That Tunnel derives the credential from the local
+`WEBCODEX_TOKEN` configuration and injects it privately; do not copy or expose it.
+The flag is ignored for non-loopback binds and all other credential classes; leave it
+unset on network-accessible Servers.
 
 List and revoke clients with `POST /api/oauth/clients/list` and
 `POST /api/oauth/clients/revoke`. OAuth uses the authorization-code flow;
@@ -470,25 +501,29 @@ protocol-level refresh-token scope and grants no extra WebCodex permission.
 
 ## GPT Actions and MCP
 
-- **MCP:** connect a client to `https://your-domain.example/mcp` with a user
-  API token (`wc_pat_*`) or, when OAuth is enabled, the OAuth flow. MCP remains
-  the primary ChatGPT integration.
-- **GPT Actions:** import `https://your-domain.example/openapi.json` into a
-  Custom GPT with HTTP Bearer authentication. On a generic runtime Server this
-  projects the same canonical Adaptive Runtime model surface: current Adaptive
-  Direct tools become direct snake_case Action operations and supported long-tail
-  tools use `call_runtime_tool`. MCP-only protocol presentation is excluded.
+- **MCP:** remains the maintained ChatGPT integration.
+- **GPT Actions:** retained only for existing Custom GPT deployments. Default
+  binaries do not mount `/openapi.json` or `/api/actions/*`; build with
+  `legacy-gpt-actions` only when that compatibility surface is still required.
+  Its direct and gateway tool sets are frozen and no longer grow with Adaptive
+  Runtime, Host, Plugin, or Code Mode development.
 
-After upgrading from the older generic Action facade, re-import `/openapi.json`
-to pick up the canonical operation names. Existing legacy REST routes may remain
-for compatibility but are not part of the new model-facing schema.
+If an older generic Action deployment is intentionally retained, rebuild with
+`legacy-gpt-actions` and re-import `/openapi.json` to pick up the frozen
+canonical operation names.
 
-Both integrations enter the same ToolRuntime authority path. GPT Actions does not
-introduce a separate scope, Project-authority, permission, Runner-capability, or
-retry policy. Project-scoped `share`/`run` deployments expose the same ordinary
-Adaptive Runtime while ProjectGrant visibility keeps them bound to their Project.
+When enabled, GPT Actions still enters the same ToolRuntime authority path and
+does not introduce separate scope, Project-authority, permission,
+Runner-capability, or retry policy. Project-scoped `share`/`run` deployments
+expose this compatibility surface only when the binary includes the feature.
 
 See [GPT Actions](GPT_ACTIONS.md), [MCP](MCP.md), and [AI Onboarding](AI_ONBOARDING.md).
+
+If ChatGPT reports a conversation-level developer-MCP `FORBIDDEN` error, do not
+treat it as proof that the deployed Server or Runner is down. Verify the
+deployment through the operator checks below and use the Host-layer decision tree
+in [Troubleshooting](TROUBLESHOOTING.md) before rotating credentials, re-registering
+projects, or restarting a healthy Runner.
 
 ## Operations
 

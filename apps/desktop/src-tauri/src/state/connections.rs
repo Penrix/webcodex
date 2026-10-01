@@ -1,8 +1,14 @@
 use super::*;
 use crate::connection_id::TunnelProfileId;
-use crate::connections::{ConnectionsSnapshot, TunnelConnectionSnapshot};
+use crate::connections::{
+    ConnectionError, ConnectionHealth, ConnectionLifecycle, ConnectionsSnapshot,
+    TunnelConnectionSnapshot,
+};
 use crate::tunnel_config::TunnelProfileRequest;
 use serde::Deserialize;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -14,6 +20,26 @@ pub enum ConnectionAction {
 }
 
 impl AppState {
+    pub async fn resume_saved_connections(&self) -> DesktopResult<DesktopStateSnapshot> {
+        let (operation, cancellation, mut core, baseline) = self
+            .begin_operation(DesktopOperationKind::RegularTunnelStart, true)
+            .await?;
+        let result = async {
+            if core.configuration_issue.is_some() || super::environment::migration_in_progress() {
+                return Err(DesktopError::new(
+                    "configuration_unavailable",
+                    "Saved configuration is unavailable or being migrated",
+                    "Resolve the configuration issue before reconnecting.",
+                ));
+            }
+            core.autostart_connections(&cancellation).await?;
+            core.get_state().await
+        }
+        .await;
+        self.finish_operation(operation, cancellation, core, baseline, result)
+            .await
+    }
+
     pub async fn save_tunnel_profile(
         &self,
         request: TunnelProfileRequest,
@@ -23,6 +49,25 @@ impl AppState {
             .await?;
         let result = async {
             cancellation.check()?;
+            if core.config.persistent_environment.is_some() {
+                if let Some(id) = request.id {
+                    let saved = super::environment::store()?;
+                    let already_managed = webcodex_environment::tunnel_profiles(&saved)
+                        .map_err(super::environment::desktop_error)?
+                        .iter().any(|profile| profile.profile_id == id.to_string());
+                    if already_managed {
+                        let original = core.tunnel_config.credentials_for(id)?;
+                        let changed_id = original.tunnel_id.expose() != request.tunnel_id.trim();
+                        let changed_key = request.api_key.as_deref().filter(|key| !key.trim().is_empty())
+                            .is_some_and(|key| original.api_key.expose() != key.trim());
+                        if changed_id || changed_key {
+                            return Err(DesktopError::new("tunnel_binding_conflict",
+                                "The persistent Tunnel already owns another credential binding",
+                                "Keep its Tunnel ID and credential, or use an explicit credential rotation workflow."));
+                        }
+                    }
+                }
+            }
             let previous = core.tunnel_config.clone();
             let id = core
                 .mutate_tunnel_config(move |config, path| config.update_profile(path, request))
@@ -86,6 +131,19 @@ impl AppState {
                     core.stop_connection_process(id).await?;
                 }
                 ConnectionAction::Delete => {
+                    if core.config.persistent_environment.is_some() {
+                        let store = super::environment::store()?;
+                        let native = webcodex_environment::NativeEnvironment::new()
+                            .map_err(super::environment::desktop_error)?;
+                        native
+                            .remove_tunnel(&store, &id.to_string())
+                            .await
+                            .map_err(super::environment::desktop_error)?;
+                        core.mutate_tunnel_config(move |config, path| config.remove(path, id))
+                            .await?;
+                        core.connections.remove(id);
+                        return core.get_state().await;
+                    }
                     // A failed stop must retain both identity and secret for recovery.
                     core.stop_connection_process(id).await?;
                     core.mutate_tunnel_config(move |config, path| config.remove(path, id))
@@ -142,6 +200,60 @@ impl DesktopCore {
             &mut self.snapshot.connections,
             self.snapshot.readiness.runtime_ready,
         );
+        if self.config.persistent_environment.is_some() {
+            let store = super::environment::store();
+            let native = webcodex_environment::NativeEnvironment::new();
+            for profile in &mut self.snapshot.connections.profiles {
+                let status =
+                    store
+                        .as_ref()
+                        .ok()
+                        .zip(native.as_ref().ok())
+                        .and_then(|(store, native)| {
+                            native
+                                .tunnel_status(store, &profile.config.id.to_string())
+                                .ok()
+                        });
+                let runtime = &mut profile.runtime;
+                runtime.pid = None;
+                runtime.tunnel_client_pid = None;
+                runtime.process_started = status
+                    .as_ref()
+                    .is_some_and(|status| status.service_status.running == Some(true));
+                runtime.process_ready = status.as_ref().is_some_and(|status| status.ready);
+                runtime.ready = runtime.process_ready;
+                runtime.tunnel_ready = status.as_ref().map(|status| status.tunnel_ready);
+                runtime.local_mcp_ready = status.as_ref().map(|status| status.local_mcp_ready);
+                runtime.lifecycle = match status.as_ref() {
+                    Some(status) if status.service_status.running == Some(true) => {
+                        ConnectionLifecycle::Running
+                    }
+                    Some(status) if status.service_status.running == Some(false) => {
+                        ConnectionLifecycle::Stopped
+                    }
+                    _ => ConnectionLifecycle::Error,
+                };
+                runtime.health = if runtime.ready {
+                    ConnectionHealth::Healthy
+                } else if runtime.process_started {
+                    ConnectionHealth::Degraded
+                } else {
+                    ConnectionHealth::Unknown
+                };
+                runtime.last_error = if runtime.process_started && !runtime.ready {
+                    Some(if runtime.local_mcp_ready == Some(false) {
+                        ConnectionError::LocalMcpUnavailable
+                    } else {
+                        ConnectionError::TunnelUnavailable
+                    })
+                } else if runtime.lifecycle == ConnectionLifecycle::Error {
+                    Some(ConnectionError::StartFailed)
+                } else {
+                    None
+                };
+            }
+            self.snapshot.connections.recount();
+        }
     }
 
     pub(super) async fn start_connection_process(
@@ -149,6 +261,18 @@ impl DesktopCore {
         id: TunnelProfileId,
         cancellation: &CancellationContext,
     ) -> DesktopResult<()> {
+        if self.config.persistent_environment.is_some() {
+            cancellation.check()?;
+            let store = super::environment::store()?;
+            let credentials = self.tunnel_config.credentials_for(id)?;
+            let native = webcodex_environment::NativeEnvironment::new()
+                .map_err(super::environment::desktop_error)?;
+            native
+                .configure_tunnel(&store, &id.to_string(), Some(&credentials))
+                .await
+                .map_err(super::environment::desktop_error)?;
+            return Ok(());
+        }
         let result = self.spawn_connection(id, cancellation).await;
         if result.is_err() {
             self.connections.fail_start(id);
@@ -206,6 +330,8 @@ impl DesktopCore {
         let local_mcp_url = format!("{}/mcp", runtime.server_url.trim_end_matches('/'));
         self.adapter.ensure_binaries(cancellation).await?;
         let proxy = effective_tunnel_proxy(&self.config.tunnel_proxy)?;
+        let auto_proxy_used =
+            self.config.tunnel_proxy.mode == TunnelProxyMode::Auto && proxy.url.is_some();
         let mut command = self
             .adapter
             .regular_tunnel_command(&env_file, proxy.url.as_deref())?;
@@ -228,6 +354,7 @@ impl DesktopCore {
             events,
             expected_root,
             local_mcp_url,
+            auto_proxy_used,
             self.supervisor.clone(),
             self.activity.clone(),
         );
@@ -238,6 +365,27 @@ impl DesktopCore {
         &mut self,
         id: TunnelProfileId,
     ) -> DesktopResult<()> {
+        if self.config.persistent_environment.is_some() {
+            let store = super::environment::store()?;
+            let profile = webcodex_environment::tunnel_profiles(&store)
+                .map_err(super::environment::desktop_error)?
+                .into_iter()
+                .find(|profile| profile.profile_id == id.to_string());
+            if !profile.is_some_and(|profile| profile.installed) {
+                return Ok(());
+            }
+            let native = webcodex_environment::NativeEnvironment::new()
+                .map_err(super::environment::desktop_error)?;
+            native
+                .control_tunnel(
+                    &store,
+                    &id.to_string(),
+                    webcodex_environment::ServiceOperation::Stop,
+                )
+                .await
+                .map_err(super::environment::desktop_error)?;
+            return Ok(());
+        }
         self.connections.stopping(id);
         let result = self
             .supervisor
@@ -267,6 +415,16 @@ impl DesktopCore {
         &mut self,
         cancellation: &CancellationContext,
     ) -> DesktopResult<()> {
+        if self.config.persistent_environment.is_some()
+            || !self.snapshot.readiness.runtime_ready
+            || self.snapshot.quick_share.is_some()
+            || !self.config.topology.as_ref().is_some_and(|topology| {
+                topology.experience == Experience::Full
+                    && matches!(topology.server, ServerTopology::Local)
+            })
+        {
+            return cancellation.check();
+        }
         for profile in self.tunnel_config.profiles() {
             cancellation.check()?;
             if profile.enabled && profile.autostart {

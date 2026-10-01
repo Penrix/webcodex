@@ -20,6 +20,32 @@ Server API 完成。
 
 ## 命令总览
 
+### 环境配置
+
+个人新安装可执行 `webcodex environment configure --create --runner --scope user`，
+再运行 `webcodex environment configure-tunnel default` 和 `webcodex environment status`。
+同机用户/Runner 凭据由内部生成，无需手动 pairing。Linux 退出登录后的持续运行取决于 linger；
+macOS LaunchAgent 与 Windows 用户计划任务需要该用户保持登录。旧服务不会被自动接管。
+[生命周期与兼容边界](implementation/personal-environment-lifecycle.md)。
+
+`webcodex environment` 与 Desktop 调用同一配置核心。该命名空间配置本机持久环境；原有项目级 `webcodex setup` 含义保持不变。安装包供应与原生验收状态见[统一安装指南](unified-installation.zh-CN.md)和[部署验收清单](unified-deployment-validation.md)。
+
+| 命令 | 用途 |
+| --- | --- |
+| `webcodex environment configure [--scope user\|system]` | 选择创建/加入与本机 Runner/查看端。新环境默认用户级服务，已有环境保留原作用域；system 明确选择机器启动服务并请求系统授权。 |
+| `configure --create --project PATH` / `configure --create --no-project` | 创建或继续配置本机 Server + Runner / 仅 Server 环境。 |
+| `configure --join URL --project PATH --code-stdin` | 带项目加入；从 stdin 读取一次性 Runner 配对码，完成凭据保存、项目注册、服务安装和就绪检查。 |
+| `configure --join URL --no-project --token-file PATH` | 从受保护文件读取用户 API 凭据，仅作为查看端加入；不创建本机 Runner 身份或服务。省略文件选项时使用隐藏终端输入。 |
+| `resume` | 核实已保存进度，只补做缺失步骤，不静默改绑环境。 |
+| `invite` | 在环境的本机 Server 创建 Runner 短期邀请；显示的 code 属于敏感信息。 |
+| `add-project PATH` | 复用已有 Runner 身份；查看端需先完成 Runner 接入。 |
+| `status --json` / `doctor --json` | 查看已保存配置、Server 连通性、Runner/项目就绪状态和结构化诊断。 |
+| `start COMPONENT` / `stop COMPONENT` / `restart COMPONENT` | 显式控制环境所拥有的 `server`、`runner` 或 `tunnel`。 |
+| `repair-user-credential [--token-file PATH]` | 核实并替换已保存用户凭据，不配对 Runner 或改变服务状态。 |
+| `repair-credential runner` | 通过隐藏输入修复 Windows SCM 账户凭据。 |
+
+完整命名空间（含 Tunnel profile、显式旧配置迁移和安装器升级/恢复）见 `webcodex environment --help`。公开环境命令支持 `--json` 和 `--environment-dir PATH`。不要将 token、配对码或服务密码放入命令行参数。配对兑换结果不确定时，先阅读恢复诊断，再显式通过 `resume --new-pairing-code --code-stdin` 提供替换码，不自动重放旧码。
+
 ### 项目 / 本地工作流
 
 以下命令作用于当前 Git 项目。
@@ -111,6 +137,46 @@ detached-process 行为。
 | `webcodex server status` | 检查 authoritative socket/service 状态、HTTP 可达性与构建版本 |
 | `webcodex server logs` | 读取 Server service journal |
 | `webcodex server uninstall` | stop/disable/remove 受管 socket/service pair |
+
+## Controller（WSL/Linux 初版）
+
+webcodex controller 是 WSL/Linux 场景下的终端控制平面。V0 不修改 Desktop，也不改变 Server、Runner 或 OpenAI Tunnel 的下层运行契约。Server 可配置为本地托管或远程观察；Runner 仍在本机由 Controller 托管；OpenAI Tunnel 只适用于本地 Server。
+
+    webcodex controller init
+    webcodex controller doctor
+    webcodex controller install
+
+默认配置位于 ~/.config/webcodex/controller.toml。运行中的 Controller 通过 $XDG_RUNTIME_DIR/webcodex/controller.sock（未设置 XDG_RUNTIME_DIR 时使用当前用户专属的 /tmp runtime 目录）提供本地 Unix Socket 控制接口。
+
+常用操作：
+
+    webcodex controller start
+    webcodex controller status
+    webcodex controller restart
+    webcodex controller restart server
+    webcodex controller restart runner
+    webcodex controller restart tunnel
+    webcodex controller logs --lines 100
+    webcodex controller stop
+    webcodex controller uninstall --confirm
+
+项目管理：
+
+    webcodex controller project list
+    webcodex controller project register /path/to/project
+    webcodex controller project remove <project-id-or-path>
+
+Controller 的 [server] 支持 mode = "local" 与 mode = "remote"。local 模式要求 env_file，Controller 会启动并监督 webcodex-server；remote 模式要求 url，Controller 只探测远程 Server，不启动本地 Server，也禁止本地 regular Tunnel。两种模式下 Runner 都使用本机 runner.toml，且其中的 server_url 必须与 Controller 配置的 Server 一致。Controller 不接管已经由 webcodex.service / webcodex.socket / webcodex-runner.service 管理的同类本地实例。
+
+`controller install` 默认安装 user service 到 `~/.config/systemd/user/webcodex-controller.service`，并通过 `systemctl --user` 管理 Controller 生命周期。`status` 会优先读取正在运行的 Controller Unix Socket，并同时显示 systemd 状态；Socket 不可用时仍可显示已安装 service 状态。`logs` 优先读取 Controller 内存中的组件日志，Controller 不可达时回退到 user journal。`stop` 会自动识别前台 Controller 与 systemd service；无组件参数的 `restart` 优先重启已安装 service，否则重启前台 runtime。`restart server|runner|tunnel` 始终通过 Controller IPC 操作组件。`uninstall --confirm` 只删除 Controller unit，不删除 controller.toml 或 controller.env。
+
+所有 `controller project` 命令均要求 `runner.enabled=true`，且指定 Runner 在 Server 上在线并对当前凭据可见；Controller 守护进程本身不必运行。Runner 离线、目标不可访问或版本不支持时明确报错，不回退本地 registry，也不自动启动 Runner。
+
+三个命令均支持 `--user-token-file PATH`。未指定时使用匹配 Server/Runner 连接的默认 `webcodex-user-token`，优先选择包含当前 Runner 配置文件的连接。默认连接缺失或存在歧义时要求显式指定；显式文件不可用时不回退其他凭据，Runner transport 和 Tunnel 凭据不能替代用户凭据。
+
+Runner 超过 100 个项目时，可使用 Server 返回的完整项目 ID（例如 `agent:runner-a:demo`）删除，命令会在 Server 侧精确筛选库存。短 ID 和路径匹配要求库存未截断，以便可靠拒绝歧义目标。
+
+`project list` 调用 `list_projects`，仅列出指定 Runner 的可见项目，并显示库存同步及截断状态（最多 100 项）。`project register PATH` 复用在线按路径解析或注册 API，只使用 Runner 当前已有路径权限，不扩展 `[policy].allowed_roots`。`project remove ID-OR-PATH` 从完整库存中解析唯一项目，携带 revision 调用 `unregister_project`；只注销项目，不删除工作目录、不收缩 allowed_roots、不停止 Runner。操作在线生效，无需重启 Runner。revision 冲突直接报错；变更响应丢失时报告结果未知，不自动重试或补删本地文件。使用 `--json` 时，成功 API 结果输出到 stdout，命令失败以 JSON 输出到 stderr 并返回非零退出码。
 
 Windows 支持 `server init`、前台 `server run` 与显式 `share`。受管 service 生命周期（`install`、`start`、`stop`、`restart`、`logs`、`uninstall`）仍只支持 Linux。
 

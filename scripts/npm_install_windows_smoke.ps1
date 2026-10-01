@@ -38,6 +38,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Resolve-InputPath([string]$Path) {
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
 function Get-BoundedShareLogTail {
     param(
         [string]$Path,
@@ -100,7 +104,7 @@ if (-not $BinDir) {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
 }
-$BinDir = [System.IO.Path]::GetFullPath($BinDir)
+$BinDir = Resolve-InputPath $BinDir
 
 # ---------------------------------------------------------------------------
 # Isolate everything under one smoke root; the registry is pinned to a
@@ -331,7 +335,7 @@ try {
                 if ($null -ne $child) { $ServerChildPid = [int]$child.ProcessId }
             }
             try {
-                $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$ServerPort/openapi.json" -TimeoutSec 1
+                $response = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$ServerPort/healthz" -TimeoutSec 1
                 if ($response.StatusCode -eq 200) {
                     $ready = $true
                     break
@@ -342,7 +346,7 @@ try {
             Start-Sleep -Milliseconds 100
         }
         if (-not $ready) {
-            throw "foreground Windows Server did not reach /openapi.json readiness before the absolute deadline"
+            throw "foreground Windows Server did not reach /healthz readiness before the absolute deadline"
         }
         while ($null -eq $ServerChildPid -and $deadline.Elapsed -lt [TimeSpan]::FromSeconds(20)) {
             $child = Get-CimInstance Win32_Process -Filter "ParentProcessId=$($ServerCliProcess.Id)" -ErrorAction SilentlyContinue |

@@ -3,6 +3,8 @@
 
 use serde_json::Value;
 
+use super::tools::RECORDING_SESSION_SELECTOR_SCHEMA_PATTERN;
+
 // MCP discovery targets, independent of GPT Actions' importer limits. Keep
 // purpose, the nearest selection boundary, and essential continuation guidance.
 pub(super) const TOOL_DESCRIPTION_MAX_CHARS: usize = 420;
@@ -12,17 +14,19 @@ pub(super) fn compact_tool(tool: &mut Value) {
     let name = tool["name"].as_str().unwrap_or_default().to_string();
     if let Some(description) = tool["description"].as_str() {
         let selection = match name.as_str() {
-            "work_on_project" => "Start ordinary coding/review with project or client_id+path. Omit session_id for a fresh Workflow Session; supply it only for exact resume. Defaults return project instructions, workflow and extension guidance. Use mode=worktree for an isolated Git worktree.",
-            "tool_manifest" => "Discover tools by intent/category, or pass tool_name for one exact canonical contract and its direct/gateway route. Use exact lookup when arguments or operational details are not already known.",
-            "call_runtime_tool" => "Call one admitted runtime tool with its exact arguments. Use tool_manifest to discover the contract. Prefer an available direct callable; this gateway also supports admitted direct tools when that callable is unavailable. Target validation and authority checks still apply.",
+            "work_on_project" if tool.pointer("/inputSchema/properties/_wc").is_none() => "Bootstrap coding/review; omit session_id for a fresh Session or supply exact session_id to resume. Read applicable AGENTS.md/CLAUDE.md with read_files. Reuse returned workspace branch/HEAD/status and sufficient catalogs; refresh stale or incomplete facts before dependent work.",
+            "work_on_project" => "Bootstrap coding/review; omit session_id for fresh Session; otherwise exact resume. To read/follow AGENTS.md/CLAUDE.md or repository rules, request _wc.context=[\"project.instructions\"]. Request webcodex.workflow via _wc.context when guidance is missing. Reuse complete instruction bodies, workspace branch/HEAD/status, available semantic navigation and sufficient catalogs; refresh for stale/incomplete facts or detail.",
+            "tool_manifest" => "Discover tools by intent/category, or pass tool_name for one exact canonical contract plus route.primary/route.fallback. Discovery never registers a new Host tool. If a direct callable is absent, follow the exact gateway fallback when it is allowed.",
+            "call_runtime_tool" => "Call one admitted runtime tool with its exact arguments. Use tool_manifest to discover the contract. Prefer an available direct callable; ordinary direct tools may fall back here when unavailable, but MCP App presentation tools must use their direct callable while Apps are enabled. Target validation and authority checks still apply.",
+            "edit_project_files" => "Primary project editor after read_files. Existing-file edit/delete/rename require expected_read_revision; create requires content. Use exact edits for unique text or replace_range for known 1-based inclusive lines, then review and validate.",
             "run_process" => "Run one native executable with literal argv. Use run_shell for shell grammar or a short related command chain. Long work continues as the same Runner-owned Job through observe_jobs; retain the returned continuation instead of redispatching.",
             "run_shell" => "Run shell grammar or a short related command chain. Use run_process for one native executable with literal argv. Long work continues as the same Runner-owned Job through observe_jobs; retain the returned continuation instead of redispatching.",
-            "run_detached_process" => "Start a native child that intentionally survives Runner restart or replacement as a durable Job. Duration alone does not require detachment. Requires an idempotency_key; retain the same Job and use observe_jobs or stop_job after handoff uncertainty.",
-            "observe_jobs" => "Continue known Jobs by job_id; do not list first. Pass observation_token unchanged as after_observation_token. Follow the returned continuation for more output; observation never redispatches work. Use wait_for_job_terminal when blocked only on terminal completion.",
-            "list_jobs" => "Recover or inventory caller-visible Job identities. When a job_id or continuation is already known, use observe_jobs directly.",
-            "wait_for_job_terminal" => "Arm a bounded one-shot terminal wait for one exact existing Job. Reuse the keyed wait and returned continuation; never redispatch the Job. Continue independent work, or follow the offered Host continuation when only terminal completion blocks progress.",
-            "stop_job" => "Stop one existing Job by exact job_id with confirm=true. Preserves Project and Session ownership. Use observe_jobs to inspect output or wait_for_job_terminal to wait without stopping.",
-            "present_agent_continuation" => "Present one exact Agent/Endpoint generation as the persistent MCP App continuation card. New window setup: create_agent_identity -> rotate_agent_continuation_endpoint -> present_agent_continuation, then yield/end promptly. Presentation success is not wake readiness; later verify list_agent_identities.production_auto_resume_available.",
+            "observe_jobs" => "Read logs/details for known Jobs; do not list first. Reuse observation_ref or pass observation_token unchanged as after_observation_token. Continue independent work first. When blocked, use bounded wait_for_job_readiness in the current turn, then observe needed results. Never redispatch execution or assume an automatic next turn.",
+            "wait_for_job_readiness" => "Bounded current-turn join for 1..8 exact Jobs, 1..45s. Finish independent work first. Use any when one terminal Job unlocks work; all only when every dependency is needed. Budget the largest safe remaining wait. At deadline reassess work/set; never mechanically refill. Terminal is readiness, not success. Logs/details: observe_jobs. No automatic next turn.",
+            "wait_for_job_terminal" => "Optional durable terminal attention for an explicitly selected continuation workflow. Not a blocking wait and does not start a model turn. Ordinary work uses wait_for_job_readiness in the current turn and observe_jobs for results. Reuse exact keyed waits; never redispatch the Job.",
+            "present_agent_continuation" => "Present one exact Agent/Endpoint generation as the persistent MCP App continuation card. Pass agent_continuation_ref or the exact tuple. New window setup: create_agent_identity -> rotate_agent_continuation_endpoint -> present_agent_continuation, then yield/end promptly. Presentation success is not wake readiness; later verify list_agent_identities.production_auto_resume_available.",
+            "start_agent_task_attempt" => "Create one leased fenced Attempt for the explicit current assignee. Returns attempt_id, attempt_fence, and attempt_ref. Exact keyed retry returns that same Attempt. Does not dispatch CodingAgent, Job, Wake, or Endpoint work.",
+            "start_agent_task_endpoint_continuation" => "Select the Endpoint continuation for one exact live AgentTaskAttempt. Pass attempt_ref or task, attempt, assignee, fence, and controller generation. Does not choose an Endpoint or grant CodingAgent authority. A stale ref fails closed and is not rewritten onto a later attempt or generation.",
             _ => description,
         };
         tool["description"] =
@@ -30,6 +34,10 @@ pub(super) fn compact_tool(tool: &mut Value) {
     }
     if let Some(schema) = tool.get_mut("inputSchema") {
         compact_input_descriptions(schema);
+        compact_invocation_envelope(schema);
+        if name == "edit_project_files" {
+            compact_primary_editor_schema(schema);
+        }
         if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             for (field, property) in properties {
                 if let (Some(description), Some(Value::String(copy))) = (
@@ -40,24 +48,109 @@ pub(super) fn compact_tool(tool: &mut Value) {
                 }
             }
         }
-        // Only these root properties are protocol wrappers. A business
-        // session_id keeps its own canonical-derived copy and requiredness.
-        // Nested IDs/resolution have no description; keep their type hints here.
-        for (pointer, description) in [
-            ("/properties/recording_session_id", "Recorder wc_sess_* provenance only; never authority or a business Session target."),
-            ("/properties/ack_session_message_ids", "ACK-required wc_msg_* IDs retained in model context; repeat while retained; never resolves or authorizes."),
-            ("/properties/session_message_resolution", "Resolve one handled non-todo recorder message by exact wc_msg_*; ACK separately if required. Independent of call success."),
-            ("/properties/context_request", "Post-result sidecar keys; no authority: project.instructions, webcodex.workflow, jobs.attention, skills.catalog, plugins.catalog, memory.bootstrap."),
-            ("/properties/context_request/items", "Context key; unsupported keys are nonfatal."),
-        ] {
-            if let Some(Value::String(copy)) = schema
-                .pointer_mut(pointer)
-                .and_then(|property| property.get_mut("description"))
-            {
-                *copy = description.to_string();
-            }
+        if let Some(envelope) = schema.pointer_mut("/properties/_wc") {
+            strip_wrapper_descriptions(envelope);
+            envelope["description"] = Value::String(
+                "Optional invocation sidecars; omit when unused. Never grants authority.".into(),
+            );
         }
         compact_discovery_validation_annotations(schema);
+    }
+}
+
+fn compact_primary_editor_schema(schema: &mut Value) {
+    // `tools/list` is only the model-selection copy. The direct editor already
+    // carries one bounded top-level purpose, while the discriminated `changes`
+    // variants repeat explanatory prose across edit/create/delete/rename and
+    // nested exact/range edit forms. Keep every structural constraint, bound,
+    // required field and discriminator, but omit that duplicated nested copy.
+    // Canonical/full discovery and ToolRuntime parsing retain the exact schema.
+    if let Some(changes) = schema.pointer_mut("/properties/changes/items") {
+        strip_schema_descriptions(changes);
+    }
+}
+
+fn strip_schema_descriptions(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    object.remove("description");
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "dependencies",
+    ] {
+        if let Some(children) = object.get_mut(keyword).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                strip_schema_descriptions(child);
+            }
+        }
+    }
+    for keyword in [
+        "items",
+        "prefixItems",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "propertyNames",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+    ] {
+        if let Some(child) = object.get_mut(keyword) {
+            if let Some(children) = child.as_array_mut() {
+                for child in children {
+                    strip_schema_descriptions(child);
+                }
+            } else {
+                strip_schema_descriptions(child);
+            }
+        }
+    }
+}
+
+fn strip_wrapper_descriptions(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    object.remove("description");
+    if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+        for property in properties.values_mut() {
+            strip_wrapper_descriptions(property);
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        strip_wrapper_descriptions(items);
+    }
+}
+
+fn compact_invocation_envelope(schema: &mut Value) {
+    let Some(envelope) = schema
+        .pointer_mut("/properties/_wc")
+        .filter(|value| value.is_object())
+    else {
+        return;
+    };
+    strip_wrapper_descriptions(envelope);
+    if let Some(properties) = envelope
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
+        if properties.contains_key("reply") {
+            properties.insert("reply".to_string(), serde_json::json!({"type": "object"}));
+        }
+        if properties.contains_key("control") {
+            properties.insert("control".to_string(), serde_json::json!({"type": "object"}));
+        }
     }
 }
 
@@ -68,15 +161,15 @@ fn compact_discovery_validation_annotations(schema: &mut Value) {
     // use their original schemas/parsers, never this owned presentation copy.
     for (pointer, pattern) in [
         (
-            "/properties/recording_session_id",
-            "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
+            "/properties/_wc/properties/record",
+            RECORDING_SESSION_SELECTOR_SCHEMA_PATTERN,
         ),
         (
-            "/properties/ack_session_message_ids/items",
+            "/properties/_wc/properties/ack/items",
             "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
         ),
         (
-            "/properties/session_message_resolution/properties/message_id",
+            "/properties/_wc/properties/resolve/properties/message_id",
             "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
         ),
     ] {
@@ -95,20 +188,16 @@ fn common_input_description(tool: &str, field: &str) -> Option<&'static str> {
     // particular run_shell cwd/timeouts can refer to a named SSH resource;
     // project, client_id and idempotency_key also differ between direct tools.
     Some(match (tool, field) {
-        ("run_process" | "run_detached_process", "cwd") =>
+        ("run_process", "cwd") =>
             "Project-relative cwd; omit, empty or '.' for root. No named Session SSH resources.",
         ("run_skill_resource", "cwd") =>
             "Project-relative cwd; omit, empty or '.' for root. Skill resolution does not change cwd.",
-        ("run_process" | "run_detached_process", "timeout_secs") =>
+        ("run_process", "timeout_secs") =>
             "Total runtime seconds; default 60, clamped to 604800 (7 days).",
         ("run_skill_resource", "timeout_secs") =>
             "Total runtime seconds; default 60, clamped to 3600.",
         ("cargo_check" | "cargo_test", "timeout_secs") =>
             "Total validation runtime seconds, clamped to 3600. Defaults vary per tool.",
-        ("run_process" | "run_script" | "run_skill_resource" | "cargo_check" | "cargo_test" | "go_test", "sync_wait_secs") =>
-            "Same-execution Job handoff grace; default 10s, clamped to 55s and timeout. Never extends runtime or retries.",
-        ("run_shell", "sync_wait_secs") =>
-            "Same-execution Job handoff grace; default 10s, clamped to 55s and timeout; controls return only. Named Session SSH unsupported.",
         ("run_process" | "run_shell", "assertion_name") =>
             "Validation label; reuse after a fix to correlate evidence. Inert unless execution is validation-like.",
         _ => return None,
@@ -186,7 +275,7 @@ pub(super) fn bound_description(description: &str, max_chars: usize) -> String {
                     .is_none_or(char::is_whitespace))
             .then_some(end)
         })
-        .last()
+        .next_back()
     {
         return prefix[..end].to_string();
     }

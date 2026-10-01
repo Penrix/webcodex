@@ -145,6 +145,23 @@ fn mime_allowed_for_import(mime: &str, path: &str) -> bool {
     mime_is_compatible_with_path(mime, path)
 }
 
+fn is_openai_download_host(host: &str) -> bool {
+    if host == "files.oaiusercontent.com" || host.ends_with(".oaiusercontent.com") {
+        return true;
+    }
+
+    let Some(storage_account) = host.strip_suffix(".blob.core.windows.net") else {
+        return false;
+    };
+    let Some(region) = storage_account.strip_prefix("oaisdmntpr") else {
+        return false;
+    };
+    !region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
 fn validate_openai_download_url(download_link: &str) -> Result<reqwest::Url, String> {
     let url =
         reqwest::Url::parse(download_link).map_err(|e| format!("invalid download_link: {e}"))?;
@@ -154,7 +171,7 @@ fn validate_openai_download_url(download_link: &str) -> Result<reqwest::Url, Str
     let Some(host) = url.host_str().map(|h| h.to_ascii_lowercase()) else {
         return Err("download_link must include a host".to_string());
     };
-    if host != "files.oaiusercontent.com" && !host.ends_with(".oaiusercontent.com") {
+    if !is_openai_download_host(&host) {
         return Err("download_link host is not an OpenAI file host".to_string());
     }
     Ok(url)
@@ -465,7 +482,7 @@ impl ToolRuntime {
                     session_id: input.session_id.clone(),
                 },
                 auth,
-                transport.clone(),
+                transport,
             )
             .await;
         if !result.success {
@@ -578,7 +595,7 @@ impl ToolRuntime {
                     overwrite: input.overwrite,
                 },
                 auth,
-                transport.clone(),
+                transport,
             )
             .await;
         if !begin.success {
@@ -606,7 +623,7 @@ impl ToolRuntime {
                     &upload_id,
                     input.session_id.as_deref(),
                     auth,
-                    transport.clone(),
+                    transport,
                 )
                 .await;
                 return Err(ToolResult::err(format!(
@@ -630,7 +647,7 @@ impl ToolRuntime {
                         &upload_id,
                         input.session_id.as_deref(),
                         auth,
-                        transport.clone(),
+                        transport,
                     )
                     .await;
                     return Err(ToolResult::err(format!(
@@ -645,7 +662,7 @@ impl ToolRuntime {
                     &upload_id,
                     input.session_id.as_deref(),
                     auth,
-                    transport.clone(),
+                    transport,
                 )
                 .await;
                 return Err(ToolResult::err(format!(
@@ -659,7 +676,7 @@ impl ToolRuntime {
                     &upload_id,
                     input.session_id.as_deref(),
                     auth,
-                    transport.clone(),
+                    transport,
                 )
                 .await;
                 return Err(ToolResult::err(format!(
@@ -683,7 +700,7 @@ impl ToolRuntime {
                             uploaded_bytes,
                             &pending,
                             auth,
-                            transport.clone(),
+                            transport,
                         )
                         .await?;
                     pending.clear();
@@ -698,7 +715,7 @@ impl ToolRuntime {
                 uploaded_bytes,
                 &pending,
                 auth,
-                transport.clone(),
+                transport,
             )
             .await?;
         }
@@ -712,7 +729,7 @@ impl ToolRuntime {
                     session_id: input.session_id.clone(),
                 },
                 auth,
-                transport.clone(),
+                transport,
             )
             .await;
         if !result.success {
@@ -771,7 +788,7 @@ impl ToolRuntime {
                     file_ref,
                     idx,
                     auth,
-                    transport.clone(),
+                    transport,
                     download_policy,
                 )
                 .await
@@ -846,7 +863,7 @@ impl ToolRuntime {
             }
             (SessionTransport::Mcp, _) => {
                 return ToolResult::err(
-                    "import_conversation_files_to_project requires authenticated MCP OAuth host-file provenance",
+                    "import_conversation_files_to_project requires trusted MCP host-file provenance",
                 );
             }
             (SessionTransport::Api, _) => {
@@ -956,6 +973,30 @@ mod tests {
     }
 
     #[test]
+    fn openai_download_host_accepts_sediment_blob_accounts_without_broadening_azure() {
+        for host in [
+            "files.oaiusercontent.com",
+            "subdomain.oaiusercontent.com",
+            "oaisdmntprcentralus.blob.core.windows.net",
+            "oaisdmntpreastus2.blob.core.windows.net",
+        ] {
+            assert!(is_openai_download_host(host), "{host} should be accepted");
+        }
+
+        for host in [
+            "oaiusercontent.com",
+            "attacker.blob.core.windows.net",
+            "oaisdmntpr.blob.core.windows.net",
+            "oaisdmntprcentralus.blob.core.windows.net.evil.example",
+        ] {
+            assert!(
+                !is_openai_download_host(host),
+                "{host} must not be accepted as an OpenAI file host"
+            );
+        }
+    }
+
+    #[test]
     fn trusted_mcp_ssrf_policy_rejects_non_public_ip_ranges() {
         for ip in [
             "127.0.0.1",
@@ -1015,6 +1056,19 @@ mod tests {
         .await
         .expect("authenticated MCP OpenAI file host should be accepted");
         assert_eq!(url.host_str(), Some("files.oaiusercontent.com"));
+        assert_eq!(import_test_dns_resolution_count(), 1);
+
+        reset_import_test_dns_resolution_count();
+        let (_client, url) = prepare_download_request(
+            "https://oaisdmntprcentralus.blob.core.windows.net/files/file/raw?sig=test",
+            ConversationImportDownloadPolicy::AuthenticatedMcpOpenAiHostFile,
+        )
+        .await
+        .expect("authenticated MCP Sediment blob host should be accepted");
+        assert_eq!(
+            url.host_str(),
+            Some("oaisdmntprcentralus.blob.core.windows.net")
+        );
         assert_eq!(import_test_dns_resolution_count(), 1);
 
         set_import_test_resolved_ips(Some(vec!["127.0.0.1".parse().unwrap()]));

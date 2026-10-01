@@ -40,6 +40,7 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
         RunnerCapabilities {
             shell: true,
             explicit_shell_selection: true,
+            bash_login_shell: true,
             ..Default::default()
         },
     )
@@ -67,6 +68,7 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: Some(session_id),
@@ -117,6 +119,7 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: Some(session_id),
@@ -166,6 +169,7 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: None,
@@ -215,6 +219,7 @@ async fn explicit_local_shell_fails_closed_on_older_runner_without_selector_capa
         RunnerCapabilities {
             shell: true,
             explicit_shell_selection: false,
+            bash_login_shell: false,
             ..Default::default()
         },
     )
@@ -224,6 +229,7 @@ async fn explicit_local_shell_fails_closed_on_older_runner_without_selector_capa
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project,
                 command: "pwd".to_string(),
                 session_id: None,
@@ -273,6 +279,7 @@ async fn outer_recorder_does_not_override_business_session_execution_context() {
         RunnerCapabilities {
             shell: true,
             explicit_shell_selection: true,
+            bash_login_shell: true,
             ..Default::default()
         },
     )
@@ -371,6 +378,7 @@ async fn run_job_inherits_session_cwd_and_shell() {
     let capabilities = RunnerCapabilities {
         async_shell_jobs: true,
         explicit_shell_selection: true,
+        bash_login_shell: true,
         ..Default::default()
     };
     register_agent_projects_for_auth(
@@ -468,8 +476,9 @@ async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_a
         let auth = auth.clone();
         async move {
             runtime
-                .dispatch_with_auth(
+                .dispatch_with_auth_transport_options_and_metadata(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: Some(session_id),
@@ -480,6 +489,8 @@ async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_a
                         shell: None,
                     },
                     Some(&auth),
+                    sessions::SessionTransport::Mcp,
+                    sessions::ToolCallRecorderMetadata::default(),
                 )
                 .await
         }
@@ -604,6 +615,7 @@ async fn session_ssh_resource_rejects_structured_cargo_before_direct_sync_start(
                 no_default_features: None,
                 features: None,
                 package: None,
+                packages: None,
                 timeout_secs: Some(30),
                 sync_wait_secs: None,
             },
@@ -717,6 +729,7 @@ async fn session_ssh_resource_requires_runner_ssh_shell_capability() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project,
                 command: "pwd".to_string(),
                 session_id: Some(session.session_id),
@@ -782,6 +795,7 @@ async fn session_ssh_transport_failure_marks_remote_delivery_uncertain() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "printf uncertain".to_string(),
                         session_id: Some(session_id),
@@ -863,6 +877,7 @@ async fn mismatch_and_invalid_context_fail_closed_without_root_fallback() {
     let mismatch = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project: second_project,
                 command: "pwd".to_string(),
                 session_id: Some(session.session_id.clone()),
@@ -929,6 +944,7 @@ async fn nonexistent_inherited_cwd_is_not_retried_at_project_root() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: Some(session.session_id),

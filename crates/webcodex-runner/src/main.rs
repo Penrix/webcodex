@@ -20,8 +20,9 @@ use webcodex_runner::{cwd_allowed, PreparedShellProfileCache};
 use runner_operation::RunnerFileOperation;
 #[cfg(test)]
 use runner_operation::RunnerOperation;
+use webcodex_build_info as build_info;
 use webcodex_core::{
-    apply_edits_shared, apply_patch_shared, artifact_policy, build_info, lsp_bridge, mcp_gateway,
+    apply_edits_shared, apply_patch_shared, artifact_policy, lsp_bridge, mcp_gateway,
     runner_operation, runner_protocol, validation_bridge,
 };
 use webcodex_runner_config as runner_config;
@@ -30,10 +31,10 @@ use webcodex_workspace::project_overview;
 use webcodex_workspace::workspace_checkpoint;
 
 use runner_protocol::{
-    validation_infrastructure_failure_code, RunnerCapabilities, RunnerPolicySummary,
-    RunnerPollPayload, RunnerPollRequest, RunnerPollResponse, RunnerProjectSummary,
-    RunnerRegisterRequest, RunnerRegisterResponse, RunnerRequest, ShellJobInventory,
-    ShellJobTestCountEvidence, ShellJobValidationStep, ShellProfileSummaryEntry,
+    validation_infrastructure_failure_code, RunnerCapabilities, RunnerCapabilityId,
+    RunnerPolicySummary, RunnerPollPayload, RunnerPollRequest, RunnerPollResponse,
+    RunnerProjectSummary, RunnerRegisterRequest, RunnerRegisterResponse, RunnerRequest,
+    ShellJobInventory, ShellJobTestCountEvidence, ShellJobValidationStep, ShellProfileSummaryEntry,
     ShellProfilesSummary, ShellProjectInventoryPage, ShellProjectInventoryStatus,
     RUNNER_PROTOCOL_GENERATION_V2, VALIDATION_STEP_WAIT_FAILED_CODE,
 };
@@ -67,7 +68,7 @@ use webcodex_runner::{
 use webcodex_runner::{
     client_profile_runner_config, configured_validation_job_command, default_config_path,
     dispatch_request_with_outcome, err_cmd, handle_apply_patch_file_request,
-    handle_apply_text_edits_file_request, handle_artifact_file_operation,
+    handle_apply_text_edits_file_request, handle_artifact_file_operation_with_store,
     handle_basic_file_request, handle_write_project_file_request, hostname, load_config,
     max_concurrent_jobs, ok_cmd, project_registry_dir, resolve_requested_path, run_runner,
     validate_client_profile, validate_structured_edit_runner_path, CommandResult, HotRunnerConfig,
@@ -106,6 +107,10 @@ enum RunnerCliAction {
         config_path: PathBuf,
         once: bool,
         stop_on_stdin_eof: bool,
+        computer_session_dir: Option<PathBuf>,
+    },
+    ComputerSessionHelper {
+        session_state_dir: PathBuf,
     },
     Exit {
         code: i32,
@@ -115,7 +120,7 @@ enum RunnerCliAction {
 }
 
 fn usage() -> &'static str {
-    "Usage: webcodex-runner [--config PATH] [--once] [--stop-on-stdin-eof]\n\n\
+    "Usage: webcodex-runner [--config PATH] [--once] [--stop-on-stdin-eof] [--computer-session-dir PATH]\n\n\
      Options:\n\
        -h, --help                 Print help and exit\n\
        -V, --version              Print version and exit\n\
@@ -123,13 +128,14 @@ fn usage() -> &'static str {
        --profile NAME             Client config profile for default config path\n\
        --once                     Complete one successful poll, then exit (polling transport)\n\
        --stop-on-stdin-eof        Stop when the invoking parent closes stdin\n\n\
+       --computer-session-dir PATH  Route Computer calls to login-session helper\n\
+       --computer-session-helper --session-state-dir PATH  Run login-session helper\n\n\
      With --profile, the default config path is derived under\n\
      /etc/webcodex/clients/<profile> for root or\n\
      ~/.config/webcodex/clients/<profile> for non-root users. Explicit\n\
      --config overrides the profile-derived default.\n\n\
      Environment:\n\
        WEBCODEX_RUNNER_CONFIG     default config path override\n\
-       WEBCODEX_AGENT_CONFIG      legacy alias for WEBCODEX_RUNNER_CONFIG\n\
      Example runner.toml:\n\
        server_url = \"https://v4.yyjeqhc.cn\"\n\
        token = \"...\"\n\
@@ -150,6 +156,19 @@ fn parse_args() -> Result<RunnerCliAction, String> {
     parse_runner_args(std::env::args().skip(1))
 }
 
+#[cfg(windows)]
+fn parse_service_runner_args(args: &[String]) -> Result<(PathBuf, PathBuf), String> {
+    if args.len() != 4
+        || args[0] != "--config"
+        || args[2] != "--computer-session-dir"
+        || args[1].is_empty()
+        || args[3].is_empty()
+    {
+        return Err("Runner service requires --config PATH --computer-session-dir PATH".into());
+    }
+    Ok((PathBuf::from(&args[1]), PathBuf::from(&args[3])))
+}
+
 fn parse_runner_args<I, S>(args: I) -> Result<RunnerCliAction, String>
 where
     I: IntoIterator<Item = S>,
@@ -159,8 +178,28 @@ where
         .into_iter()
         .map(|arg| arg.as_ref().to_string())
         .collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--computer-session-helper")
+    {
+        if args.len() != 3 || args[1] != "--session-state-dir" || args[2].is_empty() {
+            return Err(
+                "computer session helper requires only --session-state-dir PATH".to_string(),
+            );
+        }
+        return Ok(RunnerCliAction::ComputerSessionHelper {
+            session_state_dir: PathBuf::from(&args[2]),
+        });
+    }
     if args.len() == 1 {
         match args[0].as_str() {
+            "--build-info-json" => {
+                return Ok(RunnerCliAction::Exit {
+                    code: 0,
+                    stdout: build_info::build_info_json("webcodex-runner"),
+                    stderr: String::new(),
+                });
+            }
             "--help" | "-h" => {
                 return Ok(RunnerCliAction::Exit {
                     code: 0,
@@ -184,6 +223,7 @@ where
     let mut profile: Option<String> = None;
     let mut once = false;
     let mut stop_on_stdin_eof = false;
+    let mut computer_session_dir = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -203,6 +243,12 @@ where
             }
             "--once" => once = true,
             "--stop-on-stdin-eof" => stop_on_stdin_eof = true,
+            "--computer-session-dir" => {
+                let Some(path) = args.next() else {
+                    return Err("--computer-session-dir requires a path".to_string());
+                };
+                computer_session_dir = Some(PathBuf::from(path));
+            }
             "--config" | "-c" => {
                 let Some(path) = args.next() else {
                     return Err("--config requires a path".to_string());
@@ -234,6 +280,12 @@ where
                         .to_string(),
                 );
             }
+            if runner_config_env.is_none() && legacy_agent_config_env.is_some() {
+                eprintln!(
+                    "webcodex-runner warning: WEBCODEX_AGENT_CONFIG is deprecated; use WEBCODEX_RUNNER_CONFIG instead. Legacy startup compatibility will be removed in WebCodex {}.",
+                    runner_config::paths::LEGACY_RUNNER_CONFIG_REMOVAL_VERSION
+                );
+            }
             runner_config_env
                 .or(legacy_agent_config_env)
                 .map(PathBuf::from)
@@ -245,6 +297,7 @@ where
         config_path,
         once,
         stop_on_stdin_eof,
+        computer_session_dir,
     })
 }
 
@@ -1396,115 +1449,150 @@ fn disable_job_state_reconciliation_for_test() -> bool {
 }
 
 fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
-    let mut capabilities = cfg.capabilities.clone().unwrap_or_default();
+    let configured = cfg.capabilities.clone().unwrap_or_default();
+    let mut capabilities = RunnerCapabilities::default();
+    // Only these legacy implementation switches come from configuration. Do not
+    // copy the whole catalog: a future wire field is not implemented merely
+    // because a configuration advertises it. Provider capabilities are observed
+    // separately when building the registration request.
+    capabilities.set(RunnerCapabilityId::Shell, configured.shell);
+    capabilities.set(RunnerCapabilityId::Git, configured.git);
     // This binary accepts a structured local sh/bash selector on raw shell
     // requests. Older Runners omit the bit so current Servers fail closed.
-    capabilities.explicit_shell_selection = true;
-    capabilities.jobs = true;
-    capabilities.file_read = true;
-    capabilities.file_write = true;
+    capabilities.set(RunnerCapabilityId::ExplicitShellSelection, true);
+    capabilities.set(RunnerCapabilityId::BashLoginShell, true);
+    capabilities.set(RunnerCapabilityId::Jobs, true);
+    capabilities.set(RunnerCapabilityId::FileRead, true);
+    capabilities.set(RunnerCapabilityId::FileWrite, true);
     // This binary implements the narrow internal seek/read export-chunk path.
     // Older binaries omit the field so Control uses the existing slow fallback.
-    capabilities.artifact_export_chunk_read = true;
+    capabilities.set(RunnerCapabilityId::ArtifactExportChunkRead, true);
     // Large export metadata (size/SHA/MIME) is verified with bounded streaming
     // I/O. Keep this separate from chunk-read support for rolling upgrades.
-    capabilities.artifact_export_streaming_metadata = true;
+    capabilities.set(RunnerCapabilityId::ArtifactExportStreamingMetadata, true);
     // This binary implements the complete bounded structured delete contract.
     // Older binaries omit the field and therefore keep using the Server's legacy path.
-    capabilities.structured_file_delete = true;
+    capabilities.set(RunnerCapabilityId::StructuredFileDelete, true);
     // This binary enforces ApplyTextEditInput.occurrence exactly. Older binaries
     // omit this additive effect-semantics capability and must not receive selectors.
-    capabilities.apply_text_edit_occurrence = true;
+    capabilities.set(RunnerCapabilityId::ApplyTextEditOccurrence, true);
     // Unique exact local edits may be preflighted against current content
     // without a historical whole-file SHA. The transactional source-SHA fence
     // before mutation remains mandatory.
-    capabilities.apply_text_edit_local_guard_without_sha = true;
+    capabilities.set(RunnerCapabilityId::ApplyTextEditLocalGuardWithoutSha, true);
     // Line scopes are an additive rolling-upgrade fence: advertise only because
     // this binary resolves full-match containment before any mutation.
-    capabilities.apply_text_edit_line_scope = true;
+    capabilities.set(RunnerCapabilityId::ApplyTextEditLineScope, true);
+    // Deterministic whole-line range replacement is an additive rolling-upgrade
+    // capability and must never be inferred from generic line_scope support.
+    capabilities.set(RunnerCapabilityId::ApplyTextEditRange, true);
+    // This binary proves explicit all-match cardinality before any file write.
+    capabilities.set(RunnerCapabilityId::ApplyTextEditExpectedMatchCount, true);
     // Codex Patch is an additive request kind with Runner-authoritative parsing and
     // transaction semantics. Older Runners omit it and must fail closed.
-    capabilities.apply_patch = true;
+    capabilities.set(RunnerCapabilityId::ApplyPatch, true);
     // WebCodex 0.4 requires every successful patch to expose the complete bounded
     // patch-plan/match metadata consumed by Server validation. Older apply_patch
     // implementations omit this capability and are rejected before dispatch.
-    capabilities.apply_patch_match_metadata = true;
+    capabilities.set(RunnerCapabilityId::ApplyPatchMatchMetadata, true);
     // Enum-based matching is the 0.4 model-facing authority. Older Runners omit
     // it, so current Servers fail closed instead of falling back to old defaults.
-    capabilities.apply_patch_matching_mode = true;
-    capabilities.async_jobs = true;
-    capabilities.async_shell_jobs = true;
+    capabilities.set(RunnerCapabilityId::ApplyPatchMatchingMode, true);
+    capabilities.set(RunnerCapabilityId::AsyncJobs, true);
+    capabilities.set(RunnerCapabilityId::AsyncShellJobs, true);
     // SSH support intentionally depends on the local OpenSSH executable.
     // Authentication and Host aliases remain entirely Runner-local.
-    capabilities.ssh_shell = SshConnectionPool::is_available();
+    capabilities.set(
+        RunnerCapabilityId::SshShell,
+        SshConnectionPool::is_available(),
+    );
     // This binary installs the bounded, process-local persistent-shell
     // manager. Older binaries omit this field and therefore fail closed.
-    capabilities.persistent_shell = webcodex_persistent_shell::local_shell_supported();
+    capabilities.set(
+        RunnerCapabilityId::PersistentShell,
+        webcodex_persistent_shell::local_shell_supported(),
+    );
     // SSH persistent shells reuse the same OpenSSH executable as `ssh_shell`.
     // Older binaries omit this field and therefore fail closed; it is never
     // inferred from `ssh_shell` + `persistent_shell`.
-    capabilities.ssh_persistent_shell = SshConnectionPool::persistent_shell_available();
-    capabilities.structured_validation_argv = true;
+    capabilities.set(
+        RunnerCapabilityId::SshPersistentShell,
+        SshConnectionPool::persistent_shell_available(),
+    );
+    capabilities.set(RunnerCapabilityId::StructuredValidationArgv, true);
     // This binary durably round-trips Cargo test-count assertions with
     // validation Job context and reconciliation snapshots.
-    capabilities.structured_cargo_test_count_assertion = true;
+    capabilities.set(RunnerCapabilityId::StructuredCargoTestCountAssertion, true);
     // Explicit require_tests/no_run policy changes validation proof semantics,
     // so advertise durable preservation independently from the older count
     // assertion capability for rolling upgrades.
-    capabilities.structured_cargo_test_execution_policy = true;
+    capabilities.set(RunnerCapabilityId::StructuredCargoTestExecutionPolicy, true);
     // `--lib` expands the older structured Cargo test argv vocabulary, so
     // advertise it separately for mixed Server/Runner rolling upgrades.
-    capabilities.structured_cargo_test_lib = true;
+    capabilities.set(RunnerCapabilityId::StructuredCargoTestLib, true);
+    // Repeated `-p` selectors expand the older single-package Cargo check argv
+    // vocabulary, so advertise this independently for rolling upgrades.
+    capabilities.set(RunnerCapabilityId::StructuredCargoCheckPackages, true);
     // This binary accepts both legacy Go validation argv from old Servers and
     // the current machine-readable JSON argv. Do not trust static config or
     // infer this from generic structured validation support.
-    capabilities.structured_go_test_json = true;
+    capabilities.set(RunnerCapabilityId::StructuredGoTestJson, true);
+    capabilities.set(RunnerCapabilityId::ProjectValidation, true);
+    capabilities.set(RunnerCapabilityId::ProjectBuild, true);
+    // Portable package scope is additive to project_validation_v1 so mixed
+    // Server/Runner deployments fail closed before sending the expanded request.
+    capabilities.set(RunnerCapabilityId::ProjectValidationPackageScope, true);
+    capabilities.set(RunnerCapabilityId::ProjectValidationTestOptions, true);
     // This binary also understands the first-class go_test durable metadata
     // identity. Keep this independent from JSON parsing so an old Runner that
     // supported Connector Go evidence cannot be mistaken for a first-class
     // go_test executor by a newer Server.
-    capabilities.structured_go_test_tool = true;
+    capabilities.set(RunnerCapabilityId::StructuredGoTestTool, true);
     // Focused first-class go_test packages extend the older fixed `./...`
     // wire shape, so advertise them independently for rolling upgrades.
-    capabilities.structured_go_test_packages = true;
-    capabilities.structured_process_argv = true;
-    capabilities.structured_script_payload = true;
+    capabilities.set(RunnerCapabilityId::StructuredGoTestPackages, true);
+    capabilities.set(RunnerCapabilityId::StructuredProcessArgv, true);
+    capabilities.set(RunnerCapabilityId::StructuredScriptPayload, true);
     // JavaScript extends the older typed-script wire enum. Advertise it
     // separately so a newer Server never sends that variant to an older Runner
     // which already advertised structured_script_payload.
-    capabilities.structured_script_javascript = true;
+    capabilities.set(RunnerCapabilityId::StructuredScriptJavascript, true);
     // TypeScript extends the same typed-script wire enum independently from
     // JavaScript. This bit means the binary understands the semantic protocol;
     // local Node availability/version is resolved only when execution starts.
-    capabilities.structured_script_typescript = true;
-    capabilities.internal_posix_script = true;
-    capabilities.structured_execution_jobs = true;
+    capabilities.set(RunnerCapabilityId::StructuredScriptTypescript, true);
+    capabilities.set(RunnerCapabilityId::StructuredScriptPython, true);
+    capabilities.set(RunnerCapabilityId::InternalPosixScript, true);
+    capabilities.set(RunnerCapabilityId::StructuredExecutionJobs, true);
+    capabilities.set(RunnerCapabilityId::JobProcessInput, true);
     // Detached process ownership is an independent additive authority. Until
     // each native backend is implemented and dogfooded it must fail closed
     // rather than being inferred from structured process + durable Jobs.
-    capabilities.detached_process_jobs =
-        cfg!(any(target_os = "linux", target_os = "macos", windows));
-    capabilities.project_lifecycle = true;
+    capabilities.set(
+        RunnerCapabilityId::DetachedProcessJobs,
+        cfg!(any(target_os = "linux", target_os = "macos", windows)),
+    );
+    capabilities.set(RunnerCapabilityId::ProjectLifecycle, true);
     // This binary implements resolve_or_register_project; do not trust config to
     // advertise a capability that the binary does not implement.
-    capabilities.project_path_registration = true;
-    capabilities.managed_worktree = true;
+    capabilities.set(RunnerCapabilityId::ProjectPathRegistration, true);
+    capabilities.set(RunnerCapabilityId::ManagedWorktree, true);
     // Configured live roots and managed active Skills share one Runner-local runtime
     // boundary; managed lifecycle authority remains independently advertised.
-    capabilities.skill_runtime = true;
-    capabilities.skill_resource_execution = true;
-    capabilities.skill_management = true;
+    capabilities.set(RunnerCapabilityId::SkillRuntime, true);
+    capabilities.set(RunnerCapabilityId::SkillResourceExecution, true);
+    capabilities.set(RunnerCapabilityId::SkillManagement, true);
     // Native Tool Plugins are a separate Runner-local gateway capability. Keep
     // this explicit even when zero Plugins are configured so cross-platform
     // `plugin_tool reload` can target the exact Runner.
-    capabilities.native_tool_plugins = true;
-    capabilities.managed_ssh_resources = true;
+    capabilities.set(RunnerCapabilityId::NativeToolPlugins, true);
+    capabilities.set(RunnerCapabilityId::ManagedSshResources, true);
     // Formal config check/reload is implemented directly against this process's
     // startup-bound runner.toml path on every supported platform. Unix SIGHUP is
     // only an additional trigger and is not part of this capability contract.
-    capabilities.runner_config_control = true;
+    capabilities.set(RunnerCapabilityId::RunnerConfigControl, true);
     // Configured instruction files are observed only through the narrow Runner-owned snapshot boundary.
-    capabilities.instruction_runtime = true;
+    capabilities.set(RunnerCapabilityId::InstructionRuntime, true);
     // MCP gateway support is fenced by the validated provider inventory in
     // registration rather than a separate capability bit. Older binaries omit
     // that inventory, so a newer Server will never target them.
@@ -1518,60 +1606,116 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // Runner-local Chromium-family discovery result. The Server must never infer
     // them from OS, protocol generation, shell, or Computer capabilities.
     let browser_available = webcodex_browser::discover_chromium_executable().is_some();
-    capabilities.browser_observe = browser_available;
-    capabilities.browser_control = browser_available;
-    capabilities.browser_launch = browser_available;
+    capabilities.set(RunnerCapabilityId::BrowserObserve, browser_available);
+    capabilities.set(RunnerCapabilityId::BrowserControl, browser_available);
+    // This binary publishes exact snapshot node `actions` and enforces the same
+    // admission set before element effects. Keep it separate from generic Browser
+    // control so a new Server cannot dispatch the stricter contract to an older Runner.
+    capabilities.set(
+        RunnerCapabilityId::BrowserElementActionAdmission,
+        browser_available,
+    );
+    capabilities.set(RunnerCapabilityId::BrowserBatch, browser_available);
+    capabilities.set(RunnerCapabilityId::BrowserLaunch, browser_available);
     // Native read-only desktop observation is implemented only on macOS and
     // Windows. Unsupported platforms advertise false and fail closed.
-    capabilities.computer_observe = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerObserve,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Installed-application discovery and exact launch are native macOS/Windows
     // additive capabilities. Neither is inferred from observation/control or
     // from each other.
-    capabilities.computer_application_discovery = cfg!(any(target_os = "macos", windows));
-    capabilities.computer_application_launch = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerApplicationDiscovery,
+        cfg!(any(target_os = "macos", windows)),
+    );
+    capabilities.set(
+        RunnerCapabilityId::ComputerApplicationLaunch,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Exact full-display discovery/snapshot is independently implemented by
     // the native macOS and Windows backends; unsupported platforms fail closed.
-    capabilities.computer_display_observe = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerDisplayObserve,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Snapshot-fenced exact coordinate pointer input is independently implemented by
     // the native macOS and Windows backends; unsupported platforms fail closed.
-    capabilities.computer_pointer_control = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerPointerControl,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Bounded Unicode-text clipboard observation/replacement are separate
     // native capabilities on macOS and Windows.
-    capabilities.computer_clipboard_read = cfg!(any(target_os = "macos", windows));
-    capabilities.computer_clipboard_write = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerClipboardRead,
+        cfg!(any(target_os = "macos", windows)),
+    );
+    capabilities.set(
+        RunnerCapabilityId::ComputerClipboardWrite,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Region/downscale snapshot requests use a distinct additive wire fence so
     // old Runners that support only whole-window snapshots fail closed.
-    capabilities.computer_snapshot_region = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerSnapshotRegion,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Accessibility inspection is a separate read-only semantic capability.
     // macOS AX and Windows UI Automation share the same model-facing tree;
     // observation authority never implies computer-control authority.
-    capabilities.computer_accessibility_observe = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerAccessibilityObserve,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Normalized element-state observation is a separate rolling-upgrade wire
     // capability implemented by the same native read-only backends.
-    capabilities.computer_element_state = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerElementState,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Accessibility control is independently fenced and implemented by the
     // native macOS AX and Windows UI Automation backends.
-    capabilities.computer_control = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerControl,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Semantic native scroll-to-visible is independently fenced for rolling upgrades;
     // existing computer_control support never implies it.
-    capabilities.computer_scroll_to_element = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerScrollToElement,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Closed key input is a separate effect/wire capability implemented by the
     // native macOS and Windows paths and is never implied by control.
-    capabilities.computer_key_input = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerKeyInput,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Exact window activation is a separate effect/wire capability. It is
     // independently advertised by native macOS and Windows implementations.
-    capabilities.computer_window_activate = cfg!(any(target_os = "macos", windows));
+    capabilities.set(
+        RunnerCapabilityId::ComputerWindowActivate,
+        cfg!(any(target_os = "macos", windows)),
+    );
     // Bounded Accessibility text input is a separate rolling-upgrade fence;
     // older native Runners with computer_control must not be treated as capable.
-    capabilities.computer_text_input = cfg!(any(target_os = "macos", windows));
-    capabilities.job_state_reconciliation = !disable_job_state_reconciliation_for_test();
+    capabilities.set(
+        RunnerCapabilityId::ComputerTextInput,
+        cfg!(any(target_os = "macos", windows)),
+    );
+    capabilities.set(
+        RunnerCapabilityId::JobStateReconciliation,
+        !disable_job_state_reconciliation_for_test(),
+    );
 
     // New agents always advertise read-only LSP navigation. Older agents omit
     // the field and deserialize as false on the server.
-    capabilities.lsp_read_only_navigation = true;
+    capabilities.set(RunnerCapabilityId::LspReadOnlyNavigation, true);
     // Advertise the distinct capability only because this binary installs the
     // bounded typed prepare/incoming/outgoing traversal implementation.
-    capabilities.lsp_call_hierarchy = true;
+    capabilities.set(RunnerCapabilityId::LspCallHierarchy, true);
     capabilities
 }
 
@@ -1606,6 +1750,7 @@ fn build_register_request_with_provider_status(
     Arc<webcodex_runner::external_tools::ExternalToolRouter>,
     u64,
 ) {
+    webcodex_runner::computer_session::set_server_availability_contract(false);
     let hot = runtime.snapshot();
     let mut capabilities = runner_register_capabilities(cfg);
     let coding_agent_providers = runtime
@@ -1613,7 +1758,10 @@ fn build_register_request_with_provider_status(
         .map(|manager| manager.providers())
         .unwrap_or_default();
     let coding_agent_inventory = runtime.coding_agents().map(|manager| manager.inventory());
-    capabilities.coding_agent_runs = !coding_agent_providers.is_empty();
+    capabilities.set(
+        RunnerCapabilityId::CodingAgentRuns,
+        !coding_agent_providers.is_empty(),
+    );
     let (mut tool_providers, revision) = hot.external_tools.registration_status();
     tool_providers.config_reload = hot.reload_status();
     (
@@ -1626,6 +1774,7 @@ fn build_register_request_with_provider_status(
             hostname: cfg.hostname.clone().or_else(hostname),
             host_context: cfg.host_context.clone(),
             capabilities,
+            computer_session_availability: webcodex_runner::computer_session::availability(),
             policy: Some(register_policy_summary(
                 &hot,
                 prepared_cache_count,
@@ -1667,6 +1816,9 @@ fn runner_build_info() -> runner_protocol::RunnerBuildInfo {
         version: Some(info.version.to_string()),
         git_commit: info.git_commit.map(str::to_string),
         git_dirty: info.git_dirty,
+        built_at: info.built_at.map(str::to_string),
+        target: info.target.map(str::to_string),
+        architecture: info.architecture.map(str::to_string),
     }
 }
 
@@ -1815,6 +1967,14 @@ fn register(
     let response: RunnerRegisterResponse = post_json(client, cfg, RUNNER_REGISTER_PATH, &body)
         .map_err(|error| RegisterError::from_http(error, &cfg.client_id))?;
     if response.success {
+        webcodex_runner::computer_session::set_server_availability_contract(
+            webcodex_runner::computer_session::registration_echo_confirms_contract(
+                response
+                    .client
+                    .as_ref()
+                    .and_then(|client| client.computer_session_availability),
+            ),
+        );
         provider.mark_status_reported(provider_revision);
         let inventory_status = response
             .client
@@ -1844,7 +2004,16 @@ fn is_file_request_kind(kind: &str) -> bool {
         || is_artifact_request_kind(kind)
 }
 
+#[cfg(test)]
 fn handle_file_operation(policy: &RunnerPolicy, operation: &RunnerFileOperation) -> CommandResult {
+    handle_file_operation_with_artifact_store(policy, operation, None)
+}
+
+fn handle_file_operation_with_artifact_store(
+    policy: &RunnerPolicy,
+    operation: &RunnerFileOperation,
+    artifact_store_root: Option<&Path>,
+) -> CommandResult {
     let request = operation.payload();
     let path = request.path.as_str();
     let start = Instant::now();
@@ -1893,9 +2062,12 @@ fn handle_file_operation(policy: &RunnerPolicy, operation: &RunnerFileOperation)
         | RunnerFileOperation::ArtifactUploadBegin(_)
         | RunnerFileOperation::ArtifactUploadChunk(_)
         | RunnerFileOperation::ArtifactUploadFinish(_)
-        | RunnerFileOperation::ArtifactUploadAbort(_) => {
-            handle_artifact_file_operation(operation, &resolved, start)
-        }
+        | RunnerFileOperation::ArtifactUploadAbort(_) => handle_artifact_file_operation_with_store(
+            operation,
+            &resolved,
+            start,
+            artifact_store_root,
+        ),
         #[cfg(feature = "workspace-checkpoints")]
         RunnerFileOperation::CheckpointCreate(_) | RunnerFileOperation::CheckpointRestore(_) => {
             handle_checkpoint_file_request(operation, &resolved, start)
@@ -2322,6 +2494,7 @@ fn handle_one_poll(
                     revision,
                 )
             });
+    let computer_session_update = webcodex_runner::computer_session::changed_availability();
     let poll = RunnerPollPayload {
         request: RunnerPollRequest {
             client_id: cfg.client_id.clone(),
@@ -2333,6 +2506,7 @@ fn handle_one_poll(
         mcp_gateway_providers: provider_update
             .as_ref()
             .map(|_| runtime.mcp_gateway().provider_inventory()),
+        computer_session_availability: computer_session_update,
         project_inventory_page,
     };
     let response: RunnerPollResponse = match post_json(client, cfg, RUNNER_POLL_PATH, &poll) {
@@ -2352,6 +2526,9 @@ fn handle_one_poll(
             &cfg.client_id,
             response.error,
         ));
+    }
+    if let Some(available) = computer_session_update {
+        webcodex_runner::computer_session::mark_availability_reported(available);
     }
     if let Some((_, provider, revision)) = provider_update {
         provider.mark_status_reported(revision);
@@ -2454,9 +2631,67 @@ fn handle_one_poll(
 }
 
 fn main() {
-    if let Some(code) =
-        webcodex_runner::detached_job::maybe_run_internal_mode(std::env::args().skip(1))
-    {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let service = match webcodex_environment::runtime_entry::split_windows_service_args(&raw_args) {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    };
+    if let Some((name, args)) = service {
+        #[cfg(windows)]
+        {
+            let (config_path, computer_session_dir) = match parse_service_runner_args(&args) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(2);
+                }
+            };
+            let result =
+                webcodex_environment::service::runtime::run_windows_service(&name, move |stop| {
+                    let log_dir = config_path
+                        .parent()
+                        .ok_or("Runner config has no parent directory")?;
+                    let mut service_log = webcodex_environment::service::ServiceLogGuard::open(
+                        log_dir,
+                        webcodex_environment::service::Component::Runner,
+                    )?;
+                    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+                    let _ = tracing_subscriber::fmt()
+                        .with_env_filter(
+                            EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| EnvFilter::new("info")),
+                        )
+                        .try_init();
+                    let cfg = load_config(&config_path)?;
+                    let result = run_runner(
+                        cfg,
+                        config_path,
+                        false,
+                        false,
+                        Some(computer_session_dir),
+                        Some(stop),
+                    );
+                    if result.is_ok() {
+                        service_log.stopped()?;
+                    }
+                    result
+                });
+            if let Err(error) = result {
+                eprintln!("webcodex-runner service failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (name, args);
+            unreachable!("service prefix rejected on non-Windows");
+        }
+    }
+    if let Some(code) = webcodex_runner::detached_job::maybe_run_internal_mode(raw_args.iter()) {
         std::process::exit(code);
     }
     // Pin the process start timestamp before any transport work so register
@@ -2476,12 +2711,20 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let (config_path, once, stop_on_stdin_eof) = match action {
+    let (config_path, once, stop_on_stdin_eof, computer_session_dir) = match action {
         RunnerCliAction::Run {
             config_path,
             once,
             stop_on_stdin_eof,
-        } => (config_path, once, stop_on_stdin_eof),
+            computer_session_dir,
+        } => (config_path, once, stop_on_stdin_eof, computer_session_dir),
+        RunnerCliAction::ComputerSessionHelper { session_state_dir } => {
+            if let Err(error) = webcodex_runner::computer_session::run_helper(&session_state_dir) {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+            return;
+        }
         RunnerCliAction::Exit {
             code,
             stdout,
@@ -2496,9 +2739,29 @@ fn main() {
             std::process::exit(code);
         }
     };
+    #[cfg(target_os = "macos")]
+    let mut service_log = match webcodex_environment::service::ServiceLogGuard::from_managed_env(
+        webcodex_environment::service::Component::Runner,
+    ) {
+        Ok(log) => log,
+        Err(error) => {
+            eprintln!("Runner service lifecycle log unavailable: {error}");
+            std::process::exit(2);
+        }
+    };
+    if config_path.file_name().and_then(|name| name.to_str())
+        == Some(runner_config::paths::LEGACY_AGENT_CONFIG_FILE)
+    {
+        eprintln!(
+            "webcodex-runner warning: legacy Runner config filename 'agent.toml' is deprecated; rename it to 'runner.toml' before WebCodex {}.",
+            runner_config::paths::LEGACY_RUNNER_CONFIG_REMOVAL_VERSION
+        );
+    }
     let cfg = match load_config(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
+            #[cfg(target_os = "macos")]
+            drop(service_log);
             eprintln!("{}", e);
             std::process::exit(2);
         }
@@ -2508,9 +2771,23 @@ fn main() {
             "webcodex-runner warning: agent token is empty; connecting without Authorization; the server must be started with --open"
         );
     }
-    if let Err(e) = run_runner(cfg, config_path, once, stop_on_stdin_eof) {
+    if let Err(e) = run_runner(
+        cfg,
+        config_path,
+        once,
+        stop_on_stdin_eof,
+        computer_session_dir,
+        #[cfg(windows)]
+        None,
+    ) {
+        #[cfg(target_os = "macos")]
+        drop(service_log);
         eprintln!("webcodex-runner failed: {}", e);
         std::process::exit(1);
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(log) = service_log.as_mut() {
+        let _ = log.stopped();
     }
 }
 

@@ -18,10 +18,11 @@ use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
+mod environment;
 mod webcodex_cli;
 
 use webcodex_admin as admin_cli;
-use webcodex_core::build_info;
+use webcodex_build_info as build_info;
 use webcodex_runner_config as runner_config;
 
 use admin_cli::{
@@ -36,17 +37,17 @@ use webcodex_cli::{
     base_dir_or_default, client_profile_project_registry_dir, client_profile_runner_config,
     client_profile_runner_token_file, client_profile_runner_token_file_for_scope,
     client_profile_state_dir, client_profile_user_token_file,
-    client_profile_user_token_file_for_scope, connect_usage, current_user_home,
+    client_profile_user_token_file_for_scope, connect_usage, controller_usage, current_user_home,
     default_device_name, default_server_paths, disconnect_usage, discover_internal_binary,
     is_effective_root, login_usage, logout_usage, ops_projects_usage, ops_runner_usage,
     ops_runners_usage, ops_smoke_preflight_usage, ops_status_usage, ops_usage, ops_windows_usage,
     pairing_create_usage, pairing_usage, parse_plugin_command, parse_plugin_init,
     plugin_check_usage, plugin_describe_usage, plugin_init_usage, plugin_list_usage,
     plugin_reload_usage, plugin_usage, project_activate_usage, project_register_usage,
-    read_env_file_value, render_token_generate, run_connect, run_disconnect, run_hosted_log_writer,
-    run_internal_binary, run_login, run_logout, run_ops_command, run_pairing_create,
-    run_plugin_command, run_plugin_init, run_project_activate, run_project_register,
-    run_runner_install_service, run_runner_service, run_runner_status,
+    read_env_file_value, render_token_generate, run_connect, run_controller_command,
+    run_disconnect, run_hosted_log_writer, run_internal_binary, run_login, run_logout,
+    run_ops_command, run_pairing_create, run_plugin_command, run_plugin_init, run_project_activate,
+    run_project_register, run_runner_install_service, run_runner_service, run_runner_status,
     run_runner_token_create_local, run_server_init, run_server_install_service, run_server_service,
     run_server_status, run_server_tunnel, run_status, run_token_create_local,
     runner_config_for_scope, runner_init_usage, runner_install_service_usage,
@@ -54,8 +55,8 @@ use webcodex_cli::{
     server_install_service_usage, server_status_usage, server_tunnel_usage, server_usage,
     service_unit_name, status_usage, system_user_home, system_user_is_root, usage,
     validate_client_profile, validate_service_file_scope, write_connect_result, ConnectAuth,
-    ConnectOptions, DisconnectOptions, LoginOptions, LogoutOptions, OpsCommand, OpsCommonOptions,
-    OpsRunnerOptions, OpsSmokePreflightOptions, OpsWindowsOptions, PluginCommand,
+    ConnectOptions, ControllerCommand, DisconnectOptions, LoginOptions, LogoutOptions, OpsCommand,
+    OpsCommonOptions, OpsRunnerOptions, OpsSmokePreflightOptions, OpsWindowsOptions, PluginCommand,
     PluginInitOptions, ProjectActivateOptions, ProjectRegisterOptions, ServerStatusOptions,
     ServiceControl, StatusOptions, DEFAULT_LOG_LINES, RUNNER_SERVICE_UNIT, SERVER_SERVICE_FILE,
     SERVER_SERVICE_UNIT,
@@ -107,7 +108,9 @@ fn default_runner_service_scope(effective_root: bool) -> ServiceScope {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
+    Environment(Vec<String>),
     Project(Vec<String>),
+    Controller(ControllerCommand),
     ProjectRegister(ProjectRegisterOptions),
     ProjectActivate(ProjectActivateOptions),
     Connect(ConnectOptions),
@@ -180,6 +183,7 @@ struct PairingCreateOptions {
     ttl_secs: i64,
     user_token_name: Option<String>,
     runner_token_name: Option<String>,
+    runner_capabilities: bool,
     json: bool,
 }
 
@@ -190,6 +194,7 @@ struct ServerInitOptions {
     env_file: PathBuf,
     public_url: Option<String>,
     open: bool,
+    allow_remote_shared_key: bool,
     overwrite: bool,
     json: bool,
 }
@@ -197,6 +202,7 @@ struct ServerInitOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServerTunnelOptions {
     env_file: PathBuf,
+    stop_on_stdin_eof: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,10 +324,14 @@ where
         };
     }
     match args[0].as_str() {
+        "environment" => CliAction::Environment(args[1..].to_vec()),
         "--help" | "-h" => CliAction::Exit {
             code: 0,
             stdout: usage().to_string(),
             stderr: String::new(),
+        },
+        "--build-info-json" if args.len() == 1 => CliAction::Exit {
+            code: 0, stdout: build_info::build_info_json("webcodex"), stderr: String::new(),
         },
         "--version" | "-V" => CliAction::Exit {
             code: 0,
@@ -345,6 +355,11 @@ where
             }
         }
         "server" => parse_server_subcommand(&args[1..]),
+        "controller" => match webcodex_cli::parse_controller_command(&args[1..]) {
+            Ok(command) => CliAction::Controller(command),
+            Err(error) if error == controller_usage() => exit_help(controller_usage()),
+            Err(error) => exit_error(&error),
+        },
         "pairing" => parse_pairing_subcommand(&args[1..]),
         "client" if args.get(1).map(String::as_str) == Some("enroll") => cli_parse_error(
             "`webcodex client enroll` was removed; use `webcodex login <server-url> --code <code>`"
@@ -359,7 +374,10 @@ where
         "agent-token" => cli_parse_error(
             "`webcodex agent-token` was removed; use `webcodex runner-tokens ...`".to_string(),
         ),
-        "runner-tokens" | "agent-tokens" => parse_runner_token_subcommand(&args[1..]),
+        "agent-tokens" => cli_parse_error(
+            "`webcodex agent-tokens` was removed; use `webcodex runner-tokens ...`".to_string(),
+        ),
+        "runner-tokens" => parse_runner_token_subcommand(&args[1..]),
         "token" => cli_parse_error(
             "`webcodex token` was removed; use `webcodex tokens ...`".to_string(),
         ),
@@ -1817,10 +1835,10 @@ fn parse_server_tunnel(args: &[String]) -> Result<ServerTunnelOptions, String> {
     if !json {
         return Err("server tunnel currently requires --json".to_string());
     }
-    if !stop_on_stdin_eof {
-        return Err("server tunnel currently requires --stop-on-stdin-eof".to_string());
-    }
-    Ok(ServerTunnelOptions { env_file })
+    Ok(ServerTunnelOptions {
+        env_file,
+        stop_on_stdin_eof,
+    })
 }
 
 fn parse_runner_run(args: &[String]) -> Result<InternalRunOptions, String> {
@@ -2035,6 +2053,7 @@ fn parse_server_init(args: &[String]) -> Result<ServerInitOptions, String> {
         env_file: defaults.env_file,
         public_url: None,
         open: false,
+        allow_remote_shared_key: false,
         overwrite: false,
         json: false,
     };
@@ -2046,6 +2065,7 @@ fn parse_server_init(args: &[String]) -> Result<ServerInitOptions, String> {
             "--env-file" => opts.env_file = PathBuf::from(next_value(&mut iter, arg)?),
             "--public-url" => opts.public_url = Some(next_value(&mut iter, arg)?),
             "--open" => opts.open = true,
+            "--allow-remote-shared-key" => opts.allow_remote_shared_key = true,
             "--overwrite" => opts.overwrite = true,
             "--json" => opts.json = true,
             _ => return Err(format!("unknown server init flag: {}", arg)),
@@ -2265,8 +2285,13 @@ fn parse_runner_status_with_identity(
             "--user-token-file" => {
                 opts.user_token_file = Some(PathBuf::from(next_value(&mut iter, arg)?))
             }
-            "--runner-token-file" | "--agent-token-file" => {
+            "--runner-token-file" => {
                 opts.runner_token_file = Some(PathBuf::from(next_value(&mut iter, arg)?))
+            }
+            "--agent-token-file" => {
+                return Err(
+                    "--agent-token-file is retired; use --runner-token-file instead".to_string(),
+                )
             }
             "--json" => opts.json = true,
             _ => return Err(format!("unknown runner status flag: {}", arg)),
@@ -2470,8 +2495,12 @@ fn parse_pairing_create(args: &[String]) -> Result<PairingCreateOptions, String>
                     .map_err(|_| "--ttl-secs must be an integer".to_string())?;
             }
             "--user-token-name" => opts.user_token_name = Some(next_value(&mut iter, arg)?),
-            "--runner-token-name" | "--agent-token-name" => {
-                opts.runner_token_name = Some(next_value(&mut iter, arg)?)
+            "--runner-token-name" => opts.runner_token_name = Some(next_value(&mut iter, arg)?),
+            "--runner-capabilities" => opts.runner_capabilities = true,
+            "--agent-token-name" => {
+                return Err(
+                    "--agent-token-name is retired; use --runner-token-name instead".to_string(),
+                )
             }
             "--json" => opts.json = true,
             _ => return Err(format!("unknown pairing create flag: {}", arg)),
@@ -2496,6 +2525,29 @@ fn parse_pairing_create(args: &[String]) -> Result<PairingCreateOptions, String>
     Ok(opts)
 }
 
+#[cfg(test)]
+mod pairing_capability_cli_tests {
+    use super::parse_pairing_create;
+
+    #[test]
+    fn runner_capability_enrollment_is_explicit_opt_in() {
+        let mut args: Vec<String> = [
+            "--server-url",
+            "http://127.0.0.1:8080",
+            "--username",
+            "desktop",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert!(!parse_pairing_create(&args).unwrap().runner_capabilities);
+        args.push("--runner-capabilities".to_owned());
+        assert!(parse_pairing_create(&args).unwrap().runner_capabilities);
+        args.push("--arbitrary-scopes".to_owned());
+        assert!(parse_pairing_create(&args).is_err());
+    }
+}
+
 /// Small flag parser for `webcodex runner init`. Produces an
 /// `RunnerInitOptions` consumed by the shared `runner_config::run_runner_init`.
 fn parse_cli_runner_init(args: &[String]) -> Result<RunnerInitOptions, String> {
@@ -2517,7 +2569,6 @@ fn parse_cli_runner_init(args: &[String]) -> Result<RunnerInitOptions, String> {
     let mut profile: Option<String> = None;
     let mut output_explicit = false;
     let mut project_registry_dir_explicit = false;
-    let mut legacy_projects_dir_explicit = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -2536,24 +2587,13 @@ fn parse_cli_runner_init(args: &[String]) -> Result<RunnerInitOptions, String> {
                     .map_err(|_| "--poll-interval-ms must be an integer".to_string())?;
             }
             "--project-registry-dir" => {
-                if legacy_projects_dir_explicit {
-                    return Err(
-                        "use only one of --project-registry-dir or legacy --projects-dir"
-                            .to_string(),
-                    );
-                }
                 opts.project_registry_dir = PathBuf::from(next_value(&mut iter, arg)?);
                 project_registry_dir_explicit = true;
             }
             "--projects-dir" => {
-                if project_registry_dir_explicit {
-                    return Err(
-                        "use only one of --project-registry-dir or legacy --projects-dir"
-                            .to_string(),
-                    );
-                }
-                opts.project_registry_dir = PathBuf::from(next_value(&mut iter, arg)?);
-                legacy_projects_dir_explicit = true;
+                return Err(
+                    "--projects-dir is retired; use --project-registry-dir instead".to_string(),
+                )
             }
             "--allowed-root" => opts
                 .allowed_roots
@@ -2578,17 +2618,17 @@ fn parse_cli_runner_init(args: &[String]) -> Result<RunnerInitOptions, String> {
         if !output_explicit {
             opts.output = client_profile_runner_config(&profile)?;
         }
-        if !project_registry_dir_explicit && !legacy_projects_dir_explicit {
+        if !project_registry_dir_explicit {
             opts.project_registry_dir = client_profile_project_registry_dir(&profile)?;
         }
     } else {
         if !output_explicit && opts.output.as_os_str().is_empty() {
             let profile = validate_client_profile(&opts.client_id)?;
             opts.output = client_profile_runner_config(&profile)?;
-            if !project_registry_dir_explicit && !legacy_projects_dir_explicit {
+            if !project_registry_dir_explicit {
                 opts.project_registry_dir = client_profile_project_registry_dir(&profile)?;
             }
-        } else if !project_registry_dir_explicit && !legacy_projects_dir_explicit {
+        } else if !project_registry_dir_explicit {
             let default = Path::new(DEFAULT_INIT_PROJECT_REGISTRY_DIR);
             let base = default.parent().ok_or_else(|| {
                 "default Runner project registry path has no parent directory".to_string()
@@ -2611,11 +2651,11 @@ where
 
 /// Windows release boundary, evaluated before any command dispatch.
 ///
-/// Windows supports explicit local foreground Server initialization/execution
-/// and the platform-neutral project `share` path. Service-managed Server lifecycle
-/// operations and Runner service install remain unsupported and fail before
-/// platform-specific service logic. `--help` is exempt so help still renders.
-#[cfg(windows)]
+/// Windows supports persistent services through `environment`, foreground Server
+/// execution, and project `share`. Legacy service commands fail before dispatch
+/// and direct users to the shared environment setup/lifecycle path. `--help` is
+/// exempt so help still renders. The pure guard is also compiled in host tests.
+#[cfg(any(windows, test))]
 fn windows_unsupported_platform_action(args: &[String]) -> Option<&'static str> {
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         return None;
@@ -2624,14 +2664,14 @@ fn windows_unsupported_platform_action(args: &[String]) -> Option<&'static str> 
         Some("server") => match args.get(1).map(String::as_str) {
             Some("init") | Some("run") => None,
             Some("install" | "start" | "stop" | "restart" | "logs" | "uninstall") | None => Some(
-                "Windows service-managed Server lifecycle is not supported yet.\n\
-                 Use `webcodex server run` for foreground operation.",
+                "This legacy service command is unavailable on Windows.\n\
+                 Configure persistent services with `webcodex environment configure`, then use `webcodex environment start|stop|restart server`.",
             ),
             _ => None,
         },
         Some("runner") if args.get(1).map(String::as_str) == Some("install") => Some(
-            "Automatic Windows Runner startup is not supported yet.\n\
-             Use `webcodex connect` or `webcodex runner start --profile <name>.",
+            "This legacy Runner installer is unavailable on Windows.\n\
+             Configure persistent services with `webcodex environment configure`, then use `webcodex environment start|stop|restart runner`.",
         ),
         _ => None,
     }
@@ -2649,6 +2689,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     match cli_action(args) {
+        CliAction::Environment(args) => match environment::run(&args).await {
+            Ok(output) => {
+                println!("{output}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        },
         CliAction::Project(args) => {
             let output = webcodex::run_project_command(args).await;
             if !output.stdout.is_empty() {
@@ -2807,6 +2857,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Status(opts) => match run_status(opts) {
             Ok(stdout) => {
                 print!("{}", stdout);
+                std::process::exit(0);
+            }
+            Err(stderr) => {
+                eprintln!("{}", stderr);
+                std::process::exit(1);
+            }
+        },
+        CliAction::Controller(command) => match run_controller_command(command).await {
+            Ok(stdout) => {
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                    if !stdout.ends_with('\n') {
+                        println!();
+                    }
+                }
                 std::process::exit(0);
             }
             Err(stderr) => {
@@ -2990,6 +3055,50 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(code);
         }
     }
+}
+
+#[cfg(windows)]
+pub fn validate_windows_tunnel_service_args(args: &[String]) -> Result<(), String> {
+    if args.get(0).map(String::as_str) != Some("server")
+        || args.get(1).map(String::as_str) != Some("tunnel")
+    {
+        return Err("Windows webcodex service mode requires server tunnel".into());
+    }
+    let opts = parse_server_tunnel(&args[2..])?;
+    if opts.stop_on_stdin_eof {
+        return Err("persistent Tunnel service cannot use --stop-on-stdin-eof".into());
+    }
+    webcodex_environment::runtime_entry::validate_service_env_file(&opts.env_file)
+}
+
+#[cfg(windows)]
+pub async fn run_windows_tunnel_service(
+    args: Vec<String>,
+    stop: webcodex_environment::service::runtime::ServiceStop,
+) -> Result<(), String> {
+    if args.get(0).map(String::as_str) != Some("server")
+        || args.get(1).map(String::as_str) != Some("tunnel")
+    {
+        return Err("Windows webcodex service mode requires server tunnel".into());
+    }
+    let opts = parse_server_tunnel(&args[2..])?;
+    if opts.stop_on_stdin_eof {
+        return Err("persistent Tunnel service cannot use --stop-on-stdin-eof".into());
+    }
+    validate_windows_tunnel_service_args(&args)?;
+    let log_dir = opts
+        .env_file
+        .parent()
+        .ok_or("Tunnel service env file has no parent directory")?;
+    let mut service_log = webcodex_environment::service::ServiceLogGuard::open(
+        log_dir,
+        webcodex_environment::service::Component::Tunnel,
+    )?;
+    let result = webcodex_cli::server::run_server_tunnel_with_stop(opts, stop.cancelled()).await;
+    if result.is_ok() {
+        service_log.stopped()?;
+    }
+    result
 }
 
 #[cfg(test)]

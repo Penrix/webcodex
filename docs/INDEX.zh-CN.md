@@ -11,6 +11,7 @@
 - [完整使用指南](PERSONAL_SETUP.zh-CN.md) —— CLI、已有 Server、Linux 与高级普通 Server + Runner 配置
 - [AI 辅助接入](AI_ONBOARDING.zh-CN.md) —— 让 AI 帮你按普通用户语言完成配置
 - [MCP](MCP.zh-CN.md) —— ChatGPT、Claude 与其他 MCP 客户端
+- [任务接续](SESSION_CONTINUITY.zh-CN.md) —— 保存上下文、跨账号或窗口继续，以及委派 API 模型评审
 
 ## 我只想先试几分钟
 
@@ -32,7 +33,7 @@
 
 ## 我遇到了问题
 
-- [故障排查](TROUBLESHOOTING.zh-CN.md) —— 安装、连接、运行和 Runner 问题
+- [故障排查](TROUBLESHOOTING.zh-CN.md) —— ChatGPT/MCP Host、安装、连接、运行和 Runner 问题
 - [安全说明](../SECURITY.md) —— 安全模型和使用建议
 
 ## 我想理解或扩展 WebCodex
@@ -44,6 +45,8 @@
 
 ## 我想参与开发或发布
 
+- [Desktop 开发与打包](DESKTOP_DEVELOPMENT.zh-CN.md) —— 从源码运行 Desktop，并本地构建/验证 Windows 与 macOS 原生安装包
+
 下面 `docs/agent/` 中的页面属于 maintainer/internal contract。它们会有意保留
 protocol field、兼容名称和实现 invariant；普通用户不需要为了使用 WebCodex 而学习
 这些内容。
@@ -53,7 +56,7 @@ protocol field、兼容名称和实现 invariant；普通用户不需要为了�
 - [测试策略](TESTING.md)
 - [发布清单](RELEASE_CHECKLIST.md)
 - [架构决策](agent/architecture-decisions.md)
-- [Penrix fork 方向与连续性认知](agent/penrix-fork-direction.md) —— ChatGPT Web 接入、跨 conversation 恢复、DVR/检索，以及 fork 与上游边界的当前设计认知
+- [Penrix fork 当前方向](agent/penrix-fork-direction.md) —— ChatGPT Web Provider、跨 conversation 恢复证据、DVR/检索，以及 upstream/fork 职责边界
 - [Runtime host context](agent/runtime-host-context.md) —— Runner 配置的 planning context 与 runtime diagnostics
 - [Job 可靠性与 Runner 并发](agent/job-reliability-and-concurrency.md)
 - [Tool request tracing](agent/tool-request-tracing.md) —— maintainer forensic payload/correlation contract

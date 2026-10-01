@@ -3,16 +3,176 @@ use super::*;
 // Durable model-ergonomics and MCP tool-surface measurement integration tests.
 // Keep these separate from the general HTTP transport lifecycle coverage.
 
-// Explicit compact-schema=false keeps the full outputSchema projection. Keep the
-// env serialized against other compact-schema tests for the whole HTTP request.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn http_mcp_tools_list_explicit_full_projection_audits_effective_policy() {
-    let mut env = crate::test_support::TestEnvGuard::new();
-    env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
+async fn model_ergonomics_normalization_reaches_api_and_mcp_action_audit_without_payloads() {
+    use crate::runner_protocol::{
+        RunnerJobUpdateRequest, RunnerPollRequest, ShellCommandExecutionState,
+    };
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
-    let runtime = Arc::new(test_runtime());
+    let registry = Arc::new(crate::runner_http::RunnerRegistry::default());
+    registry
+        .register(crate::test_support::current_runner_registration(
+            RunnerRegisterRequest {
+                client_id: "input-audit".to_string(),
+                runner_instance_id: "inst-input-audit".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                capabilities: RunnerCapabilities {
+                    shell: true,
+                    structured_process_argv: true,
+                    ..Default::default()
+                },
+                computer_session_availability: None,
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+                display_name: None,
+                owner: None,
+                hostname: None,
+                host_context: None,
+                policy: None,
+            },
+        ))
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &registry,
+        "input-audit",
+        "inst-input-audit",
+        vec![RunnerProjectSummary {
+            id: "demo".to_string(),
+            name: None,
+            path: "/tmp/input-audit".to_string(),
+            allow_patch: true,
+            kind: Some("repo".to_string()),
+            registration_source: None,
+            description: None,
+            hooks: Vec::new(),
+            disabled: false,
+            revision: None,
+            root_fingerprint: None,
+            lineage: None,
+            git_branch: None,
+            git_head: None,
+            git_dirty: None,
+            updated_at: 1,
+            shell_profile: None,
+        }],
+    )
+    .await;
+    let runtime = Arc::new(ToolRuntime::new(
+        registry.clone(),
+        Arc::new(crate::tool_runtime::RuntimeInfo::default()),
+    ));
+    let service = Service::new(
+        build_test_router(config, db.clone(), runtime).push(
+            Router::with_path("api/tools/call")
+                .hoop(crate::AuthMiddleware)
+                .post(crate::runtime_http::tools_call),
+        ),
+    );
+    for transport in ["api", "mcp", "mcp_gateway"] {
+        let arguments = json!({"project":"agent:input-audit:demo", "executable":"PRIVATE_EXECUTABLE", "argv":["PRIVATE_ARG"]});
+        let (url, body) = if transport == "api" {
+            (
+                "http://localhost/api/tools/call",
+                json!({"tool":"run_process", "params":arguments}),
+            )
+        } else {
+            let params = if transport == "mcp_gateway" {
+                adaptive_runtime_gateway_params("run_process", arguments)
+            } else {
+                json!({"name":"run_process", "arguments":arguments})
+            };
+            (
+                "http://localhost/mcp",
+                json!({"jsonrpc":"2.0", "id":701, "method":"tools/call", "params":params}),
+            )
+        };
+        let audit_id = format!("normalization-{transport}");
+        let request = TestClient::post(url)
+            .bearer_auth("secret")
+            .add_header("x-action-session-id", &audit_id, true)
+            .json(&body);
+        let responder = async {
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if let Some(request) = registry
+                        .poll(RunnerPollRequest {
+                            client_id: "input-audit".to_string(),
+                            runner_instance_id: "inst-input-audit".to_string(),
+                        })
+                        .await
+                        .unwrap()
+                    {
+                        break request;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("fake Runner request within one absolute deadline");
+            assert_eq!(request.kind, "start_process_job");
+            assert_eq!(request.process.as_ref().unwrap().args, ["PRIVATE_ARG"]);
+            registry
+                .update_job(RunnerJobUpdateRequest {
+                    client_id: "input-audit".to_string(),
+                    runner_instance_id: "inst-input-audit".to_string(),
+                    job_id: request.job_id.expect("structured Job identity"),
+                    request_id: Some(request.request_id),
+                    update_seq: None,
+                    status: "completed".to_string(),
+                    exit_code: Some(0),
+                    stdout_chunk: Some("PRIVATE_OUTPUT".to_string()),
+                    stderr_chunk: None,
+                    log_snapshot: None,
+                    duration_ms: Some(1),
+                    error: None,
+                    command_execution_state: Some(ShellCommandExecutionState::Completed),
+                    validation_progress: None,
+                    test_count_evidence: None,
+                    activity: None,
+                    finished: true,
+                })
+                .await
+                .unwrap();
+        };
+        let (mut response, ()) = tokio::join!(request.send(&service), responder);
+        assert_eq!(effective_status(&response), StatusCode::OK);
+        let body: Value = response.take_json().await.unwrap();
+        let result = if transport == "api" {
+            &body
+        } else {
+            &body["result"]["structuredContent"]
+        };
+        assert_eq!(result["success"], true, "{body}");
+        assert_eq!(
+            result["output"]["input_normalization"]["code"],
+            "argv_to_args"
+        );
+        assert!(result["output"].get("input_normalization_code").is_none());
+        let events = db.list_action_events(&audit_id, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation.as_deref(), Some("run_process"));
+        let summary: Value = serde_json::from_str(&events[0].summary_json).unwrap();
+        let telemetry = &summary["model_ergonomics"];
+        assert_eq!(telemetry["schema_version"], 13);
+        assert_eq!(telemetry["input_normalization_code"], "argv_to_args");
+        assert!(!telemetry.to_string().contains("hint"));
+        assert!(!summary.to_string().contains("PRIVATE_"), "{summary}");
+    }
+}
+
+// Explicit compact-schema=false keeps the full outputSchema projection. Use an
+// explicit runtime snapshot so no process-global env guard is needed.
+#[tokio::test]
+async fn http_mcp_tools_list_explicit_full_projection_audits_effective_policy() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_mcp_settings(false, true));
     let service = Service::new(build_test_router(config, db.clone(), runtime));
     let mut resp = TestClient::post("http://localhost/mcp")
         .bearer_auth("secret")
@@ -85,11 +245,8 @@ async fn http_mcp_tools_list_explicit_full_projection_audits_effective_policy() 
     }
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn http_adaptive_tools_list_unset_defaults_to_compact_and_reports_effective_policy() {
-    let mut env = crate::test_support::TestEnvGuard::new();
-    env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
@@ -134,8 +291,6 @@ async fn http_adaptive_tools_list_unset_defaults_to_compact_and_reports_effectiv
 #[tokio::test]
 async fn http_mcp_tools_list_stateless_audit_measures_final_compact_result_and_skips_notifications()
 {
-    let mut env = crate::test_support::TestEnvGuard::new();
-    env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "1");
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
@@ -299,6 +454,7 @@ async fn http_mcp_work_on_project_preferences_persist_without_private_request_va
                     "base_ref": private_base_ref,
                     "instruction": private_instruction,
                     "session_id": private_session,
+                    "guidance_profile": "host_code_mode",
                     "include_extension_catalog": false
                 }
             }
@@ -319,15 +475,15 @@ async fn http_mcp_work_on_project_preferences_persist_without_private_request_va
     assert_eq!(events[0].operation.as_deref(), Some("work_on_project"));
     let summary: Value = serde_json::from_str(&events[0].summary_json).unwrap();
     let telemetry = &summary["model_ergonomics"];
-    assert_eq!(telemetry["schema_version"], 7);
+    assert_eq!(telemetry["schema_version"], 13);
     let facts = &telemetry["work_on_project"];
     assert_eq!(facts["resume_requested"], true);
     assert_eq!(facts["source"], "invalid");
     assert_eq!(facts["mode"], "worktree");
     assert_eq!(facts["mode_explicit"], true);
     assert_eq!(facts["base_ref_present"], true);
-    assert_eq!(facts["guidance_profile"], "direct");
-    assert_eq!(facts["guidance_profile_explicit"], false);
+    assert_eq!(facts["guidance_profile"], "host_code_mode");
+    assert_eq!(facts["guidance_profile_explicit"], true);
     assert_eq!(facts["include_extension_catalog"], false);
     assert_eq!(facts["include_extension_catalog_explicit"], true);
     let persisted = serde_json::to_string(&summary).unwrap();
@@ -355,6 +511,7 @@ async fn http_mcp_code_mode_persists_only_bounded_composition_telemetry() {
     runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -540,4 +697,64 @@ async fn http_mcp_tools_list_audit_sink_failure_is_non_blocking() {
     assert_eq!(effective_status(&response), StatusCode::OK);
     let body: Value = response.take_json().await.unwrap();
     assert!(body["result"]["tools"].is_array());
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn metadata_audit_retains_envelope_context_without_full_payloads() {
+    let mut env = crate::test_support::TestEnvGuard::new();
+    env.set("WEBCODEX_TOOL_REQUEST_TRACE", "metadata");
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let service = Service::new(build_test_router(
+        config,
+        db.clone(),
+        Arc::new(test_runtime()),
+    ));
+    for (id, name, arguments) in [
+        (
+            901,
+            "runtime_status",
+            json!({"_wc": {"context": ["webcodex.workflow", "PRIVATE_UNKNOWN_CONTEXT"], "ack": []}}),
+        ),
+        (
+            902,
+            "work_on_project",
+            json!({"project": "PRIVATE_PROJECT", "instruction": "PRIVATE_PROMPT", "_wc": {"context": ["project.instructions", "webcodex.workflow"]}}),
+        ),
+    ] {
+        let mut response = TestClient::post("http://localhost/mcp")
+            .bearer_auth("secret")
+            .add_header(MCP_PROTOCOL_VERSION_HEADER, MCP_STATELESS_PROTOCOL_VERSION, true)
+            .add_header(MCP_METHOD_HEADER, "tools/call", true)
+            .add_header(MCP_NAME_HEADER, name, true)
+            .add_header("x-action-session-id", "metadata-envelope-audit", true)
+            .json(&json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": mcp_2026_params(json!({"name": name, "arguments": arguments}))}))
+            .send(&service).await;
+        let body: Value = response.take_json().await.unwrap();
+        if name == "runtime_status" {
+            assert_eq!(body["result"]["isError"], false, "{body}");
+        }
+    }
+    let events = db
+        .list_action_events("metadata-envelope-audit", 10)
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    for event in events {
+        let summary: Value = serde_json::from_str(&event.summary_json).unwrap();
+        let facts = &summary["model_ergonomics"]["invocation"];
+        assert_eq!(facts["context_present"], true);
+        assert_eq!(facts["context_requested_count"], 2);
+        assert_eq!(facts["context_known"]["webcodex.workflow"], true);
+        if event.operation.as_deref() == Some("work_on_project") {
+            assert_eq!(facts["context_known"]["project.instructions"], true);
+        } else {
+            assert_eq!(facts["context_unknown_count"], 1);
+            assert_eq!(facts["ack_present"], true);
+            assert_eq!(facts["ack_count"], 0);
+        }
+        assert!(!summary["model_ergonomics"].to_string().contains("PRIVATE"));
+        assert!(summary.get("raw_arguments").is_none());
+        assert!(summary.get("effective_arguments").is_none());
+    }
 }

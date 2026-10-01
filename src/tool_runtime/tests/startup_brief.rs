@@ -108,7 +108,10 @@ fn instruction_source<'a>(output: &'a Value, path: &str) -> &'a Value {
 fn assert_builtin_workflow(output: &Value) {
     let workflow = &output["workflow"];
     assert_eq!(workflow["contract"], "webcodex.coding_workflow");
-    assert_eq!(workflow["version"], 15);
+    assert_eq!(
+        workflow["version"],
+        crate::tool_runtime::startup_brief::BUILTIN_CODING_WORKFLOW_VERSION
+    );
     assert_eq!(workflow["authority"], "model_guidance_only");
     assert!(workflow["role_selection"]
         .as_str()
@@ -128,36 +131,55 @@ fn assert_builtin_workflow(output: &Value) {
         .as_str()
         .expect("Session recording guidance");
     assert!(recording_guidance.contains("work_on_project creates or resumes"));
-    assert!(recording_guidance.contains("recording_session_id"));
+    assert!(recording_guidance.contains("_wc.record"));
+    assert!(recording_guidance.contains("prefer its returned session_ref"));
+    assert!(recording_guidance.contains("canonical wc_sess_* remains valid"));
     assert!(recording_guidance.contains("recorder provenance only"));
     assert!(recording_guidance.contains("business session_id may target another Session"));
     assert!(recording_guidance.contains("grants no authority"));
+    assert!(!recording_guidance.contains("recording_session_id"));
     let message_ack_guidance = workflow["model_protocol"]["session_message_ack"]
         .as_str()
         .expect("Session message ACK guidance");
     assert!(message_ack_guidance.contains("session_attention"));
     assert!(message_ack_guidance.contains("requires_ack"));
-    assert!(message_ack_guidance.contains("ack_session_message_ids"));
+    assert!(message_ack_guidance.contains("_wc.ack"));
+    assert!(message_ack_guidance.contains("operator_messages"));
+    assert!(message_ack_guidance.contains("peer_messages"));
+    assert!(message_ack_guidance.contains("_wc.ack_ref remains Session-only"));
     assert!(message_ack_guidance.contains("model-context retention"));
-    assert!(message_ack_guidance.contains("resolves messages"));
+    assert!(message_ack_guidance.contains("never resolves messages"));
     assert!(message_ack_guidance.contains("grants authority"));
     assert!(message_ack_guidance.contains("gates execution"));
+    assert!(!message_ack_guidance.contains("ack_session_message_ids"));
+    let window_reply_guidance = workflow["model_protocol"]["window_reply"]
+        .as_str()
+        .expect("Window reply guidance");
+    assert!(window_reply_guidance.contains("operator_messages"));
+    assert!(window_reply_guidance.contains("_wc.reply"));
+    assert!(window_reply_guidance.contains("reply_to"));
+    assert!(window_reply_guidance.contains("No _wc.record"));
+    assert!(window_reply_guidance.contains("_wc.ack"));
+    assert!(window_reply_guidance.contains("post-result"));
+    assert!(!window_reply_guidance.contains("window_reply={"));
     let message_resolution_guidance = workflow["model_protocol"]["session_message_resolution"]
         .as_str()
         .expect("Session message resolution guidance");
-    assert!(message_resolution_guidance.contains("session_message_resolution"));
+    assert!(message_resolution_guidance.contains("_wc.resolve"));
     assert!(message_resolution_guidance.contains("next ordinary call"));
-    assert!(message_resolution_guidance.contains("recording_session_id"));
-    assert!(message_resolution_guidance.contains("ack_session_message_ids"));
-    assert!(message_resolution_guidance.contains("cannot predict the main call"));
+    assert!(message_resolution_guidance.contains("_wc.record"));
+    assert!(message_resolution_guidance.contains("_wc.ack"));
+    assert!(message_resolution_guidance.contains("Resolve cannot predict"));
     assert!(message_resolution_guidance.contains("complete_session_message"));
+    assert!(!message_resolution_guidance.contains("session_message_resolution on"));
     let sidecar_guidance = workflow["model_protocol"]["context_sidecar"]
         .as_str()
         .expect("context sidecar guidance");
-    assert!(sidecar_guidance.contains("context_request"));
-    assert!(sidecar_guidance.contains("after the main tool"));
+    assert!(sidecar_guidance.contains("_wc.context"));
+    assert!(sidecar_guidance.contains("post-result context request"));
     assert!(sidecar_guidance.contains("never authorizes"));
     assert!(sidecar_guidance.contains("observation call before dependent mutation"));
+    assert!(!sidecar_guidance.contains("context_request"));
     let runner_targeting_guidance = workflow["model_protocol"]["runner_targeting"]
         .as_str()
         .expect("exact Runner targeting guidance");
@@ -184,12 +206,23 @@ fn assert_builtin_workflow(output: &Value) {
         "Validation failure is evidence, not queue cleanliness",
         "Reuse assertion_name",
         "outcome_unknown fails closed",
+        "Development validation may overlap independent work",
+        "covered-source edits make it stale for final evidence",
+        "freeze source covered by final validation",
+        "invalidate that evidence",
+        "rerun the appropriate final validation",
         "exact continuation",
-        "wait_for_job_terminal with a real Host carrier",
-        "no short polling",
-        "stop_job(confirm=true)",
+        "passive Job attention",
+        "observe_jobs is for logs/details/recovery",
         "list_jobs is identity recovery",
-        "sufficient fresh validation",
+        "Keep one execution/Job",
+        "finish ready work",
+        "one wait_for_job_readiness join",
+        "any may unblock a branch",
+        "all requires every blocker",
+        "Deadline recomputes work/set",
+        "no automatic next turn",
+        "Never retry/redispatch",
     ] {
         assert!(defaults.contains(phrase), "workflow guidance: {phrase}");
     }
@@ -212,6 +245,25 @@ fn assert_builtin_workflow(output: &Value) {
     assert!(!persistent_shell_guidance
         .contains("structured tools -> run_process/run_script -> run_shell"));
     assert!(!persistent_shell_guidance.contains("For repeated commands in one Workflow Session"));
+    let work_result_guidance = workflow["model_protocol"]["work_result_presentation"]
+        .as_str()
+        .expect("work result presentation guidance");
+    for phrase in [
+        "substantial Project work",
+        "stable client Window",
+        "present_work_result(project) exactly once",
+        "first successful project-scoped WebCodex action",
+        "Do not wait for work_on_project",
+        "same Window ActionAudit activity as WebUI",
+        "observe/diagnostic actions",
+        "optional linked Session collaboration",
+        "final changes may appear later",
+        "Never repeat presentation or model-poll it",
+        "Tiny one-step/read-only lookups may skip it",
+        "fallback if no card was presented",
+    ] {
+        assert!(work_result_guidance.contains(phrase), "{phrase}");
+    }
     let closeout_guidance = workflow["model_protocol"]["normal_closeout"]
         .as_str()
         .expect("normal closeout guidance");
@@ -225,18 +277,17 @@ fn assert_builtin_workflow(output: &Value) {
         .as_str()
         .unwrap();
     for phrase in [
-        "substantial multi-step/cross-turn",
-        "create or reuse a durable Goal",
-        "completion_conditions",
-        "current Workflow Session",
-        "Tiny one-step",
-        "independently of AGENTS.md",
+        "Goal workflow is on-demand",
+        "do not require a Goal",
+        "work_on_project.goal_context",
+        "choose explicitly among multiple candidates",
+        "never infer from Project/Window/title/recency",
+        "webcodex.goal_workflow",
     ] {
         assert!(goal_workflow.contains(phrase), "{phrase}");
     }
-    let continuation = workflow["model_protocol"]["goal_continuation"]
-        .as_str()
-        .unwrap();
+    let details = crate::model_workflow::ModelWorkflowPolicy::default().goal_workflow_projection();
+    let continuation = details["continuation"].as_str().unwrap();
     for phrase in [
         "exact explicit durable controller Agent",
         "Reuse the same Agent",
@@ -248,19 +299,33 @@ fn assert_builtin_workflow(output: &Value) {
     ] {
         assert!(continuation.contains(phrase), "{phrase}");
     }
-    let checkpoint = workflow["model_protocol"]["goal_checkpoint"]
-        .as_str()
-        .unwrap();
+    let checkpoint = details["checkpoint"].as_str().unwrap();
     for phrase in [
-        "recovery-worthy milestones",
-        "not after every call",
-        "completed_step_ids/current_step_id",
-        "explicitly update_goal",
+        "After a plan phase completes",
+        "_wc.control.before.goal_progress",
+        "facts already true",
+        "never pre-complete tests",
+        "checkpoint_goal remains valid standalone",
+        "explicit update_goal",
         "cannot judge natural-language conditions",
     ] {
         assert!(checkpoint.contains(phrase), "{phrase}");
     }
     assert!(goal_workflow.len() <= 720 && continuation.len() <= 720 && checkpoint.len() <= 480);
+    let sidecars = workflow["model_protocol"]["control_sidecars"]
+        .as_str()
+        .unwrap();
+    for phrase in [
+        "optional",
+        "otherwise omit",
+        "standalone",
+        "independently authorized",
+        "preserves main success",
+        "fail-closed",
+    ] {
+        assert!(sidecars.contains(phrase), "{phrase}");
+    }
+    assert!(sidecars.len() <= 640);
     let roles = workflow["roles"]
         .as_object()
         .expect("workflow roles object");
@@ -276,8 +341,14 @@ fn assert_builtin_workflow(output: &Value) {
     assert!(!review_guidance.is_empty());
     assert!(
         review_guidance.len()
-            <= crate::tool_runtime::startup_brief::BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS
+            <= crate::tool_runtime::startup_brief::BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEMS
     );
+    assert!(review_guidance.iter().all(|item| {
+        item.as_str().is_some_and(|text| {
+            text.chars().count()
+                <= crate::tool_runtime::startup_brief::BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEM_CHARS
+        })
+    }));
     let serialized = workflow.to_string().replace("Stalled is not offline", "");
     for forbidden in ["ChatGPT", "browser", "another window", "online", "offline"] {
         assert!(
@@ -1024,6 +1095,7 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
         .runner_registry
         .start_job_with_metadata(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("startup-jobs".to_string()),
                 cwd: Some(root_a.path().to_string_lossy().to_string()),
@@ -1255,9 +1327,7 @@ async fn startup_runner_health_uses_the_exact_project_client() {
 
     let status = runtime.runtime_status(None).await;
     assert!(status.success);
-    let clients = status.output["agents"]["summary"]["clients"]
-        .as_array()
-        .unwrap();
+    let clients = status.output["runners"]["clients"].as_array().unwrap();
     assert!(clients
         .iter()
         .any(|client| client["client_id"] == "startup-peer" && client["status"] == "online"));

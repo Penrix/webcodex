@@ -16,12 +16,63 @@ Job. Job observation never starts or replaces execution:
 
 ```text
 long tool -> same durable Job -> exact continuation retained
-  blocked on terminal -> wait_for_job_terminal
+  blocked in live cell -> wait_for_job_readiness (one exact set)
+  blocked across turns -> wait_for_job_terminal
   independent work    -> continue read/search/review; optional jobs.attention
   need logs/details   -> observe_jobs on the retained Job
   need stop           -> stop_job(project="<project>", job_id="<job>", confirm=true)
   identity lost       -> list_jobs recovery before considering any retry
 ```
+
+`wait_for_job_readiness(job_ids, mode, wait_secs)` is a transient, sequential
+Host **join barrier**, not a pending-Job observer. Finish every currently-ready
+independent action first, then pass the whole exact set that really blocks further
+useful progress in one request. Use `any` when one terminal Job can unlock a useful
+dependent branch and recompute the ready/blocked sets after it returns; use `all`
+only at a true join where every blocked dependency is required. Stable
+deduplication preserves order; 1..8 unique public Jobs and 1..45 seconds are
+required. Every Job is independently re-authorized before waiting; an
+invalid/invisible target fails the entire set without partial evidence. It shares
+`observe_jobs`' canonical Notify/revision waiter, private cursors and one absolute
+deadline. Nonterminal updates do not satisfy readiness or extend the deadline.
+The model-facing final snapshot reports only ready `job_id/status/outcome`,
+`pending_job_ids`, and `wait_state`. Request `mode` and measured `waited_ms` remain
+in canonical ActionAudit/model-ergonomics telemetry rather than repeating facts the
+caller already knows in the happy-path receipt. Failed, stopped, lost and timed-out
+Jobs are terminal-ready. `deadline` is successful observation
+of an unsatisfied bounded wait, not Job failure. Existing observation deadline
+semantics apply: an expired `all` wait stays deadline even if its final snapshot
+races completion; `any` can recognize terminal truth in that final snapshot.
+
+For Window activity only, a readiness set whose exact caller-authorized Job records
+all carry the same canonical Project is attributed to that Project before the wait
+starts. This provenance is derived from RunnerRegistry Job truth, not from the sparse
+model-facing result, and grants no Project authority. Mixed-Project, projectless,
+unknown, or unauthorized sets remain unanchored. This lets Runtime Console/WebUI
+reuse normal Project visibility across operator credential rotation without adding a
+per-tool UI allowlist or weakening fail-closed isolation.
+
+No durable registration, App carrier, new execution or retry is created.
+Cancellation/restart drops the wait; the existing Job lifecycle survives on its
+own terms. Never use parallel per-Job long waits or `Promise.race`. Resume ready
+work in the same cell, but terminal status never authorizes a mechanical
+follow-up: only an explicit `follow_up_kind=mechanically_followable` does.
+Choose `wait_secs` as the largest safe value from the remaining Host activation
+budget after preserving its return guard, capped at 45 seconds; there is no fixed
+10/15/20-second preferred slice. After `deadline`, recompute ready work and the
+blocked set. If neither changed and no new semantic information appeared, do not
+mechanically refill the same wait; yield near the activation boundary. Generic 5s
+handoff/continuation slices and Job lifetimes are unchanged. This tool is ordinary
+MCP/Adaptive Runtime only;
+no nested Code Mode admission or frozen legacy Actions membership is added.
+
+`observe_jobs` keeps `wake_on=change` backward-compatible: any accepted observation
+revision, including sequence-only Runner liveness, may wake it. Use
+`wake_on=meaningful_change` only when sequence-only liveness should be skipped; it
+advances a private wait cursor across those revisions while preserving one absolute
+deadline, and still wakes for logs, lifecycle, activity, recovery, epoch/reset, or
+terminal changes. Returned `meaningful_changed` and `heartbeat_changed` classify the
+observed revision without changing the opaque observation-token contract.
 
 `wait_for_job_terminal(job_id="<job>", idempotency_key="<wait-key>")` registers
 bounded one-shot terminal attention. Prefer it when progress genuinely depends
@@ -69,7 +120,7 @@ terminal result reconciles the same Job, exact Project, Session, tool, and
 validation target. A successful replacement execution with a matching target
 must not erase an earlier unknown outcome.
 
-An ordinary observation can request `context_request=["jobs.attention"]`.
+An ordinary observation can request `_wc.context=["jobs.attention"]`.
 This is an explicit post-tool context material, not another execution or a
 business-tool argument. It reuses `active_jobs_summary` for the exact resolved
 Project, requires canonical `runtime:read` independently of `project:read`,
@@ -79,6 +130,40 @@ available zero-count projection. Missing Project/scope or projection budget is
 nonfatal to the main call. Recorder or prior Sessions never select a business
 Session. The summary contains bounded counts and brief Job metadata, not logs,
 command bodies, observation tokens, host details, or arbitrary payload.
+
+Passive Job attention is a separate post-result projection on ordinary model-visible
+coding tools. It requires a non-anonymous authenticated principal, a current
+ClientWindow, exact resolved and currently visible Project, `runtime:read`, an
+explicit business Workflow Session authorized for that Project, and a Job whose
+durable Project and Session fields both match. A recorder Session, Window affinity,
+or Project match alone never selects a Job. The ClientWindow scopes only the
+process-local delivery cursor; it is not Job ownership, so another authorized
+Window may independently observe the same changed Job state. Passive attention
+reads only the Server's current Job records; unrelated read calls do not poll a
+Runner. The payload is sparse: `job_id`, tool, durable status, active/terminal state,
+recovery codes when present, and on terminal transitions bounded execution outcome,
+exit/command truth, conservative validation/source freshness, plus an exact
+`observe_jobs` details call. Successful validation stays sparse. Failed or unproven validation may include the
+canonical safe `diagnostics` subset (at most three compiler diagnostics and three
+`failed_test_details`, with an 8 KiB serialized detail ceiling). Item or byte
+omissions set the corresponding truncation flag. Counts describe retained parser
+evidence, not a complete log inventory. Exact `details -> observe_jobs` remains
+available for truncated/absent evidence, full logs, and recovery. Evidence comes
+from the same frozen Server record and retained bounded excerpts, never a Runner
+poll. It never inlines logs, panic/assertion bodies, or command bodies. A bounded
+process-local cursor keyed by principal, Window, Project, and business Session emits
+decision-relevant states once per observed semantic revision. Routine queued,
+agent_queued, started, running, stop-requested, progress, and timestamp changes
+only advance the baseline. Terminal transitions and changes to the canonical
+Server recovery phase/reason pair are deliverable; recovery completion is useful
+because it resolves previously uncertain execution visibility. No status-text
+heuristic classifies recovery. Server restart may repeat one bounded
+active snapshot; historical terminal records establish a baseline rather than being
+replayed as new completion. The cursor is not durable authority. Failure or
+omission of attention leaves the main tool result intact. `current_window_activity`
+is a nonmeaningful diagnostic observation and neither receives nor consumes passive
+attention. Explicit `jobs.attention` retains its Project-level scope and zero-active
+summary independently of this cursor.
 
 Query may piggyback; control may not. `stop_job` is the explicit canonical
 Mutate/JobRun/Standard/DesiredState primitive, with `confirm=true`, `job:run`,
@@ -219,8 +304,11 @@ credentials, and private paths are not required.
 Execution duration and lifetime ownership are separate policies. `run_process`,
 `run_script`, and `run_detached_process` default to 60 seconds and accept a
 total execution lifetime up to 604800 seconds (7 days). Values above that
-ceiling clamp to 7 days. `sync_wait_secs` controls only the bounded synchronous
-handoff grace; it never extends execution lifetime. `run_shell`, structured
+ceiling clamp to 7 days. The Server-owned bounded synchronous handoff grace is
+return-latency policy only; it never extends execution lifetime. Normal
+model-facing discovery exposes no handoff-timing tuning input; compatibility
+inputs, when present on older callers, can only be tightened by trusted Server
+policy. `run_shell`, structured
 validation, and trusted Skill resource execution retain the 3600-second
 ceiling, and direct synchronous structured Runner requests retain the
 120-second ceiling.
@@ -231,6 +319,40 @@ host when the Runner process is expected to remain the lifetime owner. Use
 restart, upgrade, stop, or replacement; duration alone is not a detach reason.
 Detached recovery preserves the same logical Job/execution fence and does not
 permit duplicate payload dispatch.
+
+For normal sync-first execution, model-facing handoff is intentionally sparse:
+`execution_state=pending` plus one exact fallback continuation. Static
+scheduling policy lives in builtin workflow, Host Code Mode guidance and
+tool descriptions, rather than a repeated `pending_strategy` result field. The canonical
+registry and Session ledger retain the Job id, lifecycle, validation identity,
+source fence, and structured execution metadata. A handoff in an exact
+authenticated Window/Project/Workflow Session establishes the passive
+`JobAttentionCursor` baseline without echoing a second active notification.
+Subsequent ordinary coding calls in that same scope may attach `job_attention`
+only when terminal truth or the canonical Server recovery overlay changes.
+Proven terminal success contains `job_id`, `tool`, and `outcome=passed`.
+Successful validation additionally retains its kind, test-count/policy evidence,
+target identity when present, and explicit source state. `unproven/uncrossed`
+still does not certify current source. A distinct validation adapter is retained.
+Redundant status, exit-zero, command-success and validation-success fields, and
+the success-only details call, are omitted. Unknown/stale source, incomplete or
+truncated evidence, failures and recovery retain the explanatory receipt and
+explicit details call. No passive receipt contains stdout/stderr bodies.
+This is the shared Runtime model presentation (including REST, MCP and admitted
+legacy Actions), not a change to retained Job or Session evidence. Published
+output schemas describe both sparse success and rich exceptional shapes.
+The same terminal revision is delivered at most once per process-local cursor;
+after Server restart a bounded active-state duplicate is allowed, while
+historical terminal Jobs establish baseline and are not replayed as new
+completions. Passive attention reads only the Server registry and never starts,
+retries, stops, or polls a Runner execution.
+
+This makes the normal same-turn path independent of Host automatic wake:
+pending execution can overlap read/edit/search/review work and a later ordinary
+result can carry its terminal truth. `observe_jobs` remains the explicit path
+for logs, additional diagnostics, recovery, or cases where bounded terminal truth
+is insufficient. `wait_for_job_terminal` and Host continuation carriers remain
+optional blocked-on-terminal acceleration, not required lifecycle machinery.
 
 Long-running Jobs still occupy the Runner's normal `max_concurrent_jobs`
 execution quota. Detached Jobs remain excluded only from Runner shutdown drain
@@ -373,15 +495,17 @@ item errors, or one shared absolute deadline expires. It never returns an
 `updated` wake reason: at the deadline `wait.outcome=timeout` can coexist with
 `changed=true`. Item errors take precedence over terminal, then timeout.
 
-Canonical execution handoffs expose the host-safe `wait_secs=55,
-wake_on=terminal` parser-ready observation continuation. When blocked on terminal,
-prefer `wait_for_job_terminal` with a real Host carrier; the bounded observation
-wait remains the details/recovery fallback, not a polling subscription. When
-independent work remains, retain the exact identity/continuation and continue
-that work, optionally requesting `jobs.attention` on an ordinary observation.
-The Runtime still accepts explicit waits up to 100 seconds and terminal completion wakes immediately,
-but longer model-facing waits may exceed an outer MCP Host deadline. Any missing token still gives
-an immediate baseline, and omitting `wait_secs` gives an immediate observation.
+Canonical execution handoffs expose a parser-ready `wake_on=terminal` observation
+continuation whose bounded `wait_secs` is adapted by the Server-side MCP Host timing
+profile. When blocked on terminal, prefer `wait_for_job_terminal` with a real Host
+carrier; the bounded observation wait remains the details/recovery fallback, not a
+polling subscription. When independent work remains, retain the exact
+identity/continuation and continue that work, optionally requesting `jobs.attention`
+on an ordinary observation. The transport-neutral Runtime still accepts explicit
+waits up to 100 seconds and terminal completion wakes immediately; MCP transport
+may clamp model-facing waits further to fit the configured Host budget. Any missing
+token still gives an immediate baseline, and omitting `wait_secs` gives an immediate
+observation.
 Each Job waiter advances a private opaque cursor on non-terminal updates; final
 bounded deltas always use the caller's original token. Waiters use canonical
 Notify/revision rechecks, without a periodic polling heartbeat; updates neither
@@ -471,3 +595,60 @@ The current contract is implemented and tested primarily in:
   and slot reservation;
 - `docs/RUNNER.md` — public Job/concurrency behavior;
 - `docs/TESTING.md` — real-process restart/reconciliation acceptance coverage.
+
+## Server-only convergence measurement
+
+The existing Action Audit `summary.model_ergonomics` (schema version 11) adds
+optional `job_convergence`. It records per-invocation `pending_handoff_count`,
+`passive_terminal_delivery_count`, `passive_failure_delivery_count`, and
+`wait_for_job_terminal_count`, plus at most nine bounded events. Wait counts
+include rejected invocations. Terminal failure means negative validation truth
+or failed command truth; a separate event boolean identifies the validation
+failure cohort for measuring actionable diagnostics.
+
+Events are `pending_handoff`, `explicit_observe`, or `passive_terminal`. Their
+64-hex `relation` hashes an unambiguous length-prefixed tuple: process-local
+random salt, authenticated principal kind/id, exact Window, durable Project,
+business Workflow Session, and Job. The salt is shared by runtime clones and
+changes after restart. No native ids, command, argv, cwd, env, source, logs,
+error text, or provider payload enter this projection. Reading durable Session
+attribution for an exact authorized `observe_jobs` result is telemetry only;
+it never supplies request/business/recorder context. Explicit mismatching
+Project/Session context cannot correlate. Missing Window, scope, Job attribution,
+or a busy registry yields `correlation_complete=false`, never a guessed match.
+Failed or partially failed observation also leaves incomplete correlation; it
+cannot be used as evidence that no explicit observation occurred.
+The immutable telemetry snapshot uses a nonblocking read and cannot poll, refresh,
+mutate, create receipts, or affect the ToolResult.
+
+MCP's existing bounded principal/Window continuity registry also retains the
+exact prior meaningful call's Server trace id. Action Audit stores that link as
+`summary.previous_meaningful_call` only for a proven serial predecessor. Overlap,
+cancellation, eviction and coverage gaps invalidate the link. There is no new
+model-turn identity or claim that the Host/model consumed the result.
+
+The existing offline `scripts/agent_loop_report.py summarize` report derives:
+
+- `pending_followed_immediately_by_observe_count`: the next serial meaningful
+  MCP call has an exact `explicit_observe` event matching the pending relation.
+  Discovery/diagnostic calls are nonmeaningful under the existing policy. An
+  intervening meaningful read/edit or different Job/Project/Session does not count.
+- `passive_terminal_before_explicit_observe_count`: a complete chain back to the
+  exact pending handoff contains no explicit observation of that relation.
+- `terminal_failure_followed_by_observe_count`: the first later exact explicit
+  observation after passive failure, within a proven serial chain. Reads/edits
+  alone do not count. The report separately counts the validation failure cohort.
+- `pending_to_terminal_ms`: first Server terminal observation minus the pending
+  response's existing `response_handed_at_ms`. Terminal time comes from the
+  registry's existing `terminal_observed_at`, at second resolution. Missing or
+  inconsistent timestamps are unknown, never replaced by creation/start time,
+  duration, or observation delivery time.
+
+Correlations and distributions are computed offline because kernel completion
+cannot establish adapter response handoff or exact serial adjacency. Missing
+predecessor rows, non-MCP timing, restart/retention loss and overlap remain
+unknown; they never become evidence of "no observe". The report consumes at most
+100,000 rows and one million predecessor links for this analysis and exports
+only aggregate counters/distributions, not relations or identities. Existing
+Action Audit retention and failure isolation apply. Nothing is added to ordinary
+`runtime_status`, model results, discovery, or nested Code Mode contracts.

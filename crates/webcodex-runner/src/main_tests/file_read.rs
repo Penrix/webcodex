@@ -8,6 +8,7 @@ fn file_read_request(
     max_bytes: Option<usize>,
 ) -> RunnerRequest {
     RunnerRequest {
+        login: false,
         shell: None,
         request_id: "req-file-read".to_string(),
         client_id: "agent-1".to_string(),
@@ -133,7 +134,7 @@ fn runner_file_read_range_output_obeys_max_bytes() {
 #[test]
 fn runner_file_read_range_rejects_serialized_envelope_expansion_before_stdout() {
     for (name, byte, len) in [
-        ("nul.txt", 0x00, 48 * 1024),
+        ("nul-byte.txt", 0x00, 48 * 1024),
         ("quote.txt", b'\"', 140 * 1024),
         ("backslash.txt", b'\\', 140 * 1024),
         ("control.txt", 0x01, 48 * 1024),
@@ -214,7 +215,10 @@ fn runner_file_read_allows_exact_generated_files_but_protects_secrets_and_git() 
     for (path, allowed) in [
         ("node_modules/foo/package.json", true),
         ("target/result.txt", true),
+        (".env.example", true),
+        (".ENV.SAMPLE", true),
         (".env", false),
+        (".env.example.local", false),
         (".git/config", false),
     ] {
         let target = tmp.path().join(path);

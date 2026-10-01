@@ -467,7 +467,7 @@ async fn post_live_unregister(
             "Server returned an unclassified unregister failure",
         ));
     }
-    parsed.get("output").cloned().ok_or_else(|| {
+    parsed.get("output").cloned().ok_or({
         LiveUnregisterError::OutcomeUnknown("canonical unregister_project response omitted output")
     })
 }
@@ -552,7 +552,7 @@ fn remove_exact_registration(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::webcodex_cli::test_support::canonical_test_tempdir;
+    use crate::webcodex_cli::test_support::{canonical_test_tempdir, executable_test_tempdir};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -718,7 +718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_disconnect_accepts_legacy_agent_toml_only() {
+    async fn offline_disconnect_accepts_legacy_only_agent_toml() {
         let tmp = canonical_test_tempdir();
         let config = tmp.path().join("config");
         let state = tmp.path().join("state");
@@ -743,8 +743,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.outcome, "local_unregistered");
+        assert_eq!(result.runner_action, "not_running");
         assert!(profile_dir.join("agent.toml").is_file());
         assert!(!profile_dir.join("runner.toml").exists());
+        assert!(!profile_dir.join("project-registry/repo.toml").exists());
     }
 
     #[tokio::test]
@@ -774,7 +776,8 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("runner.toml"));
         assert!(error.contains("agent.toml"));
-        assert!(error.contains("refusing to guess"));
+        assert!(error.contains("legacy"), "{error}");
+        assert!(error.contains("remove or archive"), "{error}");
         assert!(profile_dir.join("project-registry/repo.toml").is_file());
     }
 
@@ -879,7 +882,7 @@ mod tests {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = canonical_test_tempdir();
+        let tmp = executable_test_tempdir();
         let config_base = tmp.path().join("config");
         let state_base = tmp.path().join("state");
         let project = tmp.path().join("repo");
@@ -900,12 +903,17 @@ mod tests {
         let registration = profile_dir.join("project-registry/repo.toml");
 
         let runner = tmp.path().join("webcodex-runner");
+        // Publish the stub atomically: a plain in-place write leaves a window
+        // where a concurrent writer of the same path makes execve fail with
+        // ETXTBSY under parallel test load.
+        let runner_stub = tmp.path().join("webcodex-runner.stub");
         std::fs::write(
-            &runner,
+            &runner_stub,
             "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
         )
         .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&runner_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&runner_stub, &runner).unwrap();
         assert_eq!(
             super::super::process::ensure_runner_unlocked(
                 &runner,
@@ -974,7 +982,7 @@ mod tests {
     async fn lost_unregister_response_reobserves_runner_removed_registration_as_absent() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = canonical_test_tempdir();
+        let tmp = executable_test_tempdir();
         let config_base = tmp.path().join("config");
         let state_base = tmp.path().join("state");
         let project = tmp.path().join("repo");
@@ -995,12 +1003,17 @@ mod tests {
         let registration = profile_dir.join("project-registry/repo.toml");
 
         let runner = tmp.path().join("webcodex-runner");
+        // Publish the stub atomically: a plain in-place write leaves a window
+        // where a concurrent writer of the same path makes execve fail with
+        // ETXTBSY under parallel test load.
+        let runner_stub = tmp.path().join("webcodex-runner.stub");
         std::fs::write(
-            &runner,
+            &runner_stub,
             "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
         )
         .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&runner_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&runner_stub, &runner).unwrap();
         assert_eq!(
             super::super::process::ensure_runner_unlocked(
                 &runner,
@@ -1129,14 +1142,19 @@ mod tests {
     fn last_project_disconnect_stops_managed_runner() {
         use std::os::unix::fs::PermissionsExt;
 
-        let tmp = canonical_test_tempdir();
+        let tmp = executable_test_tempdir();
         let runner = tmp.path().join("webcodex-runner");
+        // Publish the stub atomically: a plain in-place write leaves a window
+        // where a concurrent writer of the same path makes execve fail with
+        // ETXTBSY under parallel test load.
+        let runner_stub = tmp.path().join("webcodex-runner.stub");
         std::fs::write(
-            &runner,
+            &runner_stub,
             "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
         )
         .unwrap();
-        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&runner_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&runner_stub, &runner).unwrap();
         let config = tmp.path().join("runner.toml");
         std::fs::write(&config, "server_url='http://example.test'\n").unwrap();
         let state = tmp.path().join("state");

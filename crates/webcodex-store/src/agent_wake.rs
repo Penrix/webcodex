@@ -870,6 +870,8 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_wc_agent_wakes_target_state
                 ON wc_agent_wakes(target_agent_id, state, created_at_unix_ms, wake_id);
+            CREATE INDEX IF NOT EXISTS idx_wc_agent_wakes_target_created
+                ON wc_agent_wakes(target_agent_id, created_at_unix_ms, wake_id);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_wc_agent_wakes_one_queueable_inbox
                 ON wc_agent_wakes(target_agent_id)
                 WHERE trigger_kind = 'inbox_changed' AND state IN ('pending', 'claimed');
@@ -2406,7 +2408,7 @@ pub(super) fn coalesce_agent_wake_for_delivery(
         return Ok(wake_id);
     }
     let wake_id = allocate_identity(
-        &transaction,
+        transaction,
         AGENT_WAKE_ID_PREFIX,
         "SELECT EXISTS(SELECT 1 FROM wc_agent_wakes WHERE wake_id = ?1)",
     )?;

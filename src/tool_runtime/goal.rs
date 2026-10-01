@@ -5,8 +5,8 @@ use crate::auth::scopes::{
 };
 use crate::auth::{AuthContext, SCOPE_RUNTIME_READ};
 use crate::db::{
-    GoalCheckpoint, GoalCorrelationKind, GoalDetail, GoalLifecycle, GoalPatch, GoalStep,
-    GoalStoreError, NewGoal, MAX_GOAL_LIST_LIMIT,
+    AgentWakeState, GoalCheckpoint, GoalCorrelationKind, GoalDetail, GoalLifecycle, GoalPatch,
+    GoalStallHostDeliveryObservation, GoalStep, GoalStoreError, NewGoal, MAX_GOAL_LIST_LIMIT,
 };
 use serde::Serialize;
 use serde_json::{json, to_value};
@@ -34,6 +34,7 @@ pub(crate) struct GoalActivityObservation {
     pub available: bool,
     pub state: GoalActivityState,
     pub idle_threshold_ms: i64,
+    pub observation_lease_ms: i64,
     pub last_seen_at_ms: Option<i64>,
     pub last_meaningful_activity_at_ms: Option<i64>,
     pub quiet_for_ms: Option<i64>,
@@ -48,6 +49,7 @@ impl GoalActivityObservation {
             available: false,
             state,
             idle_threshold_ms: GOAL_ACTIVITY_ATTENTION_AFTER_MS,
+            observation_lease_ms: crate::db::GOAL_CARD_OBSERVATION_LEASE_MS,
             last_seen_at_ms: None,
             last_meaningful_activity_at_ms: None,
             quiet_for_ms: None,
@@ -65,12 +67,132 @@ impl GoalActivityObservation {
             available: true,
             state: GoalActivityState::NotApplicable,
             idle_threshold_ms: GOAL_ACTIVITY_ATTENTION_AFTER_MS,
+            observation_lease_ms: crate::db::GOAL_CARD_OBSERVATION_LEASE_MS,
             last_seen_at_ms: None,
             last_meaningful_activity_at_ms: None,
             quiet_for_ms: None,
             linked_window_count: None,
             active_meaningful_request_count: None,
             coverage_partial: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GoalContinuityState {
+    Ready,
+    Stalled,
+    WakeQueued,
+    Dispatching,
+    HostAccepted,
+    HostUnknown,
+    ResumeConfirmed,
+    NotConfigured,
+    NotApplicable,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GoalHostDeliveryState {
+    NotStarted,
+    Dispatching,
+    Accepted,
+    Unknown,
+    NotConfirmed,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GoalFreshTurnState {
+    NotConfirmed,
+    Confirmed,
+    NotApplicable,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct GoalContinuityObservation {
+    pub available: bool,
+    pub state: GoalContinuityState,
+    pub production_auto_resume_available: bool,
+    pub wake_state: Option<AgentWakeState>,
+    pub host_delivery: GoalHostDeliveryState,
+    pub fresh_turn: GoalFreshTurnState,
+    pub attention_candidate_at_unix_ms: Option<i64>,
+    pub attention_created_at_unix_ms: Option<i64>,
+    pub wake_created_at_unix_ms: Option<i64>,
+    pub host_dispatch_prepared_at_unix_ms: Option<i64>,
+    pub host_dispatch_accepted_at_unix_ms: Option<i64>,
+    pub host_dispatch_unknown_at_unix_ms: Option<i64>,
+    pub wake_consumed_at_unix_ms: Option<i64>,
+    pub first_post_resume_meaningful_at_unix_ms: Option<i64>,
+    pub last_post_resume_meaningful_at_unix_ms: Option<i64>,
+    pub last_resume_at_unix_ms: Option<i64>,
+}
+
+impl GoalContinuityObservation {
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            state: GoalContinuityState::Unavailable,
+            production_auto_resume_available: false,
+            wake_state: None,
+            host_delivery: GoalHostDeliveryState::NotApplicable,
+            fresh_turn: GoalFreshTurnState::NotApplicable,
+            attention_candidate_at_unix_ms: None,
+            attention_created_at_unix_ms: None,
+            wake_created_at_unix_ms: None,
+            host_dispatch_prepared_at_unix_ms: None,
+            host_dispatch_accepted_at_unix_ms: None,
+            host_dispatch_unknown_at_unix_ms: None,
+            wake_consumed_at_unix_ms: None,
+            first_post_resume_meaningful_at_unix_ms: None,
+            last_post_resume_meaningful_at_unix_ms: None,
+            last_resume_at_unix_ms: None,
+        }
+    }
+
+    fn not_configured() -> Self {
+        Self {
+            available: true,
+            state: GoalContinuityState::NotConfigured,
+            production_auto_resume_available: false,
+            wake_state: None,
+            host_delivery: GoalHostDeliveryState::NotApplicable,
+            fresh_turn: GoalFreshTurnState::NotApplicable,
+            attention_candidate_at_unix_ms: None,
+            attention_created_at_unix_ms: None,
+            wake_created_at_unix_ms: None,
+            host_dispatch_prepared_at_unix_ms: None,
+            host_dispatch_accepted_at_unix_ms: None,
+            host_dispatch_unknown_at_unix_ms: None,
+            wake_consumed_at_unix_ms: None,
+            first_post_resume_meaningful_at_unix_ms: None,
+            last_post_resume_meaningful_at_unix_ms: None,
+            last_resume_at_unix_ms: None,
+        }
+    }
+
+    fn not_applicable() -> Self {
+        Self {
+            available: true,
+            state: GoalContinuityState::NotApplicable,
+            production_auto_resume_available: false,
+            wake_state: None,
+            host_delivery: GoalHostDeliveryState::NotApplicable,
+            fresh_turn: GoalFreshTurnState::NotApplicable,
+            attention_candidate_at_unix_ms: None,
+            attention_created_at_unix_ms: None,
+            wake_created_at_unix_ms: None,
+            host_dispatch_prepared_at_unix_ms: None,
+            host_dispatch_accepted_at_unix_ms: None,
+            host_dispatch_unknown_at_unix_ms: None,
+            wake_consumed_at_unix_ms: None,
+            first_post_resume_meaningful_at_unix_ms: None,
+            last_post_resume_meaningful_at_unix_ms: None,
+            last_resume_at_unix_ms: None,
         }
     }
 }
@@ -94,11 +216,16 @@ pub(crate) struct GoalPlanProjection {
     pub agent_task_count: i64,
     pub workflow_session_count: i64,
     pub activity: GoalActivityObservation,
+    pub continuity: GoalContinuityObservation,
 }
 
-fn goal_plan_projection(goal: GoalDetail, activity: GoalActivityObservation) -> GoalPlanProjection {
+fn goal_plan_projection(
+    goal: GoalDetail,
+    activity: GoalActivityObservation,
+    continuity: GoalContinuityObservation,
+) -> GoalPlanProjection {
     GoalPlanProjection {
-        version: 2,
+        version: 3,
         goal_id: goal.summary.goal_id,
         title: goal.summary.title,
         total_step_count: goal.plan.steps.len(),
@@ -115,6 +242,7 @@ fn goal_plan_projection(goal: GoalDetail, activity: GoalActivityObservation) -> 
         agent_task_count: goal.summary.agent_task_count,
         workflow_session_count: goal.summary.workflow_session_count,
         activity,
+        continuity,
     }
 }
 
@@ -122,6 +250,155 @@ fn goal_principal(
     auth: Option<&AuthContext>,
 ) -> Result<crate::db::CommunicationPrincipal, ToolResult> {
     super::communication::communication_principal(auth)
+}
+
+fn goal_continuity_observation(
+    runtime: &ToolRuntime,
+    principal: &crate::db::CommunicationPrincipal,
+    goal: &GoalDetail,
+    activity: &GoalActivityObservation,
+) -> GoalContinuityObservation {
+    if goal.summary.lifecycle.terminal() {
+        return GoalContinuityObservation::not_applicable();
+    }
+    let Some(controller_agent_id) = goal.controller_agent_id.as_deref() else {
+        return GoalContinuityObservation::not_configured();
+    };
+    let Some(db) = runtime.communication_db.as_ref() else {
+        return GoalContinuityObservation::unavailable();
+    };
+    let agents = match db.list_agent_identities(principal, Some(controller_agent_id), 0, 1) {
+        Ok(page) => page.agents,
+        Err(_) => return GoalContinuityObservation::unavailable(),
+    };
+    let Some(agent) = agents.into_iter().next() else {
+        return GoalContinuityObservation::unavailable();
+    };
+    if agent.agent_id != controller_agent_id {
+        return GoalContinuityObservation::unavailable();
+    }
+    let production_auto_resume_available = agent.active_endpoint_count > 0
+        && runtime
+            .agent_continuations
+            .as_ref()
+            .is_some_and(|continuations| {
+                continuations.production_auto_resume_available(
+                    principal,
+                    controller_agent_id,
+                    agent.current_controller_generation,
+                )
+            });
+    if !activity.available || activity.coverage_partial {
+        return GoalContinuityObservation {
+            production_auto_resume_available,
+            ..GoalContinuityObservation::unavailable()
+        };
+    }
+    let attention_candidate_at_unix_ms = activity
+        .last_meaningful_activity_at_ms
+        .map(|last| last.saturating_add(GOAL_ACTIVITY_ATTENTION_AFTER_MS));
+    let durable = match db.read_goal_stall_continuity(
+        principal,
+        &goal.summary.goal_id,
+        activity.last_meaningful_activity_at_ms,
+        controller_agent_id,
+    ) {
+        Ok(observation) => observation,
+        Err(_) => return GoalContinuityObservation::unavailable(),
+    };
+    let Some(wake) = durable.current_wake else {
+        let resume = durable.last_resume.as_ref();
+        let (host_delivery, fresh_turn) = if let Some(resume) = resume {
+            let host_delivery = if resume.host_dispatch_accepted_at_unix_ms.is_some() {
+                GoalHostDeliveryState::Accepted
+            } else if resume.host_dispatch_unknown_at_unix_ms.is_some() {
+                GoalHostDeliveryState::Unknown
+            } else {
+                GoalHostDeliveryState::NotConfirmed
+            };
+            (host_delivery, GoalFreshTurnState::Confirmed)
+        } else {
+            (
+                GoalHostDeliveryState::NotStarted,
+                GoalFreshTurnState::NotConfirmed,
+            )
+        };
+        return GoalContinuityObservation {
+            available: true,
+            state: if activity.state == GoalActivityState::AttentionNeeded {
+                GoalContinuityState::Stalled
+            } else {
+                GoalContinuityState::Ready
+            },
+            production_auto_resume_available,
+            wake_state: None,
+            host_delivery,
+            fresh_turn,
+            attention_candidate_at_unix_ms: resume
+                .map(|value| value.attention_candidate_at_unix_ms)
+                .or(attention_candidate_at_unix_ms),
+            attention_created_at_unix_ms: resume.map(|value| value.attention_created_at_unix_ms),
+            wake_created_at_unix_ms: resume.map(|value| value.wake_created_at_unix_ms),
+            host_dispatch_prepared_at_unix_ms: resume
+                .and_then(|value| value.dispatch_prepared_at_unix_ms),
+            host_dispatch_accepted_at_unix_ms: resume
+                .and_then(|value| value.host_dispatch_accepted_at_unix_ms),
+            host_dispatch_unknown_at_unix_ms: resume
+                .and_then(|value| value.host_dispatch_unknown_at_unix_ms),
+            wake_consumed_at_unix_ms: resume.map(|value| value.consumed_at_unix_ms),
+            first_post_resume_meaningful_at_unix_ms: resume
+                .and_then(|value| value.first_post_resume_meaningful_at_unix_ms),
+            last_post_resume_meaningful_at_unix_ms: resume
+                .and_then(|value| value.last_post_resume_meaningful_at_unix_ms),
+            last_resume_at_unix_ms: resume.map(|value| value.consumed_at_unix_ms),
+        };
+    };
+    let state = match wake.state {
+        AgentWakeState::Pending | AgentWakeState::Claimed => GoalContinuityState::WakeQueued,
+        AgentWakeState::Prepared => GoalContinuityState::Dispatching,
+        AgentWakeState::Delivered => GoalContinuityState::HostAccepted,
+        AgentWakeState::DeliveryUnknown => GoalContinuityState::HostUnknown,
+        AgentWakeState::Consumed => GoalContinuityState::ResumeConfirmed,
+        AgentWakeState::Retired => GoalContinuityState::Stalled,
+    };
+    let host_delivery = match wake.state {
+        AgentWakeState::Pending | AgentWakeState::Claimed | AgentWakeState::Retired => {
+            GoalHostDeliveryState::NotStarted
+        }
+        AgentWakeState::Prepared => GoalHostDeliveryState::Dispatching,
+        AgentWakeState::Delivered => GoalHostDeliveryState::Accepted,
+        AgentWakeState::DeliveryUnknown => GoalHostDeliveryState::Unknown,
+        AgentWakeState::Consumed => match wake.host_delivery {
+            GoalStallHostDeliveryObservation::Accepted => GoalHostDeliveryState::Accepted,
+            GoalStallHostDeliveryObservation::Unknown => GoalHostDeliveryState::Unknown,
+            GoalStallHostDeliveryObservation::NotObserved => GoalHostDeliveryState::NotConfirmed,
+        },
+    };
+    GoalContinuityObservation {
+        available: true,
+        state,
+        production_auto_resume_available,
+        wake_state: Some(wake.state),
+        host_delivery,
+        fresh_turn: if wake.state == AgentWakeState::Consumed {
+            GoalFreshTurnState::Confirmed
+        } else {
+            GoalFreshTurnState::NotConfirmed
+        },
+        attention_candidate_at_unix_ms,
+        attention_created_at_unix_ms: Some(wake.attention_created_at_unix_ms),
+        wake_created_at_unix_ms: Some(wake.wake_created_at_unix_ms),
+        host_dispatch_prepared_at_unix_ms: wake.dispatch_prepared_at_unix_ms,
+        host_dispatch_accepted_at_unix_ms: wake.host_dispatch_accepted_at_unix_ms,
+        host_dispatch_unknown_at_unix_ms: wake.host_dispatch_unknown_at_unix_ms,
+        wake_consumed_at_unix_ms: wake.consumed_at_unix_ms,
+        first_post_resume_meaningful_at_unix_ms: wake.first_post_resume_meaningful_at_unix_ms,
+        last_post_resume_meaningful_at_unix_ms: wake.last_post_resume_meaningful_at_unix_ms,
+        last_resume_at_unix_ms: durable
+            .last_resume
+            .as_ref()
+            .map(|value| value.consumed_at_unix_ms),
+    }
 }
 
 fn goal_store_unavailable() -> ToolResult {
@@ -229,7 +506,158 @@ fn request_visibility_budget_available(
     })
 }
 
+const GOAL_RECOVERY_MAX_CANDIDATES: usize = 8;
+const GOAL_RECOVERY_MAX_TITLE_BYTES: usize = 256;
+const GOAL_RECOVERY_MAX_OBJECTIVE_BYTES: usize = 1_024;
+const GOAL_RECOVERY_MAX_CONDITION_ITEMS: usize = 8;
+const GOAL_RECOVERY_MAX_CONDITION_BYTES: usize = 256;
+const GOAL_RECOVERY_MAX_STEPS: usize = 32;
+const GOAL_RECOVERY_MAX_STEP_TITLE_BYTES: usize = 128;
+const GOAL_RECOVERY_MAX_CHECKPOINT_BYTES: usize = 512;
+
+fn bounded_goal_recovery_text(value: &str, max_bytes: usize) -> (String, bool) {
+    let redacted = super::sessions::redact_and_bound_instruction(value, usize::MAX);
+    let mut output = String::new();
+    let mut used = 0usize;
+    let mut changed = redacted != value;
+    for ch in redacted.chars() {
+        let safe = if ch.is_control() { ' ' } else { ch };
+        let width = safe.len_utf8();
+        if used.saturating_add(width) > max_bytes {
+            changed = true;
+            break;
+        }
+        if safe != ch {
+            changed = true;
+        }
+        output.push(safe);
+        used += width;
+    }
+    (output, changed)
+}
+
+fn goal_recovery_excerpt(value: Option<&str>, max_bytes: usize) -> serde_json::Value {
+    let Some(value) = value else {
+        return json!({"excerpt": null, "truncated": false});
+    };
+    let (excerpt, truncated) = bounded_goal_recovery_text(value, max_bytes);
+    json!({"excerpt": excerpt, "truncated": truncated})
+}
+
+fn goal_recovery_candidate(goal: &GoalDetail) -> serde_json::Value {
+    let (title, title_truncated) =
+        bounded_goal_recovery_text(&goal.summary.title, GOAL_RECOVERY_MAX_TITLE_BYTES);
+    json!({
+        "goal_id": goal.summary.goal_id,
+        "title": title,
+        "title_truncated": title_truncated,
+        "lifecycle": goal.summary.lifecycle.as_str(),
+        "revision": goal.summary.revision,
+    })
+}
+
+fn goal_recovery_detail(goal: &GoalDetail) -> serde_json::Value {
+    let (title, title_truncated) =
+        bounded_goal_recovery_text(&goal.summary.title, GOAL_RECOVERY_MAX_TITLE_BYTES);
+
+    let condition_total = goal.plan.completion_conditions.len();
+    let mut condition_content_truncated = false;
+    let conditions = goal
+        .plan
+        .completion_conditions
+        .iter()
+        .take(GOAL_RECOVERY_MAX_CONDITION_ITEMS)
+        .map(|condition| {
+            let (condition, truncated) =
+                bounded_goal_recovery_text(condition, GOAL_RECOVERY_MAX_CONDITION_BYTES);
+            condition_content_truncated |= truncated;
+            condition
+        })
+        .collect::<Vec<_>>();
+
+    let step_total = goal.plan.steps.len();
+    let steps = goal
+        .plan
+        .steps
+        .iter()
+        .take(GOAL_RECOVERY_MAX_STEPS)
+        .map(|step| {
+            let (title, title_truncated) =
+                bounded_goal_recovery_text(&step.title, GOAL_RECOVERY_MAX_STEP_TITLE_BYTES);
+            json!({
+                "id": step.id,
+                "title": title,
+                "title_truncated": title_truncated,
+                "status": step.status,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "goal_id": goal.summary.goal_id,
+        "title": title,
+        "title_truncated": title_truncated,
+        "lifecycle": goal.summary.lifecycle.as_str(),
+        "revision": goal.summary.revision,
+        "objective": goal_recovery_excerpt(
+            Some(&goal.objective),
+            GOAL_RECOVERY_MAX_OBJECTIVE_BYTES,
+        ),
+        "plan": {
+            "completion_conditions": {
+                "items": conditions,
+                "total": condition_total,
+                "returned": condition_total.min(GOAL_RECOVERY_MAX_CONDITION_ITEMS),
+                "truncated": condition_total > GOAL_RECOVERY_MAX_CONDITION_ITEMS,
+                "content_truncated": condition_content_truncated,
+            },
+            "steps": {
+                "items": steps,
+                "total": step_total,
+                "returned": step_total.min(GOAL_RECOVERY_MAX_STEPS),
+                "truncated": step_total > GOAL_RECOVERY_MAX_STEPS,
+            },
+            "current_step_id": goal.plan.current_step().map(|step| step.id.clone()),
+            "checkpoint": {
+                "summary": goal_recovery_excerpt(
+                    goal.plan.progress_summary.as_deref(),
+                    GOAL_RECOVERY_MAX_CHECKPOINT_BYTES,
+                ),
+                "at_unix_ms": goal.plan.checkpoint_at_unix_ms,
+            },
+        },
+    })
+}
+
 impl ToolRuntime {
+    pub(crate) async fn prepare_goal_workflow(
+        &self,
+        auth: Option<&AuthContext>,
+        session_id: String,
+        input: NewGoal,
+    ) -> ToolResult {
+        // Exact Workflow Session authority is a Runtime concern. Re-authorize its
+        // immutable creation fingerprint and any bound Project before touching Goal
+        // durable state; the Store receives only the validated canonical identity.
+        if let Err(result) = self
+            .authorize_session_target(&session_id, "prepare_goal_workflow", auth)
+            .await
+        {
+            return result;
+        }
+        let principal = match goal_principal(auth) {
+            Ok(principal) => principal,
+            Err(result) => return result,
+        };
+        let Some(db) = self.communication_db.as_ref() else {
+            return goal_store_unavailable();
+        };
+        match db.prepare_goal_workflow(&principal, &session_id, input) {
+            Ok(result) => serialized_goal_success(result),
+            Err(error) => goal_error(error, RecoveryKind::RetrySame),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn create_goal(
         &self,
@@ -523,6 +951,7 @@ impl ToolRuntime {
             available: true,
             state,
             idle_threshold_ms: GOAL_ACTIVITY_ATTENTION_AFTER_MS,
+            observation_lease_ms: crate::db::GOAL_CARD_OBSERVATION_LEASE_MS,
             last_seen_at_ms,
             last_meaningful_activity_at_ms,
             quiet_for_ms,
@@ -532,10 +961,11 @@ impl ToolRuntime {
         }
     }
 
-    /// Sparse Goal follow-up for an independently authorized exact Workflow
-    /// Session. This does not complete Goals or reuse Session authority as Goal
-    /// authority. Inaccessible Goal metadata is never exposed through closeout.
-    pub(crate) fn goal_follow_up_for_session(
+    /// Sparse active Goal context for an independently authorized exact Workflow
+    /// Session. Callers must authorize the Session separately; this projection
+    /// never turns Session correlation into Goal authority, chooses one Goal,
+    /// or completes Goals. Inaccessible Goal metadata is never exposed.
+    pub(crate) fn active_goal_context_for_session(
         &self,
         auth: Option<&AuthContext>,
         session_id: &str,
@@ -565,16 +995,65 @@ impl ToolRuntime {
         }
     }
 
-    pub(crate) async fn goal_plan_recheck_attention_for_window(
+    /// Bounded read-only Goal context for local/exact Workflow Session recovery.
+    /// The Session has already been independently authorized by the caller.
+    /// Only explicit active Goal correlations owned by the same principal are
+    /// considered; this never selects one of several Goals, mutates Goal liveness
+    /// or progress, creates work, or grants Goal/Session/Project authority.
+    pub(crate) fn recovery_goal_context_for_session(
         &self,
         auth: Option<&AuthContext>,
-        window: Option<&crate::client_window::ClientWindow>,
-        goal_id: String,
-    ) -> ToolResult {
-        self.goal_plan_recheck_attention_with_clock(auth, window, goal_id, || {
-            chrono::Utc::now().timestamp_millis()
-        })
-        .await
+        session_id: &str,
+    ) -> Option<serde_json::Value> {
+        if !auth.is_some_and(|auth| auth.has_scope(SCOPE_COMMUNICATION_READ)) {
+            return None;
+        }
+        let principal = goal_principal(auth).ok()?;
+        let Some(db) = self.communication_db.as_ref() else {
+            return Some(json!({
+                "version": 1,
+                "source": "explicit_workflow_session_correlation",
+                "status": "unavailable",
+                "reason_code": "store_unavailable",
+                "truncated": false,
+                "goal": null,
+                "candidates": [],
+            }));
+        };
+        match db.active_goals_for_workflow_session(
+            &principal,
+            session_id,
+            GOAL_RECOVERY_MAX_CANDIDATES,
+        ) {
+            Ok((goals, _)) if goals.is_empty() => None,
+            Ok((goals, truncated)) if goals.len() == 1 && !truncated => Some(json!({
+                "version": 1,
+                "source": "explicit_workflow_session_correlation",
+                "status": "available",
+                "reason_code": null,
+                "truncated": false,
+                "goal": goal_recovery_detail(&goals[0]),
+                "candidates": [],
+            })),
+            Ok((goals, truncated)) => Some(json!({
+                "version": 1,
+                "source": "explicit_workflow_session_correlation",
+                "status": "selection_required",
+                "reason_code": "multiple_active_goals",
+                "truncated": truncated,
+                "goal": null,
+                "candidates": goals.iter().map(goal_recovery_candidate).collect::<Vec<_>>(),
+            })),
+            Err(_) => Some(json!({
+                "version": 1,
+                "source": "explicit_workflow_session_correlation",
+                "status": "unavailable",
+                "reason_code": "store_unavailable",
+                "truncated": false,
+                "goal": null,
+                "candidates": [],
+            })),
+        }
     }
 
     #[cfg(test)]
@@ -682,7 +1161,7 @@ impl ToolRuntime {
             return ineligible();
         };
         let resolved = match self
-            .authorize_session_target(session_id, "goal_plan_recheck_attention", auth)
+            .authorize_session_target(session_id, "goal_plan_sync", auth)
             .await
         {
             Ok(Some(resolved)) => resolved,
@@ -754,8 +1233,9 @@ impl ToolRuntime {
         match db.read_goal(&principal, &goal_id) {
             Ok(goal) => {
                 let activity = self.goal_activity_observation_at(auth, &goal, now_ms).await;
+                let continuity = goal_continuity_observation(self, &principal, &goal, &activity);
                 serialized_goal_success(json!({
-                    "goal_plan": goal_plan_projection(goal, activity),
+                    "goal_plan": goal_plan_projection(goal, activity, continuity),
                 }))
             }
             Err(error) => goal_error(error, RecoveryKind::Reobserve),
@@ -768,7 +1248,7 @@ impl ToolRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) async fn goal_plan_state_at(
+    pub(crate) async fn goal_plan_sync_at(
         &self,
         auth: Option<&AuthContext>,
         goal_id: String,
@@ -785,12 +1265,50 @@ impl ToolRuntime {
         self.exact_goal_plan(auth, goal_id).await
     }
 
-    pub(crate) async fn goal_plan_state(
+    pub(crate) async fn goal_plan_sync_for_window(
         &self,
         auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
         goal_id: String,
     ) -> ToolResult {
-        self.exact_goal_plan(auth, goal_id).await
+        self.goal_plan_sync_for_window_at_inner(
+            auth,
+            window,
+            goal_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn goal_plan_sync_for_window_at(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        goal_id: String,
+        now_ms: i64,
+    ) -> ToolResult {
+        self.goal_plan_sync_for_window_at_inner(auth, window, goal_id, now_ms)
+            .await
+    }
+
+    async fn goal_plan_sync_for_window_at_inner(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        goal_id: String,
+        now_ms: i64,
+    ) -> ToolResult {
+        let attention = self
+            .goal_plan_recheck_attention_with_clock(auth, window, goal_id.clone(), || now_ms)
+            .await;
+        if !attention.success {
+            return attention;
+        }
+        // One App RPC owns both authoritative stall reconciliation and the
+        // post-reconciliation projection. The browser never supplies timing,
+        // Session, Window, controller, Project, or revision authority.
+        self.exact_goal_plan_at(auth, goal_id, now_ms).await
     }
 
     pub(crate) fn list_goals(

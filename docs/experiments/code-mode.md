@@ -195,14 +195,7 @@ this presentation policy changes no nested authority. Making
 `stop_job` directly callable in ordinary MCP/Adaptive does not change that
 allowlist. Query and mutation must not share a conditional-effect sidecar.
 
-An admitted E2a validation may return the same durable Job continuation. Retain
-it outside the cell. When terminal is a real dependency, use the ordinary
-`wait_for_job_terminal` primitive with a supported Host carrier; when work is
-independent, continue read/search/review. An ordinary outer observation can use
-`context_request=["jobs.attention"]` for bounded Project-level attention without
-logs or Session inference. Nested children still reject Server-owned sidecar and
-target overrides. Detailed observation and explicit `stop_job(confirm=true)`
-remain ordinary canonical calls, never nested Job controls.
+An admitted E2a validation may return `execution_state=pending` for the same durable execution. Its exact continuation is a fallback, not a command to poll. Keep independent read/search/review work in the same turn; ordinary **outer** model-facing calls with the exact Window/Project/Session may later carry sparse terminal `job_attention`. Nested children still have no Window and therefore receive no passive Job sidecar, so effect receipts, mutation fences, and validation-source semantics remain the only nested authority. `context_request=["jobs.attention"]` remains a separate bounded Project-level fallback. When terminal is the hard dependency and no independent work remains, use the ordinary continuation / `wait_for_job_terminal` path. Detailed `observe_jobs` and explicit `stop_job(confirm=true)` remain ordinary canonical calls, never nested Job controls. No Host automatic-resume capability is required for the normal pending path.
 
 ## Authority and Session model
 
@@ -217,6 +210,7 @@ project
 session_id
 recording_session_id
 ack_session_message_ids
+ack_ref
 context_request
 session_message_resolution
 expected_failure
@@ -389,7 +383,7 @@ Nested scheduling is owned by canonical `ToolDefinition`, not by JavaScript. `To
 
 ```text
 Denied      default, including unknown/future tools
-Sequential  cargo_check, cargo_test, apply_text_edits
+Sequential  cargo_check, cargo_test, edit_project_files
 Parallel    the exact E1 read allowlist
 ```
 
@@ -423,7 +417,7 @@ Composition performance telemetry is not effect truth. E2a therefore has a separ
       "tool": "cargo_check",
       "outcome": "job_handoff",
       "job_id": "...",
-      "continuation": {"tool": "observe_jobs", "arguments": {}}
+      "continuation": {"follow_up_kind": "fallback_recovery", "tool": "observe_jobs", "arguments": {}}
     }
   ]
 }
@@ -456,26 +450,26 @@ E2b adds a third experimental entry point, `code_mode_exec_mutating`, without re
 E2b admits exactly the E1 read set plus one existing canonical mutation primitive:
 
 ```text
-apply_text_edits
+edit_project_files
 ```
 
 It intentionally does **not** admit `cargo_check`, `cargo_test`, `cargo_fmt`, generic process/shell tools, `observe_jobs`, `apply_patch`, `write_project_file`, delete/Git/Session/Goal/Agent mutation, gateways, Computer control, deploy/release tools, or any Code Mode entry point. Validation therefore remains outside the mutation-capable cell in this phase. A normal workflow is `code_mode_exec_mutating` followed by ordinary canonical validation after the cell returns; E2b does not attempt workspace-snapshot fencing for background validation Jobs.
 
-`apply_text_edits` is canonically `Sequential`, but composition eligibility remains independent from frontend admission: E1 and E2a still cannot call it. One E2b cell may attempt a canonical mutation at most once. The budget is classified from canonical `ToolEffect::Mutate`, counts failed/pre-start attempts as attempts, and rejects a second mutation before canonical business dispatch. `apply_text_edits` already supports transactional multi-file batches, so E2b does not add an in-cell mutation retry engine or a second patch protocol.
+`edit_project_files` is canonically `Sequential`, but composition eligibility remains independent from frontend admission: E1 and E2a still cannot call it. One E2b cell may attempt a canonical mutation at most once. The budget is classified from canonical `ToolEffect::Mutate`, counts failed/pre-start attempts as attempts, and rejects a second mutation before canonical business dispatch. `edit_project_files` already supports transactional multi-file batches, so E2b does not add an in-cell mutation retry engine or a second patch protocol.
 
-Across independent Code Mode cells, orchestration-originated mutation is serialized by a small process-local registry keyed by the canonical resolved Project id. The Project fence is shared by cloned `ToolRuntime` state and is held only through the canonical mutation `ToolRuntime` result. Different Projects retain independent mutation lanes. Read-only orchestration and E2a validation do not acquire this fence, and ordinary direct `apply_text_edits` intentionally remains outside it. This is coarse Code Mode containment, not a global WebCodex write lock or generic resource-lock framework.
+Across independent Code Mode cells, orchestration-originated mutation is serialized by a small process-local registry keyed by the canonical resolved Project id. The Project fence is shared by cloned `ToolRuntime` state and is held only through the canonical mutation `ToolRuntime` result. Different Projects retain independent mutation lanes. Read-only orchestration and E2a validation do not acquire this fence, and ordinary direct `edit_project_files` intentionally remains outside it. This is coarse Code Mode containment, not a global WebCodex write lock or generic resource-lock framework.
 
 Mutation effect receipts preserve canonical state-change truth. A known mutation result is `known_result` only when the canonical child returns an authoritative boolean `state_changed`; otherwise the receipt fails closed to `outcome_unknown` and omits the field. Pre-start results that prove the mutation never began are not retained as effects. No-op and dry-run edits can therefore be known with `state_changed=false`, while a completed write carries `state_changed=true`. Parent JavaScript failure or frontend timeout does not erase a completed mutation; the same bounded five-second post-frontend reconciliation used by E2a either learns the canonical result or leaves the dispatched mutation `outcome_unknown`. E2b never retries automatically.
 
-Frozen final-change eligibility remains owned by canonical Session evidence. The outer E2b call has no generic top-level `state_changed` and does not itself set `repository_edit_observed`. A successful nested canonical `apply_text_edits` event with `state_changed=true` is the first-class `Edit` provenance; no-op, dry-run, pre-start failure, and outcome uncertainty do not become successful edit evidence. Once eligible, `present_work_result` still freezes the complete Session Git baseline → final workspace tree, including later or otherwise independently produced workspace changes; it is not a Code Mode provenance diff.
+Frozen final-change eligibility remains owned by canonical Session evidence. The outer E2b call has no generic top-level `state_changed` and does not itself set `repository_edit_observed`. A successful nested canonical `edit_project_files` event with `state_changed=true` is the first-class `Edit` provenance; no-op, dry-run, pre-start failure, and outcome uncertainty do not become successful edit evidence. Once eligible, `present_work_result` still freezes the complete Session Git baseline → final workspace tree, including later or otherwise independently produced workspace changes; it is not a Code Mode provenance diff.
 
 ### Original E2b live dogfood protocol (historical)
 
 Live E2b dogfood must run in an isolated managed worktree rather than the source checkout. First verify the three model-facing manifests still expose the intended stage controls: E1 as read-only `Observe / Read / PureRead / project:read`, E2a as `Execute / JobRun / NonIdempotent / job:run`, and E2b as `Mutate / ProjectWrite / NonIdempotent / project:write`.
 
-The minimum mutation cases are: one real `read_files -> read_revision -> apply_text_edits -> read_files` cell; a canonical no-op/dry-run with `state_changed=false`; a stale revision rejection that leaves newer workspace state intact; JavaScript failure after a successful write with a preserved `known_result/state_changed=true` receipt; two mutation calls proving only one crosses canonical dispatch; `finish_coding_task` / `present_work_result` proving real Session edit eligibility and full baseline-to-final workspace presentation; and denials for shell, validation, alternate mutation primitives, and recursive Code Mode.
+The minimum mutation cases are: one real `read_files -> read_revision -> edit_project_files -> read_files` cell; a canonical no-op/dry-run with `state_changed=false`; a stale revision rejection that leaves newer workspace state intact; JavaScript failure after a successful write with a preserved `known_result/state_changed=true` receipt; two mutation calls proving only one crosses canonical dispatch; `finish_coding_task` / `present_work_result` proving real Session edit eligibility and full baseline-to-final workspace presentation; and denials for shell, validation, alternate mutation primitives, and recursive Code Mode.
 
-Capture both call economy and effect truth: outer model-facing calls, nested calls, canonical edit calls, Runner file-write requests, Code Mode duration, `slot_wait_ms`, nested raw result bytes, returned bytes, consequential-call counters, known results, outcome uncertainty, and mutation `state_changed`. The value hypothesis is specifically whether one adaptive E2b call can replace the direct sequence `read_files -> model decision -> apply_text_edits -> model decision -> read/show_changes` without weakening canonical authority or evidence. Do not infer generic mutation safety or model-level speedup from local runtime tests alone.
+Capture both call economy and effect truth: outer model-facing calls, nested calls, canonical edit calls, Runner file-write requests, Code Mode duration, `slot_wait_ms`, nested raw result bytes, returned bytes, consequential-call counters, known results, outcome uncertainty, and mutation `state_changed`. The value hypothesis is specifically whether one adaptive E2b call can replace the direct sequence `read_files -> model decision -> edit_project_files -> model decision -> read/show_changes` without weakening canonical authority or evidence. Do not infer generic mutation safety or model-level speedup from local runtime tests alone.
 
 ### E2c v1 — Source observation before bounded coding
 
@@ -516,9 +510,9 @@ The launch marker travels in the **existing** structured validation Job metadata
 
 ### E2c public entry and ordering
 
-E2c evolves `code_mode_exec_mutating` rather than adding a fourth entry point. Its canonical envelope is `Mutate / ProjectWrite / Standard / NonIdempotent`, explicitly process-capable, with **RequireAll(project:write, job:run)**. Even an edit-only use of this experimental entry requires both scopes; direct `apply_text_edits` remains the narrower choice. Each child separately retains its canonical OAuth, permission, Project/Runner, Session, validation and Job checks. The outer envelope does not grant or synthesize child authority and still is not Edit provenance.
+E2c evolves `code_mode_exec_mutating` rather than adding a fourth entry point. Its canonical envelope is `Mutate / ProjectWrite / Standard / NonIdempotent`, explicitly process-capable, with **RequireAll(project:write, job:run)**. Even an edit-only use of this experimental entry requires both scopes; direct `edit_project_files` remains the narrower choice. Each child separately retains its canonical OAuth, permission, Project/Runner, Session, validation and Job checks. The outer envelope does not grant or synthesize child authority and still is not Edit provenance.
 
-Admission is exactly the E1 read set plus `apply_text_edits`, `cargo_check`, and `cargo_test`. At most one mutation attempt crosses the canonical boundary. Validators require a preceding successful, `known_result` canonical edit with boolean `state_changed`; failed or stale guards cannot be ignored by JavaScript to dispatch a validator. A successful no-op/dry-run (`state_changed=false`) permits validation of the unchanged mutable workspace, still with unproven source freshness. Receipt publication remains inside the sequential scheduling fence so a dependent validator cannot race it. The guarded-edit callable projection retains its existing stage key and derives the expanded tool set, input constraints, output fields, and ordering constraints from canonical ToolSpecs and the exact host policy.
+Admission is exactly the E1 read set plus `edit_project_files`, `cargo_check`, and `cargo_test`. At most one mutation attempt crosses the canonical boundary. Validators require a preceding successful, `known_result` canonical edit with boolean `state_changed`; failed or stale guards cannot be ignored by JavaScript to dispatch a validator. A successful no-op/dry-run (`state_changed=false`) permits validation of the unchanged mutable workspace, still with unproven source freshness. Receipt publication remains inside the sequential scheduling fence so a dependent validator cannot race it. The guarded-edit callable projection retains its existing stage key and derives the expanded tool set, input constraints, output fields, and ordering constraints from canonical ToolSpecs and the exact host policy.
 
 A Job handoff or unknown consequential outcome closes further consequential work in that cell. The cell must return; the outer workflow continues only the exact `effect_receipt.children[].job_id / continuation`. No Job terminal wait runs in JavaScript. A terminal validation failure is `known_result` with `success=false`; a successful execution may have `success=true` and `source_state.freshness=unproven` or `stale`. Receipt `success` is canonical business truth, not current-source proof. The outer ToolResult's success denotes JavaScript completion, not an aggregate assertion that all children passed or the source is current.
 
@@ -527,14 +521,14 @@ A typical cell is:
 ```javascript
 const read = await tools.read_files({items:[{path:"src/example.rs"}]});
 const revision = read.output.items[0].output.read_revision;
-const edit = await tools.apply_text_edits({changes:[{
-  path:"src/example.rs", expected_read_revision:revision,
-  old_text:"old", new_text:"new"
+const edit = await tools.edit_project_files({changes:[{
+  kind:"edit", path:"src/example.rs", expected_read_revision:revision,
+  edits:[{kind:"replace_exact", old_text:"old", new_text:"new"}]
 }]});
 if (!edit.success || typeof edit.output?.state_changed !== "boolean") {
   throw new Error("Inspect the edit recovery; do not validate a rejected edit");
 }
-const check = await tools.cargo_check({sync_wait_secs:1});
+const check = await tools.cargo_check({});
 text({state_changed:edit.output.state_changed, call_success:check.success,
       source_state:check.output?.source_state, job_handoff:!!check.output?.job_id});
 ```
@@ -562,7 +556,7 @@ E3/H1 are not added to any Code Mode allowlist. E1 remains read-only; E2a and E2
 ```text
 E1   read-only orchestration
 E2a  structured validation + Job/effect foundation
-E2b  retained guarded mutation foundation: one apply_text_edits attempt
+E2b  retained guarded mutation foundation: one edit_project_files attempt
 E2c  bounded adaptive read -> one guarded edit -> structured validation;
      scoped source observation, never a fabricated current-source proof
 E3   implemented generic asynchronous Job terminal attention v1

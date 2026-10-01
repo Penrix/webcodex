@@ -2,7 +2,7 @@ use super::sessions::SessionTransport;
 use super::specialized::{
     SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
 };
-use super::tool_call::{BrowserActToolCall, BrowserObserveToolCall};
+use super::tool_call::{BrowserActToolCall, BrowserBatchOperation, BrowserObserveToolCall};
 use super::{SuggestedToolCall, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::{
     AuthContext, SCOPE_BROWSER_CONTROL, SCOPE_BROWSER_LAUNCH, SCOPE_BROWSER_READ,
@@ -15,6 +15,48 @@ use std::time::Duration;
 const BROWSER_WAIT_SECS: u64 = 30;
 const MAX_BROWSER_TARGETS: usize = 64;
 const MAX_BROWSER_PAGES: usize = 32;
+
+fn browser_snapshot_payload(
+    browser_id: &str,
+    page_id: &str,
+    mode: &str,
+    max_nodes: Option<usize>,
+    max_depth: Option<u32>,
+) -> Value {
+    let mut payload = json!({
+        "browser_id": browser_id,
+        "page_id": page_id,
+    });
+    if mode != "auto" {
+        payload["mode"] = json!(mode);
+    }
+    if let Some(max_nodes) = max_nodes {
+        payload["max_nodes"] = json!(max_nodes);
+    }
+    if let Some(max_depth) = max_depth {
+        payload["max_depth"] = json!(max_depth);
+    }
+    payload
+}
+
+fn browser_diagnostics_payload(
+    browser_id: &str,
+    page_id: &str,
+    include_all_console: bool,
+    include_all_network: bool,
+    since_cursor: Option<u64>,
+) -> Value {
+    let mut payload = json!({
+        "browser_id": browser_id,
+        "page_id": page_id,
+        "include_all_console": include_all_console,
+        "include_all_network": include_all_network,
+    });
+    if let Some(since_cursor) = since_cursor {
+        payload["since_cursor"] = json!(since_cursor);
+    }
+    payload
+}
 
 fn browser_observe_policy(call: &BrowserObserveToolCall) -> SpecializedOperationPolicy {
     SpecializedOperationPolicy::read(
@@ -38,6 +80,18 @@ fn browser_act_policy(call: &BrowserActToolCall) -> SpecializedOperationPolicy {
             &[SCOPE_BROWSER_CONTROL, SCOPE_PROJECT_READ],
             "browser_file_upload",
         ),
+        BrowserActToolCall::Batch { operations, .. }
+            if operations
+                .iter()
+                .any(|o| matches!(o, BrowserBatchOperation::UploadFile { .. })) =>
+        {
+            SpecializedOperationPolicy::consequential_all(
+                SpecializedSource::Browser,
+                call.action_name(),
+                &[SCOPE_BROWSER_CONTROL, SCOPE_PROJECT_READ],
+                "browser_file_upload",
+            )
+        }
         _ => SpecializedOperationPolicy::consequential(
             SpecializedSource::Browser,
             call.action_name(),
@@ -172,11 +226,74 @@ impl ToolRuntime {
                 client_id,
                 browser_id,
                 page_id,
+                mode,
+                max_nodes,
+                max_depth,
             }) => {
                 self.dispatch_browser_request(
                     &client_id,
                     "browser_snapshot",
+                    browser_snapshot_payload(
+                        &browser_id,
+                        &page_id,
+                        mode.as_str(),
+                        max_nodes,
+                        max_depth,
+                    ),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Console {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_console",
                     json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Network {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_network",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    false,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserObserve(BrowserObserveToolCall::Diagnostics {
+                client_id,
+                browser_id,
+                page_id,
+                include_all_console,
+                include_all_network,
+                since_cursor,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_diagnostics",
+                    browser_diagnostics_payload(
+                        &browser_id,
+                        &page_id,
+                        include_all_console,
+                        include_all_network,
+                        since_cursor,
+                    ),
                     auth,
                     false,
                     BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
@@ -197,6 +314,51 @@ impl ToolRuntime {
                     BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
                 )
                 .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Batch {
+                client_id,
+                browser_id,
+                page_id,
+                operations,
+            }) => {
+                if operations.is_empty() || operations.len() > 32 {
+                    return browser_error(
+                        "invalid_batch_count",
+                        "batch requires 1..32 operations",
+                        "not_started",
+                        false,
+                        None,
+                    );
+                }
+                let mut payload_operations = Vec::with_capacity(operations.len());
+                for operation in operations {
+                    let mut payload =
+                        serde_json::to_value(&operation).expect("serializable Browser operation");
+                    if let BrowserBatchOperation::UploadFile { project, .. } = &operation {
+                        let resolved = match self.resolve_project_for_auth(project, auth).await {
+                            Ok(resolved) => resolved,
+                            Err(_) => {
+                                return browser_error(
+                                    "project_access_denied",
+                                    "caller cannot access the upload source project",
+                                    "not_started",
+                                    false,
+                                    None,
+                                )
+                            }
+                        };
+                        if resolved.client_id != client_id {
+                            return browser_error("project_runner_mismatch", "upload source project does not belong to the target Browser Runner", "not_started", false, None);
+                        }
+                        let object = payload.as_object_mut().expect("operation object");
+                        object.remove("project");
+                        object.insert("project_root".into(), json!(resolved.path));
+                    }
+                    payload_operations.push(payload);
+                }
+                self.dispatch_browser_request(&client_id, "browser_batch",
+                    json!({"browser_id": browser_id, "page_id": page_id, "operations": payload_operations}),
+                    auth, true, BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id)).await
             }
             ToolCall::BrowserAct(BrowserActToolCall::Launch { client_id }) => {
                 self.dispatch_browser_request(
@@ -233,6 +395,21 @@ impl ToolRuntime {
                     &client_id,
                     "browser_navigate",
                     json!({"browser_id": browser_id, "page_id": page_id, "url": url}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
+            ToolCall::BrowserAct(BrowserActToolCall::Reload {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_reload",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
                     auth,
                     true,
                     BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
@@ -390,6 +567,21 @@ impl ToolRuntime {
                 )
                 .await
             }
+            ToolCall::BrowserAct(BrowserActToolCall::ClearDiagnostics {
+                client_id,
+                browser_id,
+                page_id,
+            }) => {
+                self.dispatch_browser_request(
+                    &client_id,
+                    "browser_clear_diagnostics",
+                    json!({"browser_id": browser_id, "page_id": page_id}),
+                    auth,
+                    true,
+                    BrowserRecoveryContext::snapshot(&client_id, &browser_id, &page_id),
+                )
+                .await
+            }
             ToolCall::BrowserAct(BrowserActToolCall::ClosePage {
                 client_id,
                 browser_id,
@@ -441,7 +633,10 @@ impl ToolRuntime {
         for client in clients {
             let browser_observe = client.supports(RunnerFeature::BrowserObserve);
             let browser_control = client.supports(RunnerFeature::BrowserControl);
+            let browser_element_action_admission =
+                client.supports(RunnerFeature::BrowserElementActionAdmission);
             let browser_launch = client.supports(RunnerFeature::BrowserLaunch);
+            let browser_batch = client.supports(RunnerFeature::BrowserBatch);
             if !browser_observe && !browser_control && !browser_launch {
                 continue;
             }
@@ -457,6 +652,8 @@ impl ToolRuntime {
                 "capabilities": {
                     "browser_observe": browser_observe,
                     "browser_control": browser_control,
+                    "browser_element_action_admission": browser_element_action_admission,
+                    "browser_batch": browser_batch,
                     "browser_launch": browser_launch,
                 }
             }));
@@ -490,21 +687,37 @@ impl ToolRuntime {
                 None,
             );
         }
+        let requires_element_action_admission = matches!(
+            kind,
+            "browser_snapshot"
+                | "browser_click"
+                | "browser_input_text"
+                | "browser_select_option"
+                | "browser_set_value"
+                | "browser_upload_file"
+                | "browser_batch"
+        );
         let required_feature = match kind {
             "browser_list_browsers"
             | "browser_list_pages"
             | "browser_snapshot"
-            | "browser_screenshot" => RunnerFeature::BrowserObserve,
+            | "browser_screenshot"
+            | "browser_console"
+            | "browser_network"
+            | "browser_diagnostics" => RunnerFeature::BrowserObserve,
             "browser_launch" => RunnerFeature::BrowserLaunch,
             "browser_new_page"
             | "browser_navigate"
+            | "browser_reload"
             | "browser_click"
             | "browser_input_text"
             | "browser_select_option"
             | "browser_set_value"
             | "browser_upload_file"
+            | "browser_batch"
             | "browser_key"
             | "browser_close_page"
+            | "browser_clear_diagnostics"
             | "browser_close" => RunnerFeature::BrowserControl,
             _ => {
                 return browser_error(
@@ -547,6 +760,36 @@ impl ToolRuntime {
                 None,
             );
         }
+        if requires_element_action_admission
+            && !client.supports(RunnerFeature::BrowserElementActionAdmission)
+        {
+            return browser_error(
+                "capability_unavailable",
+                &format!(
+                    "target Runner does not advertise {}",
+                    RunnerFeature::BrowserElementActionAdmission.as_wire_name()
+                ),
+                "not_started",
+                false,
+                None,
+            );
+        }
+        if kind == "browser_batch" && !client.supports(RunnerFeature::BrowserBatch) {
+            return browser_error(
+                "capability_unavailable",
+                "target Runner does not advertise browser_batch",
+                "not_started",
+                false,
+                None,
+            );
+        }
+        // One operation is bounded by backend request deadlines. Leave room for
+        // its completion after the batch's 20-second dispatch budget expires.
+        let wait_secs = if kind == "browser_batch" {
+            120
+        } else {
+            BROWSER_WAIT_SECS
+        };
         let payload = match serde_json::to_string(&payload) {
             Ok(payload) => payload,
             Err(_) => {
@@ -568,7 +811,7 @@ impl ToolRuntime {
                 payload,
                 requested_by,
                 crate::runner_http::runner_access_from_auth(auth).as_ref(),
-                BROWSER_WAIT_SECS,
+                wait_secs,
             )
             .await
         {
@@ -583,54 +826,50 @@ impl ToolRuntime {
                 )
             }
         };
-        let response = match tokio::time::timeout(
-            Duration::from_secs(BROWSER_WAIT_SECS + 2),
-            receiver,
-        )
-        .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(_)) if effect => {
-                let dispatched = self
-                    .runner_registry
-                    .cancel_request_dispatch_state(&request_id)
-                    .await;
-                return browser_delivery_failure(
-                    "Runner response channel closed before a terminal Browser effect result",
-                    dispatched,
-                    recovery,
-                );
-            }
-            Err(_) if effect => {
-                let dispatched = self
-                    .runner_registry
-                    .cancel_request_dispatch_state(&request_id)
-                    .await;
-                return browser_delivery_failure(
-                    "Runner did not return a terminal Browser effect result in time",
-                    dispatched,
-                    recovery,
-                );
-            }
-            Ok(Err(_)) => {
-                return browser_error(
-                    "runner_disconnected",
-                    "Runner response channel closed",
-                    "not_started",
-                    false,
-                    None,
-                )
-            }
-            Err(_) => {
-                return browser_error(
-                    "runner_timeout",
-                    "Runner did not return Browser observation in time",
-                    "not_started",
-                    false,
-                    None,
-                )
-            }
-        };
+        let response =
+            match tokio::time::timeout(Duration::from_secs(wait_secs + 2), receiver).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) if effect => {
+                    let dispatched = self
+                        .runner_registry
+                        .cancel_request_dispatch_state(&request_id)
+                        .await;
+                    return browser_delivery_failure(
+                        "Runner response channel closed before a terminal Browser effect result",
+                        dispatched,
+                        recovery,
+                    );
+                }
+                Err(_) if effect => {
+                    let dispatched = self
+                        .runner_registry
+                        .cancel_request_dispatch_state(&request_id)
+                        .await;
+                    return browser_delivery_failure(
+                        "Runner did not return a terminal Browser effect result in time",
+                        dispatched,
+                        recovery,
+                    );
+                }
+                Ok(Err(_)) => {
+                    return browser_error(
+                        "runner_disconnected",
+                        "Runner response channel closed",
+                        "not_started",
+                        false,
+                        None,
+                    )
+                }
+                Err(_) => {
+                    return browser_error(
+                        "runner_timeout",
+                        "Runner did not return Browser observation in time",
+                        "not_started",
+                        false,
+                        None,
+                    )
+                }
+            };
         if let Some(error) = response.error.as_deref() {
             if effect {
                 return browser_delivery_failure(error, response.request_dispatched, recovery);
@@ -717,6 +956,7 @@ impl ToolRuntime {
             object.insert("state_changed".to_string(), Value::Bool(effect));
             return ToolResult::ok(result);
         }
+        let is_batch = kind == "browser_batch";
         let error = envelope.get("error").cloned().unwrap_or_else(|| json!({}));
         let kind = error
             .get("kind")
@@ -753,13 +993,41 @@ impl ToolRuntime {
         } else {
             None
         };
-        browser_error(
+        let mut result = browser_error(
             kind,
             message,
             execution_state,
             execution_state == "completed" && effect,
             recovery_value,
-        )
+        );
+        if is_batch {
+            if let (Some(output), Some(receipt)) = (
+                result.output.as_object_mut(),
+                envelope.get("result").and_then(Value::as_object),
+            ) {
+                if receipt
+                    .get("completed_count")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|count| count > 0)
+                {
+                    output.insert("state_changed".into(), Value::Bool(true));
+                }
+                for field in [
+                    "requested_count",
+                    "completed_count",
+                    "stopped_at_index",
+                    "remaining_count",
+                    "needs_snapshot",
+                    "stability",
+                    "stopped_execution_state",
+                ] {
+                    if let Some(value) = receipt.get(field) {
+                        output.insert(field.into(), value.clone());
+                    }
+                }
+            }
+        }
+        result
     }
 }
 
@@ -836,7 +1104,7 @@ impl BrowserRecoveryContext {
                 "client_id": self.client_id,
             }),
         };
-        SuggestedToolCall::new("browser_observe", arguments)
+        SuggestedToolCall::fallback_recovery("browser_observe", arguments)
     }
 
     fn to_recovery(&self, reason: &str) -> Value {
@@ -889,6 +1157,50 @@ fn browser_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enhanced_browser_payloads_preserve_legacy_default_wire_shape() {
+        let snapshot = browser_snapshot_payload(
+            "browser_abcdefghijklmnop",
+            "page_abcdefghijklmnop",
+            "auto",
+            None,
+            None,
+        );
+        assert_eq!(snapshot["browser_id"], "browser_abcdefghijklmnop");
+        assert_eq!(snapshot["page_id"], "page_abcdefghijklmnop");
+        assert!(snapshot.get("mode").is_none());
+        assert!(snapshot.get("max_nodes").is_none());
+        assert!(snapshot.get("max_depth").is_none());
+
+        let enhanced = browser_snapshot_payload(
+            "browser_abcdefghijklmnop",
+            "page_abcdefghijklmnop",
+            "interactive",
+            Some(48),
+            Some(10),
+        );
+        assert_eq!(enhanced["mode"], "interactive");
+        assert_eq!(enhanced["max_nodes"], 48);
+        assert_eq!(enhanced["max_depth"], 10);
+
+        let diagnostics = browser_diagnostics_payload(
+            "browser_abcdefghijklmnop",
+            "page_abcdefghijklmnop",
+            false,
+            false,
+            None,
+        );
+        assert!(diagnostics.get("since_cursor").is_none());
+        let delta = browser_diagnostics_payload(
+            "browser_abcdefghijklmnop",
+            "page_abcdefghijklmnop",
+            false,
+            false,
+            Some(42),
+        );
+        assert_eq!(delta["since_cursor"], 42);
+    }
 
     #[test]
     fn browser_policy_matrix_is_action_sensitive_and_never_shell_like() {
@@ -958,6 +1270,19 @@ mod tests {
         assert_eq!(upload.risk, "browser_file_upload");
         assert!(upload.write_like);
         assert!(!upload.shell_like);
+
+        let batch = browser_act_policy(&BrowserActToolCall::Batch {
+            client_id: "mini".into(),
+            browser_id: "browser_fixture".into(),
+            page_id: "page_fixture".into(),
+            operations: vec![BrowserBatchOperation::UploadFile {
+                element_id: "element_fixture".into(),
+                project: "agent:mini:resume".into(),
+                path: "resume.pdf".into(),
+            }],
+        });
+        assert_eq!(batch.authority, upload.authority);
+        assert_eq!(batch.risk, upload.risk);
     }
 
     #[test]

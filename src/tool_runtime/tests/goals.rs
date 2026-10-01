@@ -3,6 +3,7 @@ use crate::auth::scopes::{
     COMMUNICATION_MANAGE_SCOPES, COMMUNICATION_READ_SCOPES, SCOPE_COMMUNICATION_MANAGE,
     SCOPE_COMMUNICATION_READ, SCOPE_PROJECT_READ, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE,
 };
+use crate::tool_runtime::communication::communication_principal;
 use crate::tool_runtime::metadata::{
     ToolApprovalPolicy, ToolAuthorityPolicy, ToolEffect, ToolIdempotency, ToolRisk,
 };
@@ -72,6 +73,7 @@ async fn register_goal_activity_project(
     runtime
         .runner_registry
         .register(crate::runner_protocol::RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: Some(4),
@@ -216,6 +218,7 @@ fn goal_activity<'a>(result: &'a crate::tool_runtime::ToolResult) -> &'a serde_j
 fn goal_tools_are_control_only_and_never_declare_execution_authority() {
     for name in [
         "create_goal",
+        "prepare_goal_workflow",
         "get_goal",
         "present_goal_plan",
         "list_goals",
@@ -266,7 +269,7 @@ fn goal_tools_are_control_only_and_never_declare_execution_authority() {
         );
     }
 
-    let app_state = lookup_tool_definition("goal_plan_state").unwrap();
+    let app_state = lookup_tool_definition("goal_plan_sync").unwrap();
     assert!(app_state.model_spec.is_none());
     assert_eq!(app_state.category, "goal");
     assert_eq!(app_state.metadata.provider_id, "control");
@@ -276,25 +279,52 @@ fn goal_tools_are_control_only_and_never_declare_execution_authority() {
         None::<RunnerCapabilityRequirement>
     );
     assert!(!app_state.metadata.shell_like);
-    assert_eq!(app_state.metadata.effect, ToolEffect::Observe);
-    assert_eq!(app_state.metadata.risk, ToolRisk::Read);
-    assert_eq!(app_state.metadata.approval, ToolApprovalPolicy::None);
-    assert_eq!(app_state.metadata.idempotency, ToolIdempotency::PureRead);
+    assert_eq!(app_state.metadata.effect, ToolEffect::Mutate);
+    assert_eq!(app_state.metadata.risk, ToolRisk::WorkflowManage);
+    assert_eq!(app_state.metadata.approval, ToolApprovalPolicy::Standard);
+    assert_eq!(
+        app_state.metadata.idempotency,
+        ToolIdempotency::DesiredState
+    );
     assert_eq!(
         app_state.metadata.authority,
-        ToolAuthorityPolicy::RequireAll(COMMUNICATION_READ_SCOPES)
-    );
-
-    let session_link = lookup_tool_definition("associate_goal_workflow_session").unwrap();
-    assert_eq!(session_link.metadata.idempotency, ToolIdempotency::Keyed);
-    assert_eq!(
-        session_link.metadata.authority,
         ToolAuthorityPolicy::RequireAll(&[
             SCOPE_COMMUNICATION_READ,
             SCOPE_COMMUNICATION_MANAGE,
+            SCOPE_RUNTIME_READ,
             SCOPE_SESSION_COLLABORATE,
+            SCOPE_PROJECT_READ,
         ])
     );
+
+    for name in ["prepare_goal_workflow", "associate_goal_workflow_session"] {
+        let session_goal = lookup_tool_definition(name).unwrap();
+        assert_eq!(session_goal.metadata.effect, ToolEffect::Mutate, "{name}");
+        assert_eq!(
+            session_goal.metadata.risk,
+            ToolRisk::WorkflowManage,
+            "{name}"
+        );
+        assert_eq!(
+            session_goal.metadata.approval,
+            ToolApprovalPolicy::Standard,
+            "{name}"
+        );
+        assert_eq!(
+            session_goal.metadata.idempotency,
+            ToolIdempotency::Keyed,
+            "{name}"
+        );
+        assert_eq!(
+            session_goal.metadata.authority,
+            ToolAuthorityPolicy::RequireAll(&[
+                SCOPE_COMMUNICATION_READ,
+                SCOPE_COMMUNICATION_MANAGE,
+                SCOPE_SESSION_COLLABORATE,
+            ]),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -322,6 +352,72 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
         .iter()
         .any(|field| field == "controller_agent_id"));
 
+    let prepare = spec("prepare_goal_workflow");
+    assert_eq!(
+        prepare.input_schema["properties"]["session_id"]["pattern"],
+        "^(wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})|~s[1-9][0-9]{0,18})$"
+    );
+    assert_eq!(
+        prepare.input_schema["properties"]["title"]["maxLength"],
+        200
+    );
+    assert_eq!(
+        prepare.input_schema["properties"]["objective"]["maxLength"],
+        8192
+    );
+    assert_eq!(
+        prepare.input_schema["properties"]["controller_agent_id"]["pattern"],
+        "^wc_dagent_[A-Za-z0-9_-]{16}$"
+    );
+    assert_eq!(
+        prepare.input_schema["properties"]["idempotency_key"]["maxLength"],
+        128
+    );
+    let prepare_required = prepare.input_schema["required"].as_array().unwrap();
+    for required in ["session_id", "title", "objective", "idempotency_key"] {
+        assert!(
+            prepare_required.iter().any(|field| field == required),
+            "{required}"
+        );
+    }
+    for forbidden in [
+        "project",
+        "client_window",
+        "window",
+        "endpoint_id",
+        "expected_controller_generation",
+        "binding_id",
+        "host",
+        "recording_session_id",
+    ] {
+        assert!(
+            prepare.input_schema["properties"].get(forbidden).is_none(),
+            "prepare_goal_workflow accepted Host/Project selector {forbidden}"
+        );
+    }
+    let prepared_goal = &prepare.output_schema["properties"]["output"]["properties"]["goal"];
+    assert!(prepared_goal["properties"].get("correlations").is_some());
+    assert!(prepared_goal["properties"]
+        .get("controller_agent_id")
+        .is_some());
+    let prepared_serialized = serde_json::to_string(prepared_goal).unwrap();
+    for forbidden in [
+        "production_auto_resume_available",
+        "endpoint_id",
+        "binding_id",
+        "wake_id",
+        "consume_token",
+        "client_window",
+        "project_path",
+        "stdout",
+        "stderr",
+    ] {
+        assert!(
+            !prepared_serialized.contains(forbidden),
+            "prepare_goal_workflow output schema leaked {forbidden}"
+        );
+    }
+
     let update = spec("update_goal");
     assert_eq!(
         update.input_schema["properties"]["lifecycle"]["enum"],
@@ -339,7 +435,7 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
     let present = spec("present_goal_plan");
     assert_eq!(present.input_schema["required"], json!(["goal_id"]));
     let plan = &present.output_schema["properties"]["output"]["properties"]["goal_plan"];
-    assert_eq!(plan["properties"]["version"]["const"], 2);
+    assert_eq!(plan["properties"]["version"]["const"], 3);
     assert_eq!(
         plan["properties"]["activity"]["additionalProperties"],
         false
@@ -347,6 +443,10 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
     assert_eq!(
         plan["properties"]["activity"]["properties"]["idle_threshold_ms"]["const"],
         300_000
+    );
+    assert_eq!(
+        plan["properties"]["activity"]["properties"]["observation_lease_ms"]["const"],
+        75_000
     );
     assert_eq!(plan["properties"]["title"]["maxLength"], 200);
     assert!(plan["properties"].get("objective").is_none());
@@ -380,9 +480,8 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
         );
     }
     let app_specs = crate::tool_runtime::goal_plan_app_tool_specs();
-    assert_eq!(app_specs.len(), 2);
-    assert_eq!(app_specs[0].name, "goal_plan_state");
-    assert_eq!(app_specs[1].name, "goal_plan_recheck_attention");
+    assert_eq!(app_specs.len(), 1);
+    assert_eq!(app_specs[0].name, "goal_plan_sync");
     for app_spec in &app_specs {
         assert_eq!(app_spec.input_schema["required"], json!(["goal_id"]));
         assert_eq!(
@@ -464,7 +563,7 @@ fn goal_schemas_are_bounded_private_and_existing_coding_tools_do_not_accept_goal
     for existing in [
         "work_on_project",
         "read_files",
-        "apply_text_edits",
+        "edit_project_files",
         "run_process",
         "run_shell",
         "finish_coding_task",
@@ -528,6 +627,58 @@ fn goal_tool_calls_and_audit_keep_goal_identity_distinct_and_private_text_out_of
         "PRIVATE_GOAL_KEY_DO_NOT_LOG",
     ] {
         assert!(!serialized.contains(private), "Goal audit leaked {private}");
+    }
+
+    let prepare_session = "wc_sess_AAAAAAAAAAAAAAAA";
+    let prepare_call = ToolCall::from_tool_name(
+        "prepare_goal_workflow",
+        json!({
+            "session_id": prepare_session,
+            "title": "PRIVATE_PREPARE_TITLE_DO_NOT_LOG",
+            "objective": "PRIVATE_PREPARE_OBJECTIVE_DO_NOT_LOG",
+            "completion_conditions": ["PRIVATE_PREPARE_CONDITION_DO_NOT_LOG"],
+            "steps": [{"id": "implement", "title": "PRIVATE_PREPARE_STEP_DO_NOT_LOG"}],
+            "controller_agent_id": "wc_dagent_AAAAAAAAAAAAAAAA",
+            "idempotency_key": "PRIVATE_PREPARE_KEY_DO_NOT_LOG"
+        }),
+    )
+    .unwrap();
+    assert_eq!(prepare_call.tool_name(), "prepare_goal_workflow");
+    assert_eq!(prepare_call.session_id(), None);
+    let prepare_audit = crate::tool_runtime::tool_audit::session_log_arguments_for_tool_request(
+        "prepare_goal_workflow",
+        &json!({
+            "session_id": prepare_session,
+            "title": "PRIVATE_PREPARE_TITLE_DO_NOT_LOG",
+            "objective": "PRIVATE_PREPARE_OBJECTIVE_DO_NOT_LOG",
+            "completion_conditions": ["PRIVATE_PREPARE_CONDITION_DO_NOT_LOG"],
+            "steps": [{"id": "implement", "title": "PRIVATE_PREPARE_STEP_DO_NOT_LOG"}],
+            "controller_agent_id": "wc_dagent_AAAAAAAAAAAAAAAA",
+            "idempotency_key": "PRIVATE_PREPARE_KEY_DO_NOT_LOG"
+        }),
+    );
+    assert_eq!(prepare_audit["session_id"], prepare_session);
+    assert_eq!(
+        prepare_audit["controller_agent_id"],
+        "wc_dagent_AAAAAAAAAAAAAAAA"
+    );
+    assert_eq!(prepare_audit["idempotency_key_present"], true);
+    assert_eq!(
+        prepare_audit["objective_bytes"],
+        "PRIVATE_PREPARE_OBJECTIVE_DO_NOT_LOG".len()
+    );
+    let serialized_prepare_audit = serde_json::to_string(&prepare_audit).unwrap();
+    for private in [
+        "PRIVATE_PREPARE_TITLE_DO_NOT_LOG",
+        "PRIVATE_PREPARE_OBJECTIVE_DO_NOT_LOG",
+        "PRIVATE_PREPARE_CONDITION_DO_NOT_LOG",
+        "PRIVATE_PREPARE_STEP_DO_NOT_LOG",
+        "PRIVATE_PREPARE_KEY_DO_NOT_LOG",
+    ] {
+        assert!(
+            !serialized_prepare_audit.contains(private),
+            "prepare_goal_workflow audit leaked {private}"
+        );
     }
 
     let plan_audit = crate::tool_runtime::tool_audit::session_log_arguments_for_tool_request(
@@ -644,6 +795,255 @@ fn goal_runtime_crud_replay_and_exact_read_hide_foreign_existence() {
     assert!(update_replay.success);
     assert_eq!(update_replay.output["replayed"], true);
     assert_eq!(update_replay.output["goal"]["summary"]["revision"], 2);
+}
+
+#[tokio::test]
+async fn prepare_goal_workflow_reauthorizes_session_project_controller_and_stays_host_neutral() {
+    let (temp, db, runtime) = runtime_with_goal_activity_db();
+    let owner = goal_activity_auth("prepare-goal-owner");
+    let foreign = goal_activity_auth("prepare-goal-foreign");
+    let project = register_goal_activity_project(
+        &runtime,
+        "prepare-goal-runner",
+        "prepare-goal-owner",
+        "demo",
+        temp.path(),
+    )
+    .await;
+    let session = start_goal_activity_session(&runtime, &owner, &project, "Prepare Goal Session");
+
+    let controller = runtime.create_agent_identity(
+        Some(&owner),
+        "prepare-goal-controller".to_string(),
+        "Prepare Goal Controller".to_string(),
+        None,
+        Vec::new(),
+        "prepare-goal-controller-create".to_string(),
+    );
+    assert!(controller.success, "{:?}", controller.output);
+    let controller_id = controller.output["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let input = |key: &str, controller_agent_id: Option<String>| crate::db::NewGoal {
+        completion_conditions: vec!["Exact Session remains the initial correlation".to_string()],
+        steps: vec![crate::db::NewGoalStep {
+            id: "implement".to_string(),
+            title: "Implement composition".to_string(),
+        }],
+        title: "Prepare Goal Workflow".to_string(),
+        objective: "Atomically admit durable Goal workflow state without Host coupling."
+            .to_string(),
+        controller_agent_id,
+        idempotency_key: key.to_string(),
+    };
+
+    let prepared = runtime
+        .prepare_goal_workflow(
+            Some(&owner),
+            session.session_id.clone(),
+            input("prepare-runtime", Some(controller_id.clone())),
+        )
+        .await;
+    assert!(prepared.success, "{:?}", prepared.output);
+    assert_eq!(prepared.output["created"], true);
+    assert_eq!(prepared.output["replayed"], false);
+    assert_eq!(prepared.output["state_changed"], true);
+    assert_eq!(prepared.output["goal"]["summary"]["revision"], 1);
+    assert_eq!(
+        prepared.output["goal"]["summary"]["workflow_session_count"],
+        1
+    );
+    assert_eq!(
+        prepared.output["goal"]["controller_agent_id"],
+        controller_id
+    );
+    assert_eq!(
+        prepared.output["goal"]["correlations"],
+        json!([{
+            "kind": "workflow_session",
+            "reference_id": session.session_id,
+            "created_at_unix_ms": prepared.output["goal"]["summary"]["created_at_unix_ms"],
+        }])
+    );
+    for host_specific in [
+        "endpoint_id",
+        "binding_id",
+        "wake_id",
+        "consume_token",
+        "client_window",
+        "production_auto_resume_available",
+    ] {
+        assert!(
+            !prepared.output.to_string().contains(host_specific),
+            "prepare output leaked Host-specific field {host_specific}"
+        );
+    }
+
+    let replay = runtime
+        .prepare_goal_workflow(
+            Some(&owner),
+            session.session_id.clone(),
+            input("prepare-runtime", Some(controller_id)),
+        )
+        .await;
+    assert!(replay.success, "{:?}", replay.output);
+    assert_eq!(replay.output["created"], false);
+    assert_eq!(replay.output["replayed"], true);
+    assert_eq!(replay.output["state_changed"], false);
+    assert_eq!(
+        replay.output["goal"]["summary"]["goal_id"],
+        prepared.output["goal"]["summary"]["goal_id"]
+    );
+    assert_eq!(replay.output["goal"]["summary"]["revision"], 1);
+
+    let omitted = runtime
+        .dispatch_with_auth(
+            ToolCall::PrepareGoalWorkflow {
+                session_id: session.session_id.clone(),
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
+                title: "Prepare Goal Workflow via generic dispatcher".to_string(),
+                objective: "Prove canonical ToolRuntime dispatch needs no MCP/App context."
+                    .to_string(),
+                controller_agent_id: None,
+                idempotency_key: "prepare-runtime-no-controller".to_string(),
+            },
+            Some(&owner),
+        )
+        .await;
+    assert!(omitted.success, "{:?}", omitted.output);
+    assert!(omitted.output["goal"]["controller_agent_id"].is_null());
+    assert_eq!(omitted.output["goal"]["summary"]["revision"], 1);
+
+    let foreign_controller = runtime.create_agent_identity(
+        Some(&foreign),
+        "prepare-foreign-controller".to_string(),
+        "Prepare Foreign Controller".to_string(),
+        None,
+        Vec::new(),
+        "prepare-foreign-controller-create".to_string(),
+    );
+    assert!(
+        foreign_controller.success,
+        "{:?}",
+        foreign_controller.output
+    );
+    let foreign_controller_id = foreign_controller.output["agent"]["agent_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let foreign_controller_error = runtime
+        .prepare_goal_workflow(
+            Some(&owner),
+            session.session_id.clone(),
+            input("prepare-foreign-controller", Some(foreign_controller_id)),
+        )
+        .await;
+    let missing_controller_error = runtime
+        .prepare_goal_workflow(
+            Some(&owner),
+            session.session_id.clone(),
+            input(
+                "prepare-missing-controller",
+                Some("wc_dagent_________________".to_string()),
+            ),
+        )
+        .await;
+    assert!(!foreign_controller_error.success);
+    assert!(!missing_controller_error.success);
+    assert_eq!(
+        foreign_controller_error.output["error_kind"],
+        "agent_not_found"
+    );
+    assert_eq!(
+        missing_controller_error.output["error_kind"],
+        foreign_controller_error.output["error_kind"]
+    );
+    assert_eq!(
+        missing_controller_error.error,
+        foreign_controller_error.error
+    );
+
+    let owner_goal_count = db
+        .list_goals(
+            &communication_principal(Some(&owner)).unwrap(),
+            None,
+            0,
+            100,
+        )
+        .unwrap()
+        .total_count;
+    let foreign_session_error = runtime
+        .prepare_goal_workflow(
+            Some(&foreign),
+            session.session_id.clone(),
+            input("prepare-foreign-session", None),
+        )
+        .await;
+    assert!(!foreign_session_error.success);
+    assert_eq!(
+        db.list_goals(
+            &communication_principal(Some(&owner)).unwrap(),
+            None,
+            0,
+            100,
+        )
+        .unwrap()
+        .total_count,
+        owner_goal_count
+    );
+
+    let revoked_project = register_goal_activity_project(
+        &runtime,
+        "prepare-goal-runner",
+        "different-project-owner",
+        "demo",
+        temp.path(),
+    )
+    .await;
+    assert_eq!(revoked_project, project);
+    assert!(runtime
+        .resolve_project_input_for_auth(&project, Some(&owner))
+        .await
+        .is_err());
+    let revoked = runtime
+        .prepare_goal_workflow(
+            Some(&owner),
+            session.session_id.clone(),
+            input("prepare-revoked-project", None),
+        )
+        .await;
+    assert!(!revoked.success);
+    assert_eq!(
+        db.list_goals(
+            &communication_principal(Some(&owner)).unwrap(),
+            None,
+            0,
+            100,
+        )
+        .unwrap()
+        .total_count,
+        owner_goal_count
+    );
+
+    let conn = db.conn_for_tests();
+    for table in [
+        "wc_agent_endpoints",
+        "wc_agent_wakes",
+        "wc_agent_wake_attempts",
+    ] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "prepare_goal_workflow mutated Host carrier table {table}"
+        );
+    }
 }
 
 #[test]
@@ -773,7 +1173,7 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
     let initial = runtime.present_goal_plan(Some(&bob), goal_id.clone()).await;
     assert!(initial.success, "{:?}", initial.output);
     let plan = &initial.output["goal_plan"];
-    assert_eq!(plan["version"], 2);
+    assert_eq!(plan["version"], 3);
     assert_eq!(plan["goal_id"], goal_id);
     assert_eq!(plan["lifecycle"], "active");
     assert_eq!(plan["revision"], 1);
@@ -784,6 +1184,13 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
     assert_eq!(plan["activity"]["state"], "unobserved");
     assert!(plan["activity"]["last_seen_at_ms"].is_null());
     assert!(plan["activity"]["linked_window_count"].is_null());
+    assert_eq!(plan["continuity"]["available"], false);
+    assert_eq!(plan["continuity"]["state"], "unavailable");
+    assert_eq!(
+        plan["continuity"]["production_auto_resume_available"],
+        false
+    );
+    assert!(plan["continuity"]["wake_state"].is_null());
     assert!(plan["terminal_at_unix_ms"].is_null());
     assert_eq!(
         plan.as_object()
@@ -803,6 +1210,7 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
             "steps",
             "progress_summary",
             "checkpoint_at_unix_ms",
+            "continuity",
             "revision",
             "terminal_at_unix_ms",
             "title",
@@ -815,7 +1223,7 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
         .collect()
     );
 
-    let polled = runtime.goal_plan_state(Some(&bob), goal_id.clone()).await;
+    let polled = runtime.present_goal_plan(Some(&bob), goal_id.clone()).await;
     assert!(polled.success);
     assert_eq!(polled.output["goal_plan"]["revision"], 1);
     assert_eq!(
@@ -823,9 +1231,11 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
         1
     );
 
-    let foreign = runtime.goal_plan_state(Some(&alice), goal_id.clone()).await;
+    let foreign = runtime
+        .present_goal_plan(Some(&alice), goal_id.clone())
+        .await;
     let missing = runtime
-        .goal_plan_state(Some(&alice), "wc_goal_________________".to_string())
+        .present_goal_plan(Some(&alice), "wc_goal_________________".to_string())
         .await;
     assert!(!foreign.success);
     assert!(!missing.success);
@@ -843,7 +1253,7 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
         "bob-plan-update".to_string(),
     );
     assert!(updated.success, "{:?}", updated.output);
-    let after_update = runtime.goal_plan_state(Some(&bob), goal_id.clone()).await;
+    let after_update = runtime.present_goal_plan(Some(&bob), goal_id.clone()).await;
     assert!(after_update.success);
     assert_eq!(after_update.output["goal_plan"]["revision"], 2);
     assert_eq!(
@@ -867,7 +1277,7 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
         "bob-plan-complete".to_string(),
     );
     assert!(completed.success, "{:?}", completed.output);
-    let terminal = runtime.goal_plan_state(Some(&bob), goal_id.clone()).await;
+    let terminal = runtime.present_goal_plan(Some(&bob), goal_id.clone()).await;
     assert!(terminal.success);
     assert_eq!(terminal.output["goal_plan"]["lifecycle"], "completed");
     assert_eq!(terminal.output["goal_plan"]["revision"], 3);
@@ -880,6 +1290,14 @@ async fn goal_plan_projection_is_exact_pure_revisioned_terminal_and_existence_hi
         "not_applicable"
     );
     assert_eq!(terminal.output["goal_plan"]["activity"]["available"], false);
+    assert_eq!(
+        terminal.output["goal_plan"]["continuity"]["state"],
+        "not_applicable"
+    );
+    assert_eq!(
+        terminal.output["goal_plan"]["continuity"]["fresh_turn"],
+        "not_applicable"
+    );
     assert!(terminal.output["goal_plan"]["terminal_at_unix_ms"].is_i64());
     assert_eq!(
         runtime.get_goal(Some(&bob), goal_id).output["goal"]["summary"]["revision"],
@@ -931,7 +1349,7 @@ async fn goal_activity_tracks_window_wide_work_and_separates_seen_from_meaningfu
         old,
     );
     let stale = runtime
-        .goal_plan_state_at(Some(&auth), goal_id.clone(), now)
+        .goal_plan_sync_at(Some(&auth), goal_id.clone(), now)
         .await;
     assert!(stale.success, "{:?}", stale.output);
     assert_eq!(goal_activity(&stale)["state"], "attention_needed");
@@ -946,13 +1364,13 @@ async fn goal_activity_tracks_window_wide_work_and_separates_seen_from_meaningfu
         &auth,
         "goal-window-wide",
         &project_a,
-        "goal_plan_state",
+        "goal_plan_sync",
         false,
         None,
         poll_at,
     );
     let polled = runtime
-        .goal_plan_state_at(Some(&auth), goal_id.clone(), now)
+        .goal_plan_sync_at(Some(&auth), goal_id.clone(), now)
         .await;
     assert_eq!(goal_activity(&polled)["state"], "attention_needed");
     assert_eq!(goal_activity(&polled)["last_seen_at_ms"], poll_at + 1);
@@ -974,7 +1392,7 @@ async fn goal_activity_tracks_window_wide_work_and_separates_seen_from_meaningfu
         None,
         recent,
     );
-    let refreshed = runtime.goal_plan_state_at(Some(&auth), goal_id, now).await;
+    let refreshed = runtime.goal_plan_sync_at(Some(&auth), goal_id, now).await;
     assert_eq!(goal_activity(&refreshed)["state"], "active");
     assert_eq!(
         goal_activity(&refreshed)["last_meaningful_activity_at_ms"],
@@ -1008,7 +1426,7 @@ async fn goal_activity_is_unobserved_without_windows_and_inflight_work_prevents_
     let now = 20_000_000;
 
     let unobserved = runtime
-        .goal_plan_state_at(Some(&auth), goal_id.clone(), now)
+        .goal_plan_sync_at(Some(&auth), goal_id.clone(), now)
         .await;
     assert_eq!(goal_activity(&unobserved)["state"], "unobserved");
     assert_eq!(goal_activity(&unobserved)["linked_window_count"], 0);
@@ -1029,7 +1447,7 @@ async fn goal_activity_is_unobserved_without_windows_and_inflight_work_prevents_
         );
     }
     let multi = runtime
-        .goal_plan_state_at(Some(&auth), goal_id.clone(), now)
+        .goal_plan_sync_at(Some(&auth), goal_id.clone(), now)
         .await;
     assert_eq!(goal_activity(&multi)["state"], "active");
     assert_eq!(goal_activity(&multi)["linked_window_count"], 2);
@@ -1047,7 +1465,7 @@ async fn goal_activity_is_unobserved_without_windows_and_inflight_work_prevents_
     );
     guard.update(Some("run_process"), Some(&project));
     let running = runtime
-        .goal_plan_state_at(Some(&auth), goal_id.clone(), later)
+        .goal_plan_sync_at(Some(&auth), goal_id.clone(), later)
         .await;
     assert_eq!(goal_activity(&running)["state"], "active");
     assert_eq!(
@@ -1070,9 +1488,7 @@ async fn goal_activity_is_unobserved_without_windows_and_inflight_work_prevents_
         "goal-inflight-terminal".to_string(),
     );
     assert!(completed.success, "{:?}", completed.output);
-    let terminal = runtime
-        .goal_plan_state_at(Some(&auth), goal_id, later)
-        .await;
+    let terminal = runtime.goal_plan_sync_at(Some(&auth), goal_id, later).await;
     assert_eq!(goal_activity(&terminal)["state"], "not_applicable");
     assert!(goal_activity(&terminal)["active_meaningful_request_count"].is_null());
     drop(guard);
@@ -1143,7 +1559,7 @@ async fn goal_activity_respects_principal_project_visibility_and_runtime_read_sc
         now - 5_000,
     );
     let projected = runtime
-        .goal_plan_state_at(Some(&alice), goal_id.clone(), now)
+        .goal_plan_sync_at(Some(&alice), goal_id.clone(), now)
         .await;
     assert_eq!(goal_activity(&projected)["state"], "unobserved");
     assert_eq!(goal_activity(&projected)["coverage_partial"], true);
@@ -1158,7 +1574,7 @@ async fn goal_activity_respects_principal_project_visibility_and_runtime_read_sc
         .scopes
         .retain(|scope| scope != SCOPE_RUNTIME_READ);
     let unavailable = runtime
-        .goal_plan_state_at(Some(&no_runtime_read), goal_id, now)
+        .goal_plan_sync_at(Some(&no_runtime_read), goal_id, now)
         .await;
     assert!(unavailable.success, "{:?}", unavailable.output);
     let activity = goal_activity(&unavailable);
@@ -1210,7 +1626,7 @@ async fn goal_activity_bounded_partial_window_scan_never_manufactures_attention(
             now - (10 + index as i64) * 60_000,
         );
     }
-    let projection = runtime.goal_plan_state_at(Some(&auth), goal_id, now).await;
+    let projection = runtime.goal_plan_sync_at(Some(&auth), goal_id, now).await;
     let activity = goal_activity(&projection);
     assert_eq!(activity["available"], true);
     assert_eq!(activity["coverage_partial"], true);
@@ -1236,7 +1652,7 @@ async fn goal_plan_projection_fails_closed_on_malformed_persisted_goal() {
             .unwrap();
     }
     let presented = runtime.present_goal_plan(Some(&bob), goal_id.clone()).await;
-    let polled = runtime.goal_plan_state(Some(&bob), goal_id).await;
+    let polled = runtime.present_goal_plan(Some(&bob), goal_id).await;
     assert!(!presented.success);
     assert!(!polled.success);
     assert_eq!(presented.output["error_kind"], "goal_store_unavailable");

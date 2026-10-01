@@ -12,6 +12,17 @@ fn canonical_result_presentation_changes_only_is_error() {
     assert_eq!(cargo_diagnostics.returned_diagnostic_count, 1);
     let results = [
         ToolResult::ok(json!({"count": 2})),
+        ToolResult::ok(
+            json!({"changed":true,"files":[{"path":"x","read_revision":8535043794784493_u64}]}),
+        ),
+        ToolResult::ok(json!({"execution_state":"pending","continuation":{
+            "follow_up_kind":"fallback_recovery","tool":"observe_jobs",
+            "arguments":{"items":[{"job_id":"job-probe","after_observation_token":"opaque"}]}
+        }})),
+        ToolResult::ok(json!({"output_truncated":true,"suggested_call":{
+            "follow_up_kind":"mechanically_followable","tool":"read_files",
+            "arguments":{"project":"agent:r:p","items":[{"path":"x","start_line":20,"expected_read_revision":8535043794784493_u64}]}
+        }})),
         ToolResult::err_with_output(
             "exact target matched multiple locations",
             json!({
@@ -21,7 +32,7 @@ fn canonical_result_presentation_changes_only_is_error() {
                 "match_count": 2,
                 "candidate_ranges": [{"start_line": 10, "end_line": 10}, {"start_line": 20, "end_line": 20}],
                 "conflicting_edit_indices": [0, 1],
-                "recovery": {"tool": "read_files", "arguments": {"project": "agent:r:p", "items": [{"path": "probe.txt"}]}}
+                "recovery": {"follow_up_kind": "mechanically_followable", "tool": "read_files", "arguments": {"project": "agent:r:p", "items": [{"path": "probe.txt"}]}}
             }),
         ),
         // Canonical process output intentionally does not echo expectation inputs.
@@ -49,7 +60,7 @@ fn canonical_result_presentation_changes_only_is_error() {
                 "execution_state": "outcome_unknown", "dispatch_certainty": "outcome_unknown",
                 "state_changed": null, "failure_kind": "outcome_unknown",
                 "recovery_kind": "reconcile",
-                "recovery": {"tool": "observe_jobs", "arguments": {"items": [{"job_id": "job-probe"}]}}
+                "recovery": {"follow_up_kind": "fallback_recovery", "tool": "observe_jobs", "arguments": {"items": [{"job_id": "job-probe"}]}}
             }),
         ),
     ];

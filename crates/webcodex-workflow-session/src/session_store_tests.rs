@@ -26,7 +26,7 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
     let (read_like, write_like, shell_like, path_hint) = match tool_name {
         "read_file" => (true, false, false, SessionPathHint::SinglePath),
         "write_project_file" => (false, true, false, SessionPathHint::SinglePath),
-        "apply_text_edits" => (false, true, false, SessionPathHint::PathList),
+        "edit_project_files" => (false, true, false, SessionPathHint::PathList),
         "run_shell" | "session_shell_exec" | "cargo_check" => {
             (false, false, true, SessionPathHint::None)
         }
@@ -161,6 +161,86 @@ fn default_session_retention_exceeds_model_summary_window_and_persists() {
 }
 
 #[test]
+fn retained_task_instruction_identity_survives_summary_tail_and_fences_later_attempt() {
+    let store = SessionStore::new(10, DEFAULT_MAX_EVENTS_PER_SESSION);
+    let request = |resume_session_id: Option<String>, instruction: &str| CodingSessionRequest {
+        project: "agent:test:attempt-fence".to_string(),
+        authority_fingerprint: TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT.to_string(),
+        resume_session_id,
+        instruction: Some(instruction.to_string()),
+        mode: SessionMode::Normal,
+        guards: SessionGuards::default(),
+        execution_context: None,
+        project_instructions: None,
+        transport: SessionTransport::Api,
+        context_refreshed: true,
+        write_scope_verified: true,
+    };
+    let created = store
+        .ensure_coding_session_with_git_baseline(
+            request(None, "first attempt"),
+            Some("a".repeat(40)),
+        )
+        .unwrap();
+    let session_id = created.summary.session_id.clone();
+    let first_instruction_id = created
+        .summary
+        .events
+        .iter()
+        .find(|event| event.kind == "task_instruction")
+        .unwrap()
+        .event_id
+        .clone();
+
+    for index in 0..110 {
+        let start = store.record_tool_call_started(
+            Some(&session_id),
+            SessionTransport::Api,
+            "runtime_status",
+            &json!({"probe": index}),
+            session_tool_contract("runtime_status"),
+        );
+        store.record_tool_call_finished(start, true, &json!({"ok": true}), None, None);
+    }
+    let truncated = store.summary(&session_id, Some(usize::MAX)).unwrap();
+    assert!(truncated.events_truncated);
+    assert!(truncated
+        .events
+        .iter()
+        .all(|event| event.kind != "task_instruction"));
+    let first_attempt_events_total = truncated.events_total;
+    assert_eq!(
+        store.retained_task_instruction_event_id_at(&session_id, first_attempt_events_total),
+        Some(first_instruction_id.clone())
+    );
+
+    let resumed = store
+        .ensure_coding_session_with_git_baseline(
+            request(Some(session_id.clone()), "second attempt"),
+            Some("b".repeat(40)),
+        )
+        .unwrap();
+    let second_instruction_id = resumed
+        .summary
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "task_instruction")
+        .unwrap()
+        .event_id
+        .clone();
+    assert_ne!(second_instruction_id, first_instruction_id);
+    assert_eq!(
+        store.retained_task_instruction_event_id_at(&session_id, first_attempt_events_total),
+        Some(first_instruction_id)
+    );
+    assert_eq!(
+        store.retained_task_instruction_event_id_at(&session_id, resumed.summary.events_total),
+        Some(second_instruction_id)
+    );
+}
+
+#[test]
 fn input_summary_redacts_sensitive_keys() {
     let store = SessionStore::default();
     let summary = store.start_session(None, None);
@@ -289,9 +369,9 @@ fn coding_git_baseline_and_repository_edit_fact_persist_resume_and_default_legac
         .record_tool_call_started(
             Some(&session_id),
             SessionTransport::Mcp,
-            "apply_text_edits",
+            "edit_project_files",
             &json!({"project": "agent:oe:private-drop", "path": "src/lib.rs"}),
-            session_tool_contract("apply_text_edits"),
+            session_tool_contract("edit_project_files"),
         )
         .unwrap();
     store
@@ -1183,39 +1263,263 @@ fn unknown_session_mutations_do_not_recreate_session() {
     assert!(matches!(resolve, Err(SessionMessageError::UnknownSession)));
 }
 
-/// Evicted (capacity-bound) sessions stay gone: events must not revive them.
-
 #[test]
-fn evicted_session_is_not_reactivated_by_events_or_messages() {
+fn active_session_survives_capacity_churn_and_keeps_exact_identity_and_fences() {
     let store = SessionStore::new(1, 10);
-    let first = store.start_session(None, Some("first".to_string()));
-    let second = store.start_session(None, Some("second".to_string()));
+    let owner_authority = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let guards = SessionGuards {
+        deny_write_tools: true,
+        deny_shell_tools: true,
+    };
+    let first = store
+        .start_session_with_options(
+            SessionCreateOptions::new(
+                Some("agent:test:durable-a".to_string()),
+                Some("first".to_string()),
+                SessionMode::ReadOnly,
+                guards,
+            )
+            .with_owner_authority_fingerprint(Some(owner_authority.to_string())),
+        )
+        .unwrap();
+    let canonical_id = first.session_id.clone();
 
-    assert!(!store.contains_session(&first.session_id));
-    assert!(store.contains_session(&second.session_id));
+    for index in 0..4 {
+        store.start_session(
+            Some(format!("agent:test:churn-{index}")),
+            Some(format!("churn {index}")),
+        );
+    }
 
-    assert!(store
+    assert!(store.contains_session(&canonical_id));
+    let retained = store.summary(&canonical_id, Some(10)).unwrap();
+    assert_eq!(retained.session_id, canonical_id);
+    assert_eq!(retained.lifecycle, SessionLifecycle::Active);
+    assert_eq!(retained.project.as_deref(), Some("agent:test:durable-a"));
+    assert_eq!(retained.mode, SessionMode::ReadOnly);
+    assert_eq!(retained.guards, guards);
+
+    let start = store
         .record_tool_call_started(
-            Some(&first.session_id),
+            Some(&canonical_id),
             SessionTransport::Api,
             "read_file",
-            &json!({"project": "demo", "path": "a.rs"}),
+            &json!({"project": "agent:test:durable-a", "path": "a.rs"}),
             session_tool_contract("read_file"),
         )
-        .is_none());
-    assert!(!store.contains_session(&first.session_id));
-    assert!(store.summary(&first.session_id, None).is_none());
+        .expect("capacity pressure must not turn an Active Session into unknown");
+    store.record_tool_call_finished(Some(start), true, &json!({"ok": true}), None, None);
 
-    let post = store.post_message(PostSessionMessageInput {
-        session_id: first.session_id.clone(),
-        kind: SessionMessageKind::Note,
-        message: "revive?".to_string(),
-        tags: Vec::new(),
-        reply_to: None,
-        priority: SessionMessagePriority::Normal,
-    });
-    assert!(matches!(post, Err(SessionMessageError::UnknownSession)));
-    assert!(!store.contains_session(&first.session_id));
+    let resume = |project: &str, authority_fingerprint: &str| CodingSessionRequest {
+        project: project.to_string(),
+        authority_fingerprint: authority_fingerprint.to_string(),
+        resume_session_id: Some(canonical_id.clone()),
+        instruction: Some("resume exact identity".to_string()),
+        mode: SessionMode::ReadOnly,
+        guards,
+        execution_context: None,
+        project_instructions: None,
+        transport: SessionTransport::Api,
+        context_refreshed: true,
+        write_scope_verified: true,
+    };
+    let resumed = store
+        .ensure_coding_session_with_git_baseline(
+            resume("agent:test:durable-a", owner_authority),
+            None,
+        )
+        .unwrap();
+    assert!(resumed.reused);
+    assert_eq!(resumed.summary.session_id, canonical_id);
+
+    assert!(matches!(
+        store.ensure_coding_session_with_git_baseline(
+            resume("agent:test:wrong-project", owner_authority,),
+            None,
+        ),
+        Err(CodingSessionError::ResumeProjectMismatch { .. })
+    ));
+    assert!(matches!(
+        store.ensure_coding_session_with_git_baseline(
+            resume(
+                "agent:test:durable-a",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            None,
+        ),
+        Err(CodingSessionError::ResumeAuthorityMismatch { .. })
+    ));
+
+    let status = store.status();
+    assert_eq!(status.hot_session_capacity_target, 1);
+    assert!(status.retained_sessions > status.hot_session_capacity_target);
+    assert_eq!(status.active_sessions, status.retained_sessions);
+    assert_eq!(status.capacity_evictions, 0);
+}
+
+#[test]
+fn active_session_survives_persistence_restart_after_capacity_churn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let owner_authority = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let request =
+        |resume_session_id: Option<String>, project: &str, authority: &str| CodingSessionRequest {
+            project: project.to_string(),
+            authority_fingerprint: authority.to_string(),
+            resume_session_id,
+            instruction: Some("durable active".to_string()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context: None,
+            project_instructions: None,
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        };
+
+    let store = SessionStore::with_persistence(&ledger, 1, 10);
+    let first = store
+        .ensure_coding_session_with_git_baseline(
+            request(None, "agent:test:persistent-active", owner_authority),
+            None,
+        )
+        .unwrap();
+    let canonical_id = first.summary.session_id.clone();
+    for index in 0..4 {
+        store.start_session(
+            Some(format!("agent:test:persist-churn-{index}")),
+            Some(format!("churn {index}")),
+        );
+    }
+    assert!(store.contains_session(&canonical_id));
+    store.flush_persistence();
+    drop(store);
+
+    let restored = SessionStore::with_persistence(&ledger, 1, 10);
+    assert!(restored.contains_session(&canonical_id));
+    assert_eq!(
+        restored.lifecycle_state(&canonical_id),
+        Some(SessionLifecycle::Active)
+    );
+    assert!(restored.status().restored_sessions > 1);
+    assert!(matches!(
+        restored.ensure_coding_session_with_git_baseline(
+            request(
+                Some(canonical_id.clone()),
+                "agent:test:wrong-project",
+                owner_authority,
+            ),
+            None,
+        ),
+        Err(CodingSessionError::ResumeProjectMismatch { .. })
+    ));
+    assert!(matches!(
+        restored.ensure_coding_session_with_git_baseline(
+            request(
+                Some(canonical_id.clone()),
+                "agent:test:persistent-active",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            None,
+        ),
+        Err(CodingSessionError::ResumeAuthorityMismatch { .. })
+    ));
+    let resumed = restored
+        .ensure_coding_session_with_git_baseline(
+            request(
+                Some(canonical_id.clone()),
+                "agent:test:persistent-active",
+                owner_authority,
+            ),
+            None,
+        )
+        .unwrap();
+    assert!(resumed.reused);
+    assert_eq!(resumed.summary.session_id, canonical_id);
+}
+
+#[test]
+fn restore_boundary_preserves_older_active_sessions_beyond_hot_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = SessionStore::with_persistence(&ledger, 10, 10);
+    let oldest = store.start_session(
+        Some("agent:test:restore-boundary".to_string()),
+        Some("oldest active".to_string()),
+    );
+    let _middle = store.start_session(
+        Some("agent:test:restore-boundary".to_string()),
+        Some("middle active".to_string()),
+    );
+    let newest = store.start_session(
+        Some("agent:test:restore-boundary".to_string()),
+        Some("newest active".to_string()),
+    );
+    store.flush_persistence();
+    drop(store);
+
+    let restored = SessionStore::with_persistence(&ledger, 1, 10);
+    assert!(restored.contains_session(&oldest.session_id));
+    assert!(restored.contains_session(&newest.session_id));
+    assert_eq!(
+        restored.lifecycle_state(&oldest.session_id),
+        Some(SessionLifecycle::Active)
+    );
+    let status = restored.status();
+    assert_eq!(status.hot_session_capacity_target, 1);
+    assert_eq!(status.retained_sessions, 3);
+    assert_eq!(status.active_sessions, 3);
+    assert_eq!(status.closed_sessions, 0);
+    assert_eq!(status.capacity_evictions, 0);
+}
+
+#[test]
+fn restore_prunes_only_old_closed_history_and_keeps_active_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("sessions.json");
+    let store = SessionStore::with_persistence_limits(&ledger, 10, 10, 10);
+    let active = store.start_session(
+        Some("agent:test:mixed-restore".to_string()),
+        Some("active".to_string()),
+    );
+    let old_closed = store.start_session(
+        Some("agent:test:mixed-restore".to_string()),
+        Some("old closed".to_string()),
+    );
+    store.close_session(&old_closed.session_id).unwrap();
+    let new_closed = store.start_session(
+        Some("agent:test:mixed-restore".to_string()),
+        Some("new closed".to_string()),
+    );
+    store.close_session(&new_closed.session_id).unwrap();
+    store.flush_persistence();
+    drop(store);
+
+    let restored = SessionStore::with_persistence_limits(&ledger, 1, 1, 10);
+    assert!(restored.contains_session(&active.session_id));
+    assert_eq!(
+        restored.lifecycle_state(&active.session_id),
+        Some(SessionLifecycle::Active)
+    );
+    assert!(
+        !restored.contains_session(&old_closed.session_id),
+        "restore-time historical retention should prune the oldest Closed row"
+    );
+    assert!(restored.contains_session(&new_closed.session_id));
+    assert_eq!(
+        restored.lifecycle_state(&new_closed.session_id),
+        Some(SessionLifecycle::Closed)
+    );
+    let status = restored.status();
+    assert_eq!(status.retained_sessions, 2);
+    assert_eq!(status.restored_sessions, 2);
+    assert_eq!(status.active_sessions, 1);
+    assert_eq!(status.closed_sessions, 1);
+    assert_eq!(status.hot_sessions, 1);
+    assert_eq!(status.cold_sessions, 1);
+    assert_eq!(status.hot_session_capacity_target, 1);
+    assert_eq!(status.historical_session_retention_limit, 1);
+    assert_eq!(status.capacity_evictions, 1);
 }
 
 #[test]
@@ -2204,4 +2508,71 @@ fn retained_project_selection_preserves_global_edit_and_only_persists_metadata()
     ] {
         assert!(!durable.contains(hidden));
     }
+}
+
+#[test]
+fn console_lists_batch_preserves_project_bounds_order_and_cold_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ledger = tmp.path().join("batch-console.json");
+    let store = SessionStore::with_persistence_limits(&ledger, 20, 20, 10);
+    let mut expected = std::collections::HashMap::new();
+    for project in ["project-a", "project-b", "private-project"] {
+        let mut rows = Vec::new();
+        for index in 0..3 {
+            let session =
+                store.start_session(Some(project.into()), Some(format!("{project}-{index}")));
+            store.close_session(&session.session_id).unwrap();
+            let summary = store.summary(&session.session_id, Some(1)).unwrap();
+            rows.push((summary.session_id, summary.updated_at));
+        }
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.cmp(&a.0)));
+        expected.insert(project, rows);
+    }
+    store.flush_persistence();
+    drop(store);
+    let store = SessionStore::with_persistence_limits(&ledger, 1, 20, 10);
+    assert!(store.status().cold_sessions > 0);
+    let validation = ConsoleValidationHooks {
+        event_observes_validation_activity: |_| false,
+        validation_summary_from_events: |_, _| json!({}),
+    };
+    for limit in [Some(1), Some(2), None] {
+        let lists = store.console_lists_for_projects(
+            &["project-a", "project-b", "empty-project", "project-a"],
+            limit,
+            validation,
+        );
+        assert_eq!(lists.len(), 3);
+        assert!(!lists.contains_key("private-project"));
+        for project in ["project-a", "project-b"] {
+            let list = &lists[project];
+            let returned = limit.unwrap_or(3);
+            assert_eq!(list.total, 3);
+            assert_eq!(list.returned, returned);
+            assert_eq!(list.truncated, returned < 3);
+            assert_eq!(
+                list.sessions
+                    .iter()
+                    .map(|s| &s.session_id)
+                    .collect::<Vec<_>>(),
+                expected[project]
+                    .iter()
+                    .take(returned)
+                    .map(|s| &s.0)
+                    .collect::<Vec<_>>()
+            );
+            assert!(list.sessions.iter().all(|s| s.lifecycle == "closed"));
+            assert_eq!(
+                serde_json::to_value(list).unwrap(),
+                serde_json::to_value(store.console_list_for_project(project, limit, validation))
+                    .unwrap()
+            );
+        }
+        assert_eq!(lists["empty-project"].total, 0);
+        assert_eq!(lists["empty-project"].returned, 0);
+        assert!(!lists["empty-project"].truncated);
+    }
+    assert!(store
+        .console_lists_for_projects(&[], None, validation)
+        .is_empty());
 }

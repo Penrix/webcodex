@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
+use webcodex_core::coding_agent::CodingAgentConfigValue;
 
 const DEFAULT_SYSTEM_CONFIG_DIR: &str = "/etc/webcodex";
 pub(crate) const CLIENT_PROFILE_ERROR: &str =
@@ -75,9 +76,8 @@ pub(crate) struct RunnerConfig {
     pub(crate) host_context: Option<RunnerHostContext>,
     #[serde(default)]
     pub(crate) project_registry_dir: Option<PathBuf>,
-    /// Legacy config spelling retained only for load-time compatibility. A
-    /// loaded config is normalized into `project_registry_dir` and clears this
-    /// field so runtime comparisons operate on one effective registry path.
+    /// Legacy config spelling accepted only during the 0.4.x migration window.
+    /// `load_config` normalizes it into `project_registry_dir` before runtime use.
     #[serde(default, rename = "projects_dir")]
     pub(crate) legacy_projects_dir: Option<PathBuf>,
     /// Minimum delay after an empty polling response. Repeated idle polls back
@@ -141,6 +141,10 @@ pub(crate) struct AcpConfig {
     pub(crate) max_concurrent_runs: usize,
     #[serde(default = "default_acp_permission_timeout_secs")]
     pub(crate) permission_timeout_secs: u64,
+    /// Runner-owned admission policy applied to every ACP Coding Agent session.
+    /// The upstream default is intentionally empty and provider-neutral.
+    #[serde(default)]
+    pub(crate) forced_config: BTreeMap<String, CodingAgentConfigValue>,
     #[serde(default)]
     pub(crate) agents: Vec<AcpAgentConfig>,
 }
@@ -174,6 +178,7 @@ impl Default for AcpConfig {
         Self {
             max_concurrent_runs: default_acp_max_concurrent_runs(),
             permission_timeout_secs: default_acp_permission_timeout_secs(),
+            forced_config: BTreeMap::new(),
             agents: Vec::new(),
         }
     }
@@ -1584,10 +1589,6 @@ pub(crate) fn load_config(path: &Path) -> Result<RunnerConfig, String> {
     let effective =
         effective_allowed_roots(&cfg.policy.allowed_roots, cfg.policy.allow_cwd_anywhere)?;
     cfg.policy.allowed_roots = effective;
-    // Normalize old/new config spellings into one effective registry path. Two
-    // explicit fields are ambiguous and fail closed rather than guessing
-    // precedence. With neither field configured, select the on-disk layout
-    // using the shared four-state compatibility contract.
     cfg.project_registry_dir = match (
         cfg.project_registry_dir.take(),
         cfg.legacy_projects_dir.take(),
@@ -1598,7 +1599,14 @@ pub(crate) fn load_config(path: &Path) -> Result<RunnerConfig, String> {
                     .to_string(),
             );
         }
-        (Some(path), None) | (None, Some(path)) => Some(path),
+        (Some(path), None) => Some(path),
+        (None, Some(path)) => {
+            eprintln!(
+                "webcodex-runner warning: Runner config field 'projects_dir' is deprecated; use 'project_registry_dir' instead. Legacy startup compatibility will be removed in WebCodex {}.",
+                crate::runner_config::paths::LEGACY_RUNNER_CONFIG_REMOVAL_VERSION
+            );
+            Some(path)
+        }
         (None, None) => Some(default_project_registry_dir()?),
     };
     validate_shell_config(&cfg.shell)?;
@@ -1777,7 +1785,8 @@ fn validate_acp_env_name(value: &str) -> Result<(), ()> {
 fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
     use std::collections::HashSet;
     use webcodex_core::coding_agent::{
-        validate_provider_id, CODING_AGENT_MAX_CONFIG_KEY_BYTES, CODING_AGENT_MAX_PROVIDERS,
+        validate_provider_id, CODING_AGENT_MAX_CONFIG_KEY_BYTES, CODING_AGENT_MAX_CONFIG_OPTIONS,
+        CODING_AGENT_MAX_CONFIG_VALUE_BYTES, CODING_AGENT_MAX_PROVIDERS,
         CODING_AGENT_MAX_PROVIDER_NAME_BYTES,
     };
 
@@ -1797,6 +1806,25 @@ fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
         return Err(format!(
             "acp.agents may contain at most {CODING_AGENT_MAX_PROVIDERS} entries"
         ));
+    }
+    if config.forced_config.len() > CODING_AGENT_MAX_CONFIG_OPTIONS {
+        return Err(format!(
+            "acp.forced_config may contain at most {CODING_AGENT_MAX_CONFIG_OPTIONS} entries"
+        ));
+    }
+    for (option, value) in &config.forced_config {
+        if option.is_empty()
+            || option.len() > CODING_AGENT_MAX_CONFIG_KEY_BYTES
+            || option.chars().any(char::is_control)
+            || value.serialized_len() > CODING_AGENT_MAX_CONFIG_VALUE_BYTES
+        {
+            return Err("acp.forced_config contains an invalid option".to_string());
+        }
+        if matches!(value, CodingAgentConfigValue::Integer(_)) {
+            return Err(
+                "acp.forced_config supports only string/select and boolean values".to_string(),
+            );
+        }
     }
     let mut ids = HashSet::new();
     for agent in &config.agents {
@@ -1892,6 +1920,16 @@ fn validate_acp_config(config: &AcpConfig) -> Result<(), String> {
                     agent.id
                 ));
             }
+        }
+        if config
+            .forced_config
+            .keys()
+            .any(|option| config_ids.contains(option.as_str()))
+        {
+            return Err(format!(
+                "ACP agent '{}' cannot allow an option that is forced globally",
+                agent.id
+            ));
         }
     }
     Ok(())
@@ -2011,7 +2049,7 @@ fn validate_mcp_gateway_config(config: &McpGatewayConfig) -> Result<(), String> 
             }
             if destinations
                 .iter()
-                .any(|existing| super::shell::env_keys_equal(*existing, destination))
+                .any(|existing| super::shell::env_keys_equal(existing, destination))
             {
                 return Err(format!(
                     "mcp provider '{}' env_from_env contains conflicting destination names for this platform",
@@ -2121,6 +2159,66 @@ mod acp_config_tests {
             agents: vec![agent],
             ..AcpConfig::default()
         })
+    }
+
+    #[test]
+    fn desktop_owned_acp_marker_is_configuration_metadata_not_provider_inventory() {
+        let executable = toml::Value::String(agent().executable).to_string();
+        let source = format!(
+            r#"
+max_concurrent_runs = 1
+permission_timeout_secs = 5
+[[agents]]
+id = "pi"
+name = "Pi Agent"
+executable = {executable}
+args = ["--acp"]
+desktop_owner = "fixture-desktop-owner"
+[agents.env_from_env]
+OPENAI_API_KEY = "SUB2API_API_KEY"
+"#
+        );
+        let config: AcpConfig = toml::from_str(&source).unwrap();
+        validate_acp_config(&config).unwrap();
+        assert_eq!(config.agents[0].id, "pi");
+        assert_eq!(
+            config.agents[0].env_from_env["OPENAI_API_KEY"],
+            "SUB2API_API_KEY"
+        );
+    }
+
+    #[test]
+    fn acp_global_forced_config_is_empty_by_default() {
+        assert!(AcpConfig::default().forced_config.is_empty());
+    }
+
+    #[test]
+    fn acp_global_forced_config_rejects_allowed_overlap() {
+        let mut configured = agent();
+        configured.allowed_config_options.push("model".to_string());
+        let mut config = AcpConfig {
+            agents: vec![configured],
+            ..AcpConfig::default()
+        };
+        config.forced_config.insert(
+            "model".to_string(),
+            CodingAgentConfigValue::String("policy-model".to_string()),
+        );
+        assert!(validate_acp_config(&config)
+            .unwrap_err()
+            .contains("forced globally"));
+    }
+
+    #[test]
+    fn acp_global_forced_config_rejects_integer_values() {
+        let mut config = AcpConfig::default();
+        config.forced_config.insert(
+            "integer-option".to_string(),
+            CodingAgentConfigValue::Integer(7),
+        );
+        assert!(validate_acp_config(&config)
+            .unwrap_err()
+            .contains("string/select and boolean"));
     }
 
     #[test]

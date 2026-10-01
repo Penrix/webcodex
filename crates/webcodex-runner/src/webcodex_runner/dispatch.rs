@@ -15,7 +15,7 @@ use super::{
     CommandResult, HotRunnerConfig, PersistentShellManager, ReloadableRunnerConfig, RunnerSink,
     ShellCommandResult, SubmitResultError,
 };
-use crate::handle_file_operation;
+use crate::handle_file_operation_with_artifact_store;
 use crate::runner_protocol::{
     PersistentShellResult, RunnerConfigAction, RunnerConfigOperationRequest,
     RunnerJobUpdateRequest, RunnerRequest, EXTERNAL_SEARCH_REQUEST_PREFIX,
@@ -149,6 +149,7 @@ fn run_native_shell_or_internal_search(
         operation.cwd.as_deref(),
         &operation.command,
         operation.shell,
+        operation.login,
         operation.stdin.as_deref(),
         operation.timeout_secs,
         Some(runtime.shutdown_flag()),
@@ -484,7 +485,11 @@ pub(crate) fn dispatch_request_with_outcome(
                 .map(|_| true)
         }
         RunnerOperation::Computer(operation) => {
-            let result = handle_computer_operation(&operation);
+            let result = if super::computer_session::configured() {
+                super::computer_session::dispatch(&operation)
+            } else {
+                handle_computer_operation(&operation)
+            };
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -667,7 +672,11 @@ pub(crate) fn dispatch_request_with_outcome(
             }
         }
         RunnerOperation::File(operation) => {
-            let result = handle_file_operation(policy, &operation);
+            let result = handle_file_operation_with_artifact_store(
+                policy,
+                &operation,
+                Some(project_registry_dir),
+            );
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
@@ -718,6 +727,16 @@ pub(crate) fn dispatch_request_with_outcome(
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }
+        RunnerOperation::PlanProjectValidation(payload) => {
+            let result = super::validation::project::handle(policy, project_registry_dir, &payload);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::PlanProjectBuild(payload) => {
+            let result = super::project_build::handle(policy, project_registry_dir, &payload);
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
         RunnerOperation::Validation { payload, .. } => {
             let result = handle_validation_request(
                 policy,
@@ -725,6 +744,28 @@ pub(crate) fn dispatch_request_with_outcome(
                 &payload,
                 Some(runtime.shutdown_flag()),
             );
+            sink.submit_result_with_metadata(request_id, result, config, runtime)
+                .map(|_| true)
+        }
+        RunnerOperation::JobInput(input) => {
+            let result = match jobs.write_input(&input, policy, sink.runner_instance_id()) {
+                Ok(receipt) => CommandResult {
+                    exit_code: Some(0),
+                    stdout: Some(
+                        serde_json::to_string(&receipt).expect("input receipt serialization"),
+                    ),
+                    stderr: None,
+                    duration_ms: None,
+                    error: None,
+                },
+                Err(error) => CommandResult {
+                    exit_code: Some(1),
+                    stdout: None,
+                    stderr: None,
+                    duration_ms: None,
+                    error: Some(error),
+                },
+            };
             sink.submit_result_with_metadata(request_id, result, config, runtime)
                 .map(|_| true)
         }

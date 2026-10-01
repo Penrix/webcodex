@@ -1,5 +1,7 @@
 //! Compound inspection must preserve canonical reads without duplicate model output.
 
+mod projection;
+
 use super::super::*;
 use super::support::*;
 use serde_json::{json, Value};
@@ -194,6 +196,8 @@ async fn search_and_read_returns_one_source_block_for_overlapping_matches() {
             .collect::<Vec<_>>(),
         vec![26, 43, 60, 77]
     );
+    assert!(matches.iter().all(|entry| entry.get("preview").is_none()));
+    assert!(matches.iter().all(|entry| entry.get("read_hint").is_none()));
     let reads = result.output["reads"]["items"].as_array().unwrap();
     assert_eq!(
         reads.len(),
@@ -413,6 +417,7 @@ async fn batched_search_and_read_preserves_per_query_failure_identity() {
     assert_eq!(items[0]["output"]["reason_code"], "invalid_pattern");
     assert_eq!(items[1]["index"], 1);
     assert_eq!(items[1]["success"], true);
+    assert!(items[1]["output"]["matches"][0].get("preview").is_none());
     assert!(items[1]["output"]["matches"][0].get("read_hint").is_none());
     validate_compound_schema(&result);
 }

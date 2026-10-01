@@ -37,9 +37,9 @@ shell state.
 
 Some compatibility-facing values still use the historical word `agent`, including the `wc_agent_*` Runner-token prefix and `agent:<client_id>:<project_id>` runtime Project address. They do not refer to WebCodex's separate Durable Agent domain, and ordinary users do not need the process-level lease identifiers behind Runner recovery.
 
-### Runner config filename compatibility
+### Runner config filename migration
 
-`runner.toml` is the canonical config filename. A legacy directory containing only `agent.toml` remains readable for compatibility; if both names exist in the same config directory WebCodex fails closed and asks the operator to resolve the ambiguity. `WEBCODEX_RUNNER_CONFIG` is the current path override; the old `WEBCODEX_AGENT_CONFIG` remains a compatibility alias.
+`runner.toml` is the canonical config filename. During the WebCodex 0.4.x migration window, automatic/default/profile discovery still accepts a legacy-only `agent.toml`, and `WEBCODEX_AGENT_CONFIG` remains a deprecated fallback when `WEBCODEX_RUNNER_CONFIG` is unset. Likewise, a legacy-only `projects_dir` config field is normalized to `project_registry_dir` at load time. These compatibility inputs emit migration warnings and are planned for removal in WebCodex 0.5.0. Ambiguous dual state remains fail-closed: `runner.toml` plus `agent.toml`, both config-path environment variables, or both registry fields must be resolved by the operator. New/generated configurations always use `runner.toml`, `project_registry_dir`, and `WEBCODEX_RUNNER_CONFIG`.
 
 ## Connecting to the Server
 
@@ -66,6 +66,13 @@ When upgrading an older installation across the 0.4 boundary, upgrade the first-
 
 The exact protocol-generation field names, baseline capability list, registration grammar, and compatibility-test matrix are maintainer/wire-contract details and are intentionally omitted from this operations guide.
 
+A ChatGPT Host message that the current conversation does not support developer
+MCPs is not a Runner heartbeat or reconnect result. If ChatGPT cannot dispatch
+`runtime_status`, first run `webcodex runner status` locally (and inspect bounded
+Runner logs) before restarting or changing Runner configuration. See
+[Troubleshooting](TROUBLESHOOTING.md) for the Host-vs-Server-vs-Runner decision
+tree.
+
 If you use QUIC, keep Server and Runner QUIC settings compatible. `[quic].keepalive_interval_secs` defaults to 20 seconds and accepts `1..=25`; invalid values are rejected rather than silently clamped.
 
 ## Registering projects
@@ -88,11 +95,14 @@ allow_patch = true
 `id` and `path` are the important fields; `kind` is optional descriptive metadata.
 The registry directory is storage for Project records, not a workspace root.
 
-New configurations use `project-registry/` and `project_registry_dir`. A legacy
-installation that has only `projects.d/` / `projects_dir` remains readable. If
-both old and new locations/fields are configured, WebCodex fails closed instead
-of merging or guessing precedence. Use `--project-registry-dir` in new CLI
-commands.
+New configurations use `project-registry/` and `project_registry_dir`. An
+existing installation whose only physical registry directory is `projects.d/`
+continues to use that directory in place. During 0.4.x, a legacy-only
+`projects_dir` config field is also accepted with a deprecation warning and is
+normalized to `project_registry_dir`; the old `--projects-dir` CLI flag remains
+retired. If both physical registry directories or both config fields exist,
+WebCodex fails closed instead of merging or guessing precedence. Use
+`--project-registry-dir` for explicit CLI selection.
 
 Runtime Project ids take the canonical shape `agent:<client_id>:<project_id>`, for example `agent:workstation:my-repo`. That canonical identity remains the authorization, persistence, audit, Runner-routing, diagnostic, API and CLI address. Model-facing bootstrap/discovery may additionally return a short Server-issued `project_ref` such as `~p1`. Models should normally reuse that selector on later Project-scoped tool calls instead of copying the canonical id. The mapping is durable and scoped to the authenticated caller, is pinned to the canonical id plus Runner-reported Project root identity, and grants no authority: every use re-runs current Project visibility/authorization. It never depends on Workflow Session, ClientWindow, MCP session, transport connection, recent activity or hidden Host state, and a stale ref is never silently rebound to another Project.
 
@@ -111,6 +121,12 @@ allow_cwd_anywhere = false
 allowed_roots = ["/root/git"]
 ```
 
+Managed-worktree bootstrap uses the same boundary. The Runner may derive a
+private managed namespace so the model never supplies a destination path, but
+that namespace and the resulting Project still have to fit the effective
+`allowed_roots` policy (unless `allow_cwd_anywhere=true`). A Project selector or
+Project ref does not widen this filesystem authority.
+
 ### Registering projects at runtime
 
 The runtime tools `register_project` and `create_project` let a client register
@@ -122,11 +138,15 @@ Runner's `allowed_roots` policy.
 `skill_list` presents one catalog while preserving three distinct ownership and
 lifecycle models:
 
+**Available since v0.4.2:** configured live Runner Skill roots and the Managed Runner Skill Store participate in this unified catalog. WebCodex v0.4.1 `skill_list` did not implicitly scan `~/.codex/skills`; configure `[skills].roots` explicitly on v0.4.2+ when that directory should participate.
+
 | Source | Location / owner | Trust | Version semantics |
 | --- | --- | --- | --- |
 | Project Skills | `<project>/.agents/skills/<package>/SKILL.md` | `project_content` | Live project content; no package revision. |
 | Configured live Runner Skill roots | Operator-selected absolute directories on the Runner host | `operator_configured_guidance` | Live filesystem content that WebCodex does not modify; supported scripts may execute through `run_skill_resource`; no install, activation, rollback, or package revision. |
 | Managed Runner Skill Store | Runner state under `runner-skills-v1` | `operator_installed_guidance` | Immutable package revisions with install, activation, removal, and rollback-oriented Store semantics. |
+
+`skill_list.sources` always reports these three logical sources with bounded `status`, counts, truncation, and safe reason codes. An available source with `skill_count=0` means discovery succeeded and found no Skills; it is not an index failure. Only the Project source exposes the logical root hint `.agents/skills`; native configured Runner paths remain private.
 
 Configured live roots are optional and have no implicit defaults. Each configured
 root contains normal Agent Skill packages directly:
@@ -177,6 +197,10 @@ use `expected_package_revision` to fence the immutable package. Changing the
 configured `roots` list is a hot-reloadable Runner configuration change: edit
 `runner.toml`, run `runner_config_check`, then `runner_config_reload` with the
 current generation. No Runner process restart is required.
+
+## Runner build identity
+
+A connected Runner reports bounded, non-secret binary identity through `runtime_status(client_id=...)` and `list_runners`: package version, Git commit/dirty state, build timestamp, Cargo target triple, and architecture. Older Runners may omit any of these optional fields. This is intended for deployment/source-alignment diagnostics; executable paths, environment, tokens, and credentials are not included. `webcodex-runner --version` remains the local pre-connection identity check.
 
 ## Runner-level configured instructions
 
@@ -309,7 +333,7 @@ The built-in Runner-to-provider gateway is intentionally a bounded stdio tool su
 - provider-side tool behavior is based on MCP `2025-06-18`;
 - `tools/list` and `tools/call` are supported;
 - callbacks, list pagination, and end-to-end progress forwarding are not supported;
-- tool results support text plus standard bounded image content blocks, preserving provider content order; image data must be standard Base64 with MIME `image/png`, `image/jpeg`, or `image/webp`, and all image blocks in one result share a 1 MiB decoded-data cap;
+- tool results support text plus standard bounded image content blocks, preserving provider content order; image data must be standard Base64 with MIME `image/png`, `image/jpeg`, or `image/webp`, and all image blocks in one result share a 4 MiB decoded-data cap;
 - bounded `structuredContent` is preserved independently of image content;
 - audio, resource, `resource_link`, and unknown content block types remain unsupported.
 

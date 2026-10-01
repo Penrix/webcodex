@@ -22,17 +22,41 @@ from typing import BinaryIO
 
 DEFAULT_REPO = "yyjeqhc/webcodex"
 PLATFORMS = ("linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64")
+INSTALLER_TARGETS = {
+    "linux-x64-deb": ("linux-x64", "deb"),
+    "linux-x64-rpm": ("linux-x64", "rpm"),
+    "linux-arm64-deb": ("linux-arm64", "deb"),
+    "linux-arm64-rpm": ("linux-arm64", "rpm"),
+    "darwin-x64-pkg": ("darwin-x64", "pkg"),
+    "darwin-arm64-pkg": ("darwin-arm64", "pkg"),
+    "win32-x64-exe": ("win32-x64", "exe"),
+    "win32-arm64-exe": ("win32-arm64", "exe"),
+}
 BINARIES = ("webcodex", "webcodex-server", "webcodex-runner")
-DESKTOP_PLATFORMS = ("darwin-x64", "darwin-arm64", "win32-x64", "win32-arm64")
+DESKTOP_PLATFORMS = ("darwin-arm64", "win32-x64", "win32-arm64")
+SUPPLEMENTAL_DESKTOP_PLATFORMS = ("darwin-x64",)
+ALL_DESKTOP_PLATFORMS = ("darwin-x64", *DESKTOP_PLATFORMS)
+SUPPLEMENTAL_DESKTOP_FIRST_VERSION = (0, 4, 3)
+
+
+def primary_desktop_platforms_for_version(version: str) -> tuple[str, ...]:
+    core_text = version.split("+", 1)[0].split("-", 1)[0]
+    try:
+        core = tuple(int(part) for part in core_text.split("."))
+    except ValueError as exc:
+        raise CollectionError(f"invalid release version: {version!r}") from exc
+    if len(core) != 3:
+        raise CollectionError(f"invalid release version: {version!r}")
+    return DESKTOP_PLATFORMS if core >= SUPPLEMENTAL_DESKTOP_FIRST_VERSION else ALL_DESKTOP_PLATFORMS
 RELEASE_WORKFLOW_PATH = ".github/workflows/release-build.yml"
 API_VERSION = "2022-11-28"
 USER_AGENT = "webcodex-release-bundle-collector/1"
 MAX_JSON_BYTES = 2 * 1024 * 1024
 MAX_ARTIFACT_COUNT = 16
-MAX_ARTIFACT_ZIP_BYTES = 384 * 1024 * 1024
-MAX_ZIP_MEMBERS = 16
-MAX_UNCOMPRESSED_BYTES = 384 * 1024 * 1024
-MAX_MEMBER_BYTES = 96 * 1024 * 1024
+MAX_ARTIFACT_ZIP_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ZIP_MEMBERS = 32
+MAX_UNCOMPRESSED_BYTES = 1536 * 1024 * 1024
+MAX_MEMBER_BYTES = 768 * 1024 * 1024
 MAX_REPORT_BYTES = 2 * 1024 * 1024
 MAX_RELEASE_BUILD_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024
@@ -40,6 +64,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 RELEASE_TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
+SOURCE_REF_RE = re.compile(r"^(?:main|release/v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$")
 VERIFY_TAG_RE = re.compile(r"^release-build-test-[0-9A-Za-z][0-9A-Za-z._-]*$")
 SAFE_NAME_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]*$")
 
@@ -53,6 +78,13 @@ def normalize_source_sha(value: str) -> str:
     if not SOURCE_SHA_RE.fullmatch(source):
         raise CollectionError(f"invalid expected source SHA: {value!r}")
     return source
+
+
+def normalize_source_ref(value: str) -> str:
+    source_ref = value.strip()
+    if not SOURCE_REF_RE.fullmatch(source_ref):
+        raise CollectionError(f"invalid release source ref: {value!r}")
+    return source_ref
 
 
 def validate_expected_tag(value: str) -> str:
@@ -72,7 +104,7 @@ def desktop_artifact_filename(
     tag: str,
     source_sha: str,
 ) -> str:
-    if platform not in DESKTOP_PLATFORMS:
+    if platform not in ALL_DESKTOP_PLATFORMS:
         raise CollectionError(f"unsupported Desktop platform: {platform!r}")
     suffix = "-setup.exe" if platform.startswith("win32-") else ".dmg"
     if build_kind == "release":
@@ -80,6 +112,14 @@ def desktop_artifact_filename(
     if build_kind == "verification":
         return f"webcodex-desktop-{tag}-{source_sha[:12]}-v{version}-{platform}{suffix}"
     raise CollectionError(f"unsupported release build kind: {build_kind!r}")
+
+
+def installer_artifact_filename(version: str, target: str) -> str:
+    try:
+        platform, package_format = INSTALLER_TARGETS[target]
+    except KeyError as exc:
+        raise CollectionError(f"unsupported installer target: {target!r}") from exc
+    return f"webcodex-unified-v{version}-{platform}.{package_format}"
 
 
 def resolve_github_token() -> str:
@@ -276,8 +316,6 @@ def validate_run(run: dict, run_id: int, expected_source_sha: str) -> None:
         raise CollectionError("release-build run was not started by workflow_dispatch")
     if run.get("path") != RELEASE_WORKFLOW_PATH:
         raise CollectionError(f"unexpected workflow path: {run.get('path')!r}")
-    if run.get("head_branch") != "main":
-        raise CollectionError(f"release-build run did not use main: {run.get('head_branch')!r}")
 
 
 def _artifact_digest(value: object) -> str:
@@ -490,8 +528,14 @@ def _validate_release_manifest(
     version: str,
     artifact_files: dict[str, str],
     artifact_hashes: dict[str, str],
+    installer_files: dict[str, str] | None = None,
+    installer_hashes: dict[str, str] | None = None,
+    source_manifest_hashes: dict[str, str] | None = None,
 ) -> None:
-    if set(manifest) != {"version", "binaries", "artifacts"}:
+    expected_keys = {"version", "binaries", "artifacts"}
+    if "installers" in manifest:
+        expected_keys.add("installers")
+    if set(manifest) != expected_keys:
         raise CollectionError("release manifest contains unexpected top-level fields")
     if manifest.get("version") != version or manifest.get("binaries") != list(BINARIES):
         raise CollectionError("release manifest version/binary list mismatch")
@@ -506,6 +550,31 @@ def _validate_release_manifest(
         expected_url = f"https://github.com/{repo}/releases/download/v{version}/{filename}"
         if item.get("url") != expected_url or item.get("sha256") != artifact_hashes[platform]:
             raise CollectionError(f"release manifest does not match assembled archive: {platform}")
+    installers = manifest.get("installers")
+    if installers is None:
+        if installer_files:
+            raise CollectionError("release manifest is missing unified installers")
+        return
+    if not isinstance(installers, dict) or set(installers) != set(INSTALLER_TARGETS) or not installer_files or not installer_hashes:
+        raise CollectionError("release manifest installer set does not match assembled eight-target installer set")
+    for target, (platform, package_format) in INSTALLER_TARGETS.items():
+        item = installers.get(target)
+        filename = installer_artifact_filename(version, target)
+        expected_url = f"https://github.com/{repo}/releases/download/v{version}/{filename}"
+        if not isinstance(item, dict) or set(item) != {"platform", "format", "filename", "url", "sha256", "source_manifest_url", "source_manifest_sha256"}:
+            raise CollectionError(f"release manifest installer entry is malformed: {target}")
+        if (item.get("platform"), item.get("format")) != (platform, package_format):
+            raise CollectionError(f"release manifest installer target identity is invalid: {target}")
+        if (item.get("filename"), item.get("url"), item.get("sha256")) != (
+            filename, expected_url, installer_hashes[target]
+        ) or installer_files.get(target) != filename:
+            raise CollectionError(f"release manifest does not match assembled installer: {target}")
+        source_filename = f"webcodex-source-v{version}-{platform}.json"
+        source_url = f"https://github.com/{repo}/releases/download/v{version}/{source_filename}"
+        if (item.get("source_manifest_url"), item.get("source_manifest_sha256")) != (
+            source_url, (source_manifest_hashes or {})[platform]
+        ):
+            raise CollectionError(f"release manifest does not bind source manifest: {target}")
 
 
 def verify_bundle_directory(
@@ -539,6 +608,12 @@ def verify_bundle_directory(
         "artifacts",
         "desktop_artifacts",
     }
+    # Older retained bundles have no Desktop contract manifest. Only that
+    # explicit absence is legacy; malformed or unchecksummed present assets fail.
+    if "runtime_manifest" in release_build:
+        required_fields.add("runtime_manifest")
+    if "installer_artifacts" in release_build:
+        required_fields.add("installer_artifacts")
     if set(release_build) != required_fields:
         raise CollectionError("release-build.json contains unexpected or missing fields")
     if release_build.get("tag") != expected_tag:
@@ -586,11 +661,15 @@ def verify_bundle_directory(
         artifact_hashes[platform] = digest
 
     desktop_artifacts = release_build.get("desktop_artifacts")
-    if not isinstance(desktop_artifacts, dict) or set(desktop_artifacts) != set(DESKTOP_PLATFORMS):
-        raise CollectionError("release-build.json must contain exactly the supported Desktop artifacts")
+    desktop_platforms = primary_desktop_platforms_for_version(version)
+    if not isinstance(desktop_artifacts, dict) or set(desktop_artifacts) != set(desktop_platforms):
+        raise CollectionError(
+            f"release-build.json Desktop artifact set mismatch for {version}: "
+            f"expected={sorted(desktop_platforms)}"
+        )
     desktop_files: dict[str, str] = {}
     desktop_hashes: dict[str, str] = {}
-    for platform in DESKTOP_PLATFORMS:
+    for platform in desktop_platforms:
         item = desktop_artifacts.get(platform)
         if not isinstance(item, dict) or set(item) != {"filename", "sha256"}:
             raise CollectionError(f"release-build.json Desktop artifact entry is malformed: {platform}")
@@ -610,6 +689,36 @@ def verify_bundle_directory(
         desktop_files[platform] = filename
         desktop_hashes[platform] = digest
 
+    runtime_manifest = release_build.get("runtime_manifest")
+    if "runtime_manifest" in release_build:
+        if build_kind != "release" or not isinstance(runtime_manifest, dict) or set(runtime_manifest) != {"filename", "sha256"}:
+            raise CollectionError("malformed Runtime release manifest identity")
+        if runtime_manifest.get("filename") != "webcodex-release-manifest.json" or not isinstance(runtime_manifest.get("sha256"), str) or not SHA256_RE.fullmatch(runtime_manifest["sha256"]):
+            raise CollectionError("invalid Runtime release manifest identity")
+    installer_artifacts = release_build.get("installer_artifacts")
+    installer_files: dict[str, str] = {}
+    installer_hashes: dict[str, str] = {}
+    if installer_artifacts is not None:
+        if not isinstance(installer_artifacts, dict) or set(installer_artifacts) != set(INSTALLER_TARGETS):
+            raise CollectionError("release-build.json must contain exactly the eight unified installer targets")
+        for target, (platform, _package_format) in INSTALLER_TARGETS.items():
+            item = installer_artifacts.get(target)
+            filename = installer_artifact_filename(version, target)
+            fields = {"filename", "sha256", "source_manifest_filename", "source_manifest_sha256", "inner_sha256", "candidate_manifest_sha256"} if platform.startswith("win32-") else {"filename", "sha256", "source_manifest_filename", "source_manifest_sha256"}
+            if not isinstance(item, dict) or set(item) != fields:
+                raise CollectionError(f"release-build.json installer entry is malformed: {target}")
+            if item.get("filename") != filename or not isinstance(item.get("sha256"), str) or not SHA256_RE.fullmatch(item["sha256"]):
+                raise CollectionError(f"release-build.json installer identity is invalid: {target}")
+            source_filename = f"webcodex-source-v{version}-{platform}.json"
+            if item.get("source_manifest_filename") != source_filename or not isinstance(item.get("source_manifest_sha256"), str) or not SHA256_RE.fullmatch(item["source_manifest_sha256"]):
+                raise CollectionError(f"release-build.json source manifest identity is invalid: {target}")
+            if platform.startswith("win32-") and any(
+                not isinstance(item.get(key), str) or not SHA256_RE.fullmatch(item[key])
+                for key in ("inner_sha256", "candidate_manifest_sha256")
+            ):
+                raise CollectionError(f"release-build.json Windows installer provenance digest is invalid: {target}")
+            installer_files[target] = filename
+            installer_hashes[target] = item["sha256"]
     expected_files = {
         "release-build.json",
         "SHA256SUMS",
@@ -620,6 +729,26 @@ def verify_bundle_directory(
     }
     if build_kind == "release":
         expected_files.add("manifest.json")
+    if runtime_manifest is not None:
+        expected_files.add(runtime_manifest["filename"])
+    expected_files.update(installer_files.values())
+    source_manifest_files = {
+        platform: f"webcodex-source-v{version}-{platform}.json"
+        for platform in PLATFORMS
+        if installer_files
+    }
+    source_manifest_hashes = {}
+    if installer_files:
+        for platform in PLATFORMS:
+            digests = {
+                installer_artifacts[target]["source_manifest_sha256"]
+                for target, (candidate_platform, _format) in INSTALLER_TARGETS.items()
+                if candidate_platform == platform
+            }
+            if len(digests) != 1:
+                raise CollectionError(f"installer targets disagree on source manifest provenance: {platform}")
+            source_manifest_hashes[platform] = digests.pop()
+    expected_files.update(source_manifest_files.values())
     try:
         actual_files = {child.name for child in root.iterdir()}
     except OSError as exc:
@@ -633,7 +762,30 @@ def verify_bundle_directory(
         sums_text = _read_bounded(root / "SHA256SUMS", 16 * 1024).decode("ascii")
     except UnicodeDecodeError as exc:
         raise CollectionError("SHA256SUMS is not ASCII") from exc
-    sums = _parse_sha256sums(sums_text, set(artifact_files.values()) | set(desktop_files.values()))
+    downloadable = set(artifact_files.values()) | set(desktop_files.values())
+    downloadable.update(installer_files.values())
+    downloadable.update(source_manifest_files.values())
+    if installer_files and build_kind == "release":
+        downloadable.add("manifest.json")
+    if runtime_manifest is not None:
+        downloadable.add(runtime_manifest["filename"])
+    sums = _parse_sha256sums(sums_text, downloadable)
+    if installer_files and build_kind == "release":
+        if sums["manifest.json"] != sha256_file(root / "manifest.json"):
+            raise CollectionError("unified installer manifest SHA-256 mismatch")
+    if runtime_manifest is not None:
+        try:
+            from .desktop_runtime_manifest import validate, ManifestError
+        except ImportError:
+            from desktop_runtime_manifest import validate, ManifestError
+        filename = runtime_manifest["filename"]
+        actual = sha256_file(root / filename)
+        if actual != runtime_manifest["sha256"] or sums.get(filename) != actual:
+            raise CollectionError("Runtime release manifest SHA-256 mismatch")
+        try:
+            validate(_read_json(root / filename, MAX_MANIFEST_BYTES), version)
+        except ManifestError as exc:
+            raise CollectionError("Runtime release manifest contract is invalid") from exc
     for platform in PLATFORMS:
         filename = artifact_files[platform]
         path = root / filename
@@ -642,7 +794,12 @@ def verify_bundle_directory(
             raise CollectionError(f"assembled archive SHA-256 mismatch: {platform}")
         _verify_archive_members(path, platform)
 
-    for platform in DESKTOP_PLATFORMS:
+    for platform, filename in source_manifest_files.items():
+        actual = sha256_file(root / filename)
+        if actual != source_manifest_hashes[platform] or sums.get(filename) != actual:
+            raise CollectionError(f"source manifest SHA-256 mismatch: {platform}")
+
+    for platform in desktop_platforms:
         filename = desktop_files[platform]
         path = root / filename
         try:
@@ -655,6 +812,29 @@ def verify_bundle_directory(
         if actual != desktop_hashes[platform] or sums.get(filename) != actual:
             raise CollectionError(f"Desktop distribution artifact SHA-256 mismatch: {platform}")
 
+    for target, filename in installer_files.items():
+        platform, package_format = INSTALLER_TARGETS[target]
+        path = root / filename
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise CollectionError(f"unified installer artifact is missing: {filename}") from exc
+        if size <= 0 or size > MAX_UNCOMPRESSED_BYTES:
+            raise CollectionError(f"unified installer is outside its size bound: {filename}")
+        actual = sha256_file(path)
+        if actual != installer_hashes[target] or sums.get(filename) != actual:
+            raise CollectionError(f"unified installer SHA-256 mismatch: {target}")
+        with path.open("rb") as handle:
+            magic = handle.read(8)
+        expected_magic = {
+            "deb": b"!<arch>\n",
+            "rpm": bytes.fromhex("edabeedb"),
+            "pkg": b"xar!",
+            "exe": b"MZ",
+        }[package_format]
+        if not magic.startswith(expected_magic):
+            raise CollectionError(f"unified installer container signature mismatch: {target}")
+
     for report in ("linux-x64-elf.txt", "linux-arm64-elf.txt"):
         try:
             size = (root / report).stat().st_size
@@ -665,7 +845,10 @@ def verify_bundle_directory(
 
     if build_kind == "release":
         manifest = _read_json(root / "manifest.json", MAX_MANIFEST_BYTES)
-        _validate_release_manifest(manifest, repo, version, artifact_files, artifact_hashes)
+        _validate_release_manifest(
+            manifest, repo, version, artifact_files, artifact_hashes,
+            installer_files or None, installer_hashes or None, source_manifest_hashes or None,
+        )
 
     return {
         "tag": expected_tag,
@@ -676,10 +859,24 @@ def verify_bundle_directory(
         "workflow_run_id": run_id,
         "archive_stem": archive_stem,
         "artifacts": artifact_hashes,
+        **({"runtime_manifest": runtime_manifest} if runtime_manifest is not None else {}),
         "desktop_artifacts": {
             platform: {"filename": desktop_files[platform], "sha256": desktop_hashes[platform]}
-            for platform in DESKTOP_PLATFORMS
+            for platform in desktop_platforms
         },
+        **({"installer_artifacts": {
+            target: {
+                "filename": installer_files[target],
+                "sha256": installer_hashes[target],
+                **({
+                    "inner_sha256": installer_artifacts[target]["inner_sha256"],
+                    "candidate_manifest_sha256": installer_artifacts[target]["candidate_manifest_sha256"],
+                } if INSTALLER_TARGETS[target][0].startswith("win32-") else {}),
+                "source_manifest_filename": installer_artifacts[target]["source_manifest_filename"],
+                "source_manifest_sha256": installer_artifacts[target]["source_manifest_sha256"],
+            }
+            for target in INSTALLER_TARGETS
+        }} if installer_files else {}),
     }
 
 

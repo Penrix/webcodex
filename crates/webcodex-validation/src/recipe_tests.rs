@@ -1,4 +1,7 @@
-use super::{resolve_validation_recipe, RecipeError, RecipeId, SemanticCheck};
+use super::{
+    resolve_validation_recipe, resolve_validation_recipe_with_packages, RecipeError, RecipeId,
+    SemanticCheck,
+};
 use std::fs;
 use std::path::Path;
 
@@ -146,6 +149,14 @@ fn recipe_resolution_fails_closed_for_ambiguity_mismatch_and_missing_marker() {
     )
     .unwrap_err();
     assert_eq!(mismatch.code, "validation_recipe_mismatch");
+    assert_eq!(
+        mismatch.details.as_ref().unwrap(),
+        &serde_json::json!({
+            "recipe_root": ".",
+            "candidate_recipes": ["node", "go"],
+            "detected_markers": ["package.json", "go.mod"],
+        })
+    );
 
     let empty = tempfile::tempdir().unwrap();
     let missing = resolve(empty.path(), None, None, &[SemanticCheck::Check], None).unwrap_err();
@@ -325,6 +336,73 @@ fn recipes_emit_only_canonical_argv_and_never_select_mutating_node_format() {
 }
 
 #[test]
+fn scoped_rust_and_go_recipes_bind_canonical_package_argv_into_invocation_identity() {
+    use sha2::{Digest, Sha256};
+
+    let rust = tempfile::tempdir().unwrap();
+    write(
+        rust.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['package-a','package-b']\n",
+    );
+    let rust_plan = resolve_validation_recipe_with_packages(
+        rust.path(),
+        None,
+        Some(RecipeId::Rust),
+        &[SemanticCheck::Check, SemanticCheck::Test],
+        None,
+        Some(&["package-b".into(), "package-a".into()]),
+    )
+    .unwrap();
+    assert_eq!(
+        rust_plan.steps[0].args,
+        [
+            "check",
+            "--all-targets",
+            "-p",
+            "package-a",
+            "-p",
+            "package-b"
+        ]
+    );
+    assert_eq!(
+        rust_plan.steps[1].args,
+        ["test", "-p", "package-a", "-p", "package-b"]
+    );
+    assert_eq!(
+        rust_plan.invocation_digest,
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&rust_plan.steps).unwrap())
+        )
+    );
+
+    let go = tempfile::tempdir().unwrap();
+    write(go.path(), "go.mod", "module example.test/fixture\n");
+    let go_plan = resolve_validation_recipe_with_packages(
+        go.path(),
+        None,
+        Some(RecipeId::Go),
+        &[SemanticCheck::Check, SemanticCheck::Test],
+        None,
+        Some(&["./cmd/...".into(), "./internal".into()]),
+    )
+    .unwrap();
+    assert_eq!(go_plan.steps[0].args, ["vet", "./cmd/...", "./internal"]);
+    assert_eq!(
+        go_plan.steps[1].args,
+        ["test", "-json", "./cmd/...", "./internal"]
+    );
+    assert_eq!(
+        go_plan.invocation_digest,
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&go_plan.steps).unwrap())
+        )
+    );
+}
+
+#[test]
 fn go_test_json_argv_is_bound_into_durable_invocation_identity() {
     use sha2::{Digest, Sha256};
 
@@ -396,6 +474,153 @@ fn node_package_manager_resolution_covers_declared_and_lockfile_evidence() {
             .unwrap()
             .contains("private body"));
     }
+}
+
+#[test]
+fn package_scope_is_rejected_for_non_portable_backends() {
+    let node = tempfile::tempdir().unwrap();
+    write(
+        node.path(),
+        "package.json",
+        r#"{"packageManager":"npm@10","scripts":{"test":"vitest"}}"#,
+    );
+    write(node.path(), "package-lock.json", "{}");
+    let error = resolve_validation_recipe_with_packages(
+        node.path(),
+        None,
+        Some(RecipeId::Node),
+        &[SemanticCheck::Test],
+        None,
+        Some(&["package-a".to_string()]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "validation_scope_unsupported");
+
+    let python = tempfile::tempdir().unwrap();
+    write(
+        python.path(),
+        "pyproject.toml",
+        "[tool.pytest.ini_options]\naddopts = '-q'\n",
+    );
+    let error = resolve_validation_recipe_with_packages(
+        python.path(),
+        None,
+        Some(RecipeId::Python),
+        &[SemanticCheck::Test],
+        None,
+        Some(&["package-a".to_string()]),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "validation_scope_unsupported");
+}
+
+#[test]
+fn project_recipe_filtered_execution_is_deterministic_without_repeating_arg_builders() {
+    for (marker, backend, filter) in [
+        ("Cargo.toml", RecipeId::Rust, " selected "),
+        ("go.mod", RecipeId::Go, "^TestA/Sub$"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        write(root.path(), marker, "");
+        let plain = resolve(
+            root.path(),
+            None,
+            Some(backend),
+            &[SemanticCheck::Test],
+            None,
+        )
+        .unwrap();
+        let selected = resolve(
+            root.path(),
+            None,
+            Some(backend),
+            &[SemanticCheck::Test],
+            Some(filter),
+        )
+        .unwrap();
+        let expected =
+            crate::project_validation_operation(backend.as_str(), SemanticCheck::Test, None)
+                .unwrap()
+                .with_test_filter(Some(filter))
+                .unwrap()
+                .build_readonly_plan()
+                .unwrap();
+        assert_eq!(selected.steps, vec![expected.structured_step]);
+        assert_eq!(selected.manifest_digest, plain.manifest_digest);
+        assert_ne!(selected.invocation_digest, plain.invocation_digest);
+        assert_eq!(
+            resolve(
+                root.path(),
+                None,
+                Some(backend),
+                &[SemanticCheck::Test],
+                Some("")
+            )
+            .unwrap()
+            .invocation_digest,
+            plain.invocation_digest
+        );
+    }
+}
+
+#[test]
+fn rust_member_manifest_digest_tracks_workspace_root_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['member']\nresolver='2'\n",
+    );
+    write(temp.path(), "Cargo.lock", "version = 4\n");
+    write(
+        temp.path(),
+        "member/Cargo.toml",
+        "[package]\nname='member'\nversion='0.1.0'\nedition='2021'\n",
+    );
+
+    let resolve_member = || {
+        resolve(
+            temp.path(),
+            Some("member"),
+            Some(RecipeId::Rust),
+            &[SemanticCheck::Check],
+            None,
+        )
+        .unwrap()
+    };
+    let original = resolve_member();
+    assert_eq!(original.recipe_root_relative, "member");
+    assert_eq!(original.steps[0].args, ["check", "--all-targets"]);
+
+    write(
+        temp.path(),
+        "member/src/lib.rs",
+        "pub fn value() -> u8 { 1 }\n",
+    );
+    let source_only = resolve_member();
+    assert_eq!(source_only.manifest_digest, original.manifest_digest);
+    assert_eq!(source_only.invocation_digest, original.invocation_digest);
+
+    write(temp.path(), "Cargo.lock", "version = 3\n");
+    let lock_changed = resolve_member();
+    assert_ne!(lock_changed.manifest_digest, original.manifest_digest);
+    assert_eq!(lock_changed.invocation_digest, original.invocation_digest);
+
+    write(temp.path(), "Cargo.lock", "version = 4\n");
+    write(
+        temp.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers=['member']\nresolver='2'\n[profile.dev]\nopt-level=1\n",
+    );
+    let workspace_manifest_changed = resolve_member();
+    assert_ne!(
+        workspace_manifest_changed.manifest_digest,
+        original.manifest_digest
+    );
+    assert_eq!(
+        workspace_manifest_changed.invocation_digest,
+        original.invocation_digest
+    );
 }
 
 #[test]
@@ -519,6 +744,31 @@ fn rust_filter_contract_normalizes_rejects_and_binds_identity() {
         "test_filter_unsupported"
     );
     assert!(!outside.path().join("target").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn marker_symlink_escape_remains_a_manifest_error_after_recipe_detection() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write(
+        outside.path(),
+        "Cargo.toml",
+        "[package]\nname='outside'\nversion='0.1.0'\n",
+    );
+    symlink(
+        outside.path().join("Cargo.toml"),
+        root.path().join("Cargo.toml"),
+    )
+    .unwrap();
+    assert_eq!(
+        resolve(root.path(), None, None, &[SemanticCheck::Check], None)
+            .unwrap_err()
+            .code,
+        "validation_manifest_invalid"
+    );
 }
 
 #[cfg(unix)]

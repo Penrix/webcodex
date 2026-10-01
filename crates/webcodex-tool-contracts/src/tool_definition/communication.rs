@@ -1,7 +1,7 @@
 use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
-    adaptive_runtime_direct, def, model_spec, permission_risk, require_all_scopes, ToolDefinition,
-    PERMISSION_RISK_WRITE, TOOL_CATEGORY_COMMUNICATION,
+    def, model_spec, permission_risk, require_all_scopes, ToolDefinition, PERMISSION_RISK_WRITE,
+    TOOL_CATEGORY_COMMUNICATION,
 };
 use crate::metadata::{
     ToolPathHint::None as NoPath,
@@ -41,7 +41,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Create a durable Server-owned Agent identity and mutable self-description card. For a new ChatGPT window that needs durable Agent continuation, this is the first setup step; next use rotate_agent_continuation_endpoint, then present_agent_continuation. The canonical wc_dagent_* id remains independent from windows, Endpoints, Workflow Sessions, Projects, and execution authority. Exact idempotency-key replay returns the original Agent; changed reuse is rejected.",
+            "Create a durable Server-owned Agent identity and mutable self-description card. For a new ChatGPT window that needs durable Agent continuation, this is the first setup step; use rotate_agent_continuation_endpoint for Endpoint preparation. Use present_agent_continuation only when its dedicated descriptor is advertised; an unavailable carrier is not a reason to repeat discovery. The canonical wc_dagent_* id remains independent from windows, Endpoints, Workflow Sessions, Projects, and execution authority. Exact idempotency-key replay returns the original Agent; changed reuse is rejected.",
         ),
         COMMUNICATION_MANAGE_SCOPES,
     ),
@@ -75,7 +75,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "List bounded durable Agent cards owned by the current communication principal, or read one exact Agent. Each listed Agent includes production_auto_resume_available, a read-only conjunction of current durable Endpoint truth and the current Server process's production Host carrier for that exact generation. It is continuation readiness only: not idle/presence, not a capacity reservation, not execution authority, and not a guarantee of immediate Host scheduling. Handles, names, descriptions, labels, and Endpoint counts are metadata only and never grant Project, filesystem, Runner, or Workflow Session authority.",
+            "List bounded durable Agent cards owned by the current communication principal, or read one exact Agent. Each listed Agent includes production_auto_resume_available, a read-only conjunction of current durable Endpoint truth and the current Server process's production Host carrier for that exact generation. When one current unexpired Endpoint matches that generation, agent_continuation_ref names the pinned tuple for present_agent_continuation. The ref is not a credential and grants no authority. Readiness is not idle/presence, not a capacity reservation, not execution authority, and not a guarantee of immediate Host scheduling. Handles, names, descriptions, labels, and Endpoint counts are metadata only and never grant Project, filesystem, Runner, or Workflow Session authority.",
         ),
         COMMUNICATION_READ_SCOPES,
     ),
@@ -117,8 +117,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         COMMUNICATION_MANAGE_SCOPES,
     ),
     require_all_scopes(
-        adaptive_runtime_direct(
-            permission_risk(
+        permission_risk(
                 model_spec(
                     def(
                         "rotate_agent_continuation_endpoint",
@@ -156,15 +155,16 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                         false,
                         super::ToolSessionEvidencePolicy::NONE,
                     ),
-                    "Create or rotate the server-local continuation Endpoint for an owned durable Agent. This is the canonical Endpoint step for first-time durable continuation setup; later calls replace the Endpoint with a new monotonic controller generation and make older generations stale. Next usually call present_agent_continuation. This tool does not establish a Host binding or production auto-resume readiness. Exact idempotency replay returns the same Endpoint.",
+                    "Create or rotate the server-local continuation Endpoint for an owned durable Agent. The result's agent_continuation_ref pins that exact Endpoint generation for present_agent_continuation; it is not a credential and will not follow a later rotation. This is the canonical Endpoint step for first-time durable continuation setup; later calls replace the Endpoint with a new monotonic controller generation and make older generations stale. Use present_agent_continuation only when its dedicated descriptor is advertised; do not repeat discovery for an unavailable Host carrier. This tool does not establish a Host binding or production auto-resume readiness. Exact idempotency replay returns the same Endpoint.",
                 ),
                 PERMISSION_RISK_WRITE,
             )
             .with_gpt_action_unsupported(),
-            19,
-        ),
         COMMUNICATION_MANAGE_SCOPES,
     ),
+    // Sole frozen GPT Actions name exception. Default Adaptive builds do not
+    // register or parse this historical spelling.
+    #[cfg(feature = "legacy-gpt-actions")]
     require_all_scopes(
         permission_risk(
             model_spec(
@@ -204,15 +204,14 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Compatibility name for rotate_agent_continuation_endpoint. Rotates only the server-local continuation Endpoint record for an owned durable Agent, assigns a new monotonic controller generation, and makes older generations stale. It does not connect to, configure, or control ChatGPT or any external Host. Public rotation is not wake-capable until a separately authorized process-local Host binding is established. Exact idempotency replay returns the same Endpoint.",
+            "Frozen legacy GPT Actions name for rotate_agent_continuation_endpoint. Rotates only the server-local continuation Endpoint record for an owned durable Agent, assigns a new monotonic controller generation, and makes older generations stale. The result's agent_continuation_ref pins that exact generation and is not a credential. It does not connect to, configure, or control ChatGPT or any external Host. Public rotation is not wake-capable until a separately authorized process-local Host binding is established. Exact idempotency replay returns the same Endpoint.",
             ),
             PERMISSION_RISK_WRITE,
         ),
         COMMUNICATION_MANAGE_SCOPES,
     ),
     require_all_scopes(
-        adaptive_runtime_direct(
-            model_spec(
+        model_spec(
                 def(
                     "present_agent_continuation",
                     super::ToolAuditPolicy::typed_fields(&[
@@ -225,7 +224,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                         super::ToolAuditResultField::pointer("dispatch_observation", "/agent_continuation/dispatch_observation"),
                         super::ToolAuditResultField::value("error_kind"),
                     ]),
-                    ModelVisible,
+                    ModelHidden,
                     TOOL_CATEGORY_COMMUNICATION,
                     None,
                     TOOL_PROVIDER_CONTROL,
@@ -242,11 +241,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     false,
                     super::ToolSessionEvidencePolicy::NONE,
                 ),
-                "Present one explicit durable Agent/Endpoint generation as a sparse MCP App continuation controller card. New durable Agent window setup is create_agent_identity -> rotate_agent_continuation_endpoint -> present_agent_continuation; after presentation, yield/end the current model turn promptly so the MCP App can establish and maintain the Host binding. Presentation success is not production auto-resume readiness: verify list_agent_identities.production_auto_resume_available afterward. All identity fields remain explicit; presentation is read-only and never itself establishes Host binding or execution authority.",
+                "Present one explicit durable Agent/Endpoint generation as a sparse MCP App continuation controller card. Pass either agent_continuation_ref from rotate_agent_continuation_endpoint or list_agent_identities, or the exact agent_id, endpoint_id, and expected_controller_generation. The ref only names that pinned tuple; it is not a credential, and this read still rechecks owner, lifecycle, and generation. New durable Agent window setup is create_agent_identity -> rotate_agent_continuation_endpoint -> present_agent_continuation; after presentation, yield/end the current model turn promptly so the MCP App can establish and maintain the Host binding. Presentation success is not production auto-resume readiness: verify list_agent_identities.production_auto_resume_available afterward. Presentation is read-only and never itself establishes Host binding or execution authority.",
             )
             .with_gpt_action_unsupported(),
-            18,
-        ),
         COMMUNICATION_READ_SCOPES,
     ),
     require_all_scopes(
@@ -551,6 +548,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             "Verify an exact Agent/Endpoint generation and return bounded turn context without Message bodies. activation_idempotency_key is only for explicit activation of an eligible pending Inbox-style Wake into this already-active turn; omit it for agent_task_attempt, attention_event, and agent_wait_events Wakes already dispatched by an Endpoint carrier. Explicit activation never requests a new model turn.",
         ),
@@ -855,6 +856,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             "Consume one exact durable Agent Wake continuation after accepting the resumed model turn. wake_id and consume_token identify the exact continuation, while endpoint_id and expected_controller_generation fence stale attachments. Repeating the same exact consume returns already_consumed without another state change. This operation never consumes Agent Inbox deliveries and grants no Project, filesystem, Runner, Task, or Workflow Session authority.",
             ),

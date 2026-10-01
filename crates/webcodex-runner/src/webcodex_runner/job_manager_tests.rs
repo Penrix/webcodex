@@ -19,6 +19,11 @@ use std::sync::OnceLock;
 use tempfile::TempDir;
 use webcodex_core::runner_protocol::{RunnerEnvelope, VALIDATION_STEP_WAIT_FAILED_CODE};
 
+#[path = "job_manager_tests/project_build.rs"]
+mod project_build;
+#[path = "job_manager_tests/project_validation.rs"]
+mod project_validation;
+
 fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
     let mut snapshot = test_job_snapshot(job_id);
     snapshot.status = "completed".to_string();
@@ -29,10 +34,543 @@ fn retained_terminal_job(job_id: &str, ended_at: i64) -> RunningJob {
         client_id: "test-agent".to_string(),
         runner_instance_id: "test-instance".to_string(),
         snapshot,
+        input: None,
         child: None,
         stop_requested: Arc::new(AtomicBool::new(false)),
         slot_reserved: false,
     }
+}
+
+#[test]
+fn job_update_delivery_signal_wakes_all_worker_consumers() {
+    let signal = Arc::new(JobUpdateDeliverySignal::default());
+    let mut waiters = Vec::new();
+    for _ in 0..2 {
+        let signal = Arc::clone(&signal);
+        waiters.push(std::thread::spawn(move || {
+            let started = Instant::now();
+            let generation = signal
+                .wait_for_change(0, Duration::from_secs(2))
+                .expect("signal remains open");
+            (generation, started.elapsed())
+        }));
+    }
+
+    std::thread::sleep(Duration::from_millis(50));
+    signal.notify();
+
+    for waiter in waiters {
+        let (generation, elapsed) = waiter.join().expect("signal waiter");
+        assert_eq!(generation, 1);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "all worker consumers must wake promptly from one update notification"
+        );
+    }
+}
+
+#[test]
+fn heartbeat_batch_advances_only_runner_owned_active_lifecycles() {
+    let manager = JobManager::new(1);
+    for (job_id, status) in [
+        ("heartbeat-agent-queued", "agent_queued"),
+        ("heartbeat-running", "running"),
+        ("heartbeat-stop-requested", "stop_requested"),
+        ("heartbeat-server-queued", "queued"),
+        ("heartbeat-legacy-started", "started"),
+        ("heartbeat-terminal", "completed"),
+    ] {
+        let mut snapshot = test_job_snapshot(job_id);
+        snapshot.status = status.to_string();
+        if status == "completed" {
+            snapshot.ended_at = Some(chrono::Utc::now().timestamp());
+            snapshot.exit_code = Some(0);
+            snapshot.duration_ms = Some(1);
+        }
+        lock_unpoison(&manager.jobs).insert(
+            job_id.to_string(),
+            RunningJob {
+                client_id: "test-agent".to_string(),
+                runner_instance_id: "test-instance".to_string(),
+                snapshot,
+                input: None,
+                child: None,
+                stop_requested: Arc::new(AtomicBool::new(status == "stop_requested")),
+                slot_reserved: runner_job_is_active(status),
+            },
+        );
+    }
+
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        3
+    );
+
+    let jobs = lock_unpoison(&manager.jobs);
+    for job_id in [
+        "heartbeat-agent-queued",
+        "heartbeat-running",
+        "heartbeat-stop-requested",
+    ] {
+        assert_eq!(jobs[job_id].snapshot.update_seq, 2, "{job_id}");
+    }
+    for job_id in [
+        "heartbeat-server-queued",
+        "heartbeat-legacy-started",
+        "heartbeat-terminal",
+    ] {
+        assert_eq!(jobs[job_id].snapshot.update_seq, 1, "{job_id}");
+    }
+    drop(jobs);
+
+    let pending = lock_unpoison(&manager.pending_job_updates);
+    for job_id in [
+        "heartbeat-agent-queued",
+        "heartbeat-running",
+        "heartbeat-stop-requested",
+    ] {
+        let marker = pending[job_id]
+            .output_only
+            .as_ref()
+            .expect("active Job heartbeat marker");
+        assert_eq!(marker.update_seq, 2);
+        assert!(marker.liveness_only);
+        assert!(!marker.finished);
+    }
+    for job_id in [
+        "heartbeat-server-queued",
+        "heartbeat-legacy-started",
+        "heartbeat-terminal",
+    ] {
+        assert!(!pending.contains_key(job_id), "{job_id}");
+    }
+}
+
+#[test]
+fn heartbeat_delivery_is_minimal_liveness_only_payload() {
+    let manager = JobManager::new(1);
+    let job_id = "heartbeat-minimal";
+    let mut snapshot = test_job_snapshot(job_id);
+    snapshot.stdout.tail = "retained stdout\n".to_string();
+    snapshot.stderr.tail = "retained stderr\n".to_string();
+    snapshot.command_execution_state = Some(ShellCommandExecutionState::OutcomeUnknown);
+    snapshot.context.validation_steps = vec!["check".to_string(), "test".to_string()];
+    snapshot.validation_progress = Some(ShellJobValidationProgress {
+        completed: 1,
+        current_step: Some("test".to_string()),
+        failed_step: None,
+    });
+    snapshot.activity = Some(ShellJobActivity {
+        state: ShellJobActivityState::Working,
+        phase: ShellJobActivityPhase::ValidationTest,
+        source: ShellJobActivitySource::ValidationPlan,
+    });
+    lock_unpoison(&manager.jobs).insert(
+        job_id.to_string(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            runner_instance_id: "test-instance".to_string(),
+            snapshot,
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        1
+    );
+    let marker = lock_unpoison(&manager.pending_job_updates)[job_id]
+        .output_only
+        .clone()
+        .expect("heartbeat marker");
+    let jobs = lock_unpoison(&manager.jobs);
+    let update = job_update_from_delivery(&jobs[job_id], &marker);
+    assert_eq!(update.update_seq, Some(2));
+    assert_eq!(update.status, "running");
+    assert!(update.stdout_chunk.is_none());
+    assert!(update.stderr_chunk.is_none());
+    assert!(update.log_snapshot.is_none());
+    assert!(update.exit_code.is_none());
+    assert!(update.duration_ms.is_none());
+    assert!(update.error.is_none());
+    assert!(update.command_execution_state.is_none());
+    assert_eq!(
+        update.validation_progress,
+        Some(ShellJobValidationProgress {
+            completed: 1,
+            current_step: Some("test".to_string()),
+            failed_step: None,
+        })
+    );
+    assert!(update.test_count_evidence.is_none());
+    assert!(update.activity.is_none());
+    assert!(!update.finished);
+}
+
+#[test]
+fn heartbeat_delivery_stays_behind_meaningful_updates_and_stops_at_terminal() {
+    let manager = JobManager::new(1);
+    let job_id = "heartbeat-order";
+    lock_unpoison(&manager.jobs).insert(
+        job_id.to_string(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            runner_instance_id: "test-instance".to_string(),
+            snapshot: test_job_snapshot(job_id),
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        1
+    );
+    manager.update_and_send(
+        job_id,
+        RunnerJobDelta {
+            status: "stop_requested".to_string(),
+            error: Some("stop requested".to_string()),
+            ..Default::default()
+        },
+    );
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = &pending[job_id];
+        assert_eq!(queue.required.len(), 1);
+        assert_eq!(queue.required.front().unwrap().update_seq, 3);
+        assert!(queue.output_only.is_none());
+    }
+
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        1
+    );
+    {
+        let pending = lock_unpoison(&manager.pending_job_updates);
+        let queue = &pending[job_id];
+        assert_eq!(queue.next().unwrap().update_seq, 3);
+        let heartbeat = queue.output_only.as_ref().expect("post-stop heartbeat");
+        assert_eq!(heartbeat.update_seq, 4);
+        assert!(heartbeat.liveness_only);
+    }
+
+    manager.update_and_send(
+        job_id,
+        RunnerJobDelta {
+            status: "stopped".to_string(),
+            error: Some("stopped".to_string()),
+            finished: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        queue_job_heartbeat_batch(
+            &manager.jobs,
+            &manager.pending_job_updates,
+            &manager.job_update_delivery_order,
+            &manager.delivery_signal,
+        ),
+        0
+    );
+    let pending = lock_unpoison(&manager.pending_job_updates);
+    let queue = &pending[job_id];
+    assert!(queue.output_only.is_none());
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|update| update.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 5]
+    );
+}
+
+#[test]
+fn heartbeat_worker_keeps_fixed_cadence_across_signals_and_exits_on_shutdown() {
+    let jobs = Arc::new(Mutex::new(HashMap::new()));
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let delivery_order = Arc::new(Mutex::new(()));
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let signal = Arc::new(JobUpdateDeliverySignal::default());
+    let job_id = "heartbeat-worker";
+    lock_unpoison(&jobs).insert(
+        job_id.to_string(),
+        RunningJob {
+            client_id: "test-agent".to_string(),
+            runner_instance_id: "test-instance".to_string(),
+            snapshot: test_job_snapshot(job_id),
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    let interval = Duration::from_millis(300);
+    let worker = spawn_job_heartbeat_worker_with_interval(
+        Arc::downgrade(&jobs),
+        Arc::downgrade(&pending),
+        Arc::downgrade(&delivery_order),
+        Arc::downgrade(&shutting_down),
+        Arc::downgrade(&signal),
+        interval,
+    );
+
+    std::thread::sleep(Duration::from_millis(180));
+    signal.notify();
+    assert!(
+        wait_until(Duration::from_millis(220), || lock_unpoison(&jobs)[job_id]
+            .snapshot
+            .update_seq
+            >= 2),
+        "ordinary delivery signals must not postpone the fixed heartbeat cadence"
+    );
+
+    shutting_down.store(true, Ordering::SeqCst);
+    let shutdown_started = Instant::now();
+    signal.close();
+    worker.join().expect("heartbeat worker must exit cleanly");
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(1),
+        "closed shutdown signal must wake the heartbeat worker promptly"
+    );
+}
+
+#[test]
+fn delivery_queue_orders_semantic_truth_and_drops_stale_output_only_updates() {
+    let mut queue = JobUpdateDeliveryQueue::default();
+    let base = RunnerJobUpdateRequest {
+        client_id: "test-agent".into(),
+        runner_instance_id: "test-instance".into(),
+        job_id: "ordered-delivery".into(),
+        request_id: Some("request-ordered-delivery".into()),
+        update_seq: Some(0),
+        status: "running".into(),
+        stdout_chunk: None,
+        stderr_chunk: None,
+        log_snapshot: None,
+        exit_code: None,
+        duration_ms: None,
+        error: None,
+        command_execution_state: None,
+        validation_progress: None,
+        test_count_evidence: None,
+        activity: None,
+        finished: false,
+    };
+    let mut semantic = base.clone();
+    semantic.update_seq = Some(3);
+    semantic.status = "stop_requested".into();
+    semantic.error = Some("stop requested".into());
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), true));
+
+    // A: a stale output-only (seq2) that arrives behind newer semantic truth
+    // (seq3) is dropped rather than retained to regress the drained state.
+    let mut stale_heartbeat = semantic.clone();
+    stale_heartbeat.update_seq = Some(2);
+    stale_heartbeat.status = "running".into();
+    stale_heartbeat.error = None;
+    assert!(queue.enqueue(
+        PendingJobUpdateDelivery::from_update(&stale_heartbeat),
+        false
+    ));
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+    assert!(queue.output_only.is_none());
+
+    // B: out-of-order semantic seq5 then seq4 both land, kept ascending.
+    semantic.update_seq = Some(5);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), true));
+    semantic.update_seq = Some(4);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), true));
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+
+    // C: a duplicate semantic seq4 replaces the existing seq4 in place. The
+    // distinct status/error sentinel proves replacement, not a new item.
+    let mut duplicate = semantic.clone();
+    duplicate.status = "stopped_replaced".into();
+    duplicate.error = Some("replaced sentinel".into());
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&duplicate), true));
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    let replaced = queue
+        .required
+        .iter()
+        .find(|pending| pending.update_seq == 4)
+        .unwrap();
+    assert_eq!(replaced.status, "stopped_replaced");
+    assert_eq!(replaced.error.as_deref(), Some("replaced sentinel"));
+
+    // D: a genuinely newer output-only (seq6) is coalesced and retained.
+    semantic.update_seq = Some(6);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), false));
+    assert_eq!(queue.output_only.as_ref().unwrap().update_seq, 6);
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+
+    // E: newer semantic truth (seq7) clears the older output-only (seq6).
+    semantic.update_seq = Some(7);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&semantic), true));
+    assert!(queue.output_only.is_none());
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5, 7]
+    );
+
+    // F: once required holds seq7, an output-only seq7 or seq6 must not
+    // resurrect an older/equal heartbeat behind the semantic truth.
+    let mut backdoor = semantic.clone();
+    backdoor.update_seq = Some(7);
+    backdoor.status = "running".into();
+    backdoor.error = None;
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&backdoor), false));
+    assert!(queue.output_only.is_none());
+    backdoor.update_seq = Some(6);
+    assert!(queue.enqueue(PendingJobUpdateDelivery::from_update(&backdoor), false));
+    assert!(queue.output_only.is_none());
+    assert_eq!(
+        queue
+            .required
+            .iter()
+            .map(|pending| pending.update_seq)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5, 7]
+    );
+}
+
+#[test]
+fn delivery_worker_waits_for_sequence_barrier_before_selecting_candidate() {
+    let manager = JobManager::new(1);
+    let job_id = "delivery-sequence-barrier";
+    let mut snapshot = test_job_snapshot(job_id);
+    snapshot.update_seq = 5;
+    lock_unpoison(&manager.jobs).insert(
+        job_id.to_string(),
+        RunningJob {
+            client_id: "test-agent".into(),
+            runner_instance_id: "test-instance".into(),
+            snapshot,
+            input: None,
+            child: None,
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            slot_reserved: true,
+        },
+    );
+
+    // Model the exact producer gap this queue exists to tolerate: seq5 is
+    // already pending while an older generated seq4 still owns the sequencing
+    // barrier and has not reached the queue yet. The delivery worker must not
+    // let seq5 escape during that window.
+    let delivery_order = lock_unpoison(&manager.job_update_delivery_order);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    manager.install_sink(RunnerSink::WebSocket {
+        tx,
+        client_id: "test-agent".into(),
+        runner_instance_id: "test-instance".into(),
+    });
+
+    let pending = |update_seq, status: &str| PendingJobUpdateDelivery {
+        update_seq,
+        status: status.to_string(),
+        exit_code: None,
+        duration_ms: None,
+        error: None,
+        command_execution_state: None,
+        validation_progress: None,
+        test_count_evidence: None,
+        activity: None,
+        finished: false,
+        liveness_only: false,
+    };
+    {
+        let mut pending_map = lock_unpoison(&manager.pending_job_updates);
+        assert!(pending_map
+            .entry(job_id.to_string())
+            .or_default()
+            .enqueue(pending(5, "stop_requested"), true));
+    }
+    manager.delivery_signal.notify();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    {
+        let mut pending_map = lock_unpoison(&manager.pending_job_updates);
+        assert!(pending_map
+            .get_mut(job_id)
+            .unwrap()
+            .enqueue(pending(4, "running"), true));
+    }
+    drop(delivery_order);
+    manager.delivery_signal.notify();
+
+    let updates = collect_job_updates(&mut rx, Duration::from_secs(5));
+    assert_eq!(
+        updates
+            .iter()
+            .map(|update| update.update_seq)
+            .collect::<Vec<_>>(),
+        vec![Some(4), Some(5)]
+    );
+    assert_eq!(updates[0].status, "running");
+    assert_eq!(updates[1].status, "stop_requested");
 }
 
 #[test]
@@ -48,6 +586,7 @@ fn job_reconciliation_inventory_prioritizes_active_and_bounds_terminal_history()
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot: active,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -168,6 +707,7 @@ fn job_reconciliation_inventory_drops_terminal_payload_before_active_jobs() {
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot: active,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -211,6 +751,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
             client_id: "test-agent".to_string(),
             runner_instance_id: "test-instance".to_string(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -237,7 +778,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
             ..Default::default()
         },
     );
-    let first = recv_job_update(&mut rx, Duration::from_secs(2), "incremental update");
+    let first = recv_job_update(&mut rx, Duration::from_secs(5), "incremental update");
     assert_eq!(first.update_seq, Some(2));
     assert!(first.stdout_chunk.is_none());
     let first_logs = first
@@ -316,7 +857,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
         runner_instance_id: "test-instance".to_string(),
     });
     manager.replay_snapshots_since(&registered_inventory);
-    assert!(wait_until(Duration::from_secs(2), || {
+    assert!(wait_until(Duration::from_secs(5), || {
         !lock_unpoison(&manager.pending_job_updates).contains_key("offline-terminal-job")
     }));
     while reconnected_rx.try_recv().is_ok() {}
@@ -341,7 +882,7 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     manager.replay_snapshots_since(&registered_inventory);
     let replay = recv_job_update(
         &mut fresh_rx,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         "post-register replay",
     );
     assert_eq!(replay.job_id, "offline-terminal-job");
@@ -351,10 +892,23 @@ fn job_reconciliation_local_snapshot_advances_before_best_effort_send() {
     assert_eq!(logs.stdout.tail, "one\ntwo\n");
     assert_eq!(logs.stdout.next_line, 3);
 
+    // Receiving the replay proves it entered the transport queue, but the
+    // delivery worker may not yet have acknowledged the same update_seq in its
+    // local pending queue. Wait for that first delivery to retire before
+    // simulating a later server stop; otherwise the resend can legitimately
+    // coalesce with the still-pending identical sequence and the test races its
+    // own delivery bookkeeping.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            !lock_unpoison(&manager.pending_job_updates).contains_key("offline-terminal-job")
+        }),
+        "first terminal replay must retire before simulating the later stop"
+    );
+
     manager.stop("offline-terminal-job").unwrap();
     let stopped_race = recv_job_update(
         &mut fresh_rx,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
         "stop racing a lost terminal update replays the terminal snapshot",
     );
     assert_eq!(stopped_race.status, "completed");
@@ -826,6 +1380,7 @@ fn job_manager_stop_terminates_the_process_group() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("process-group-job"),
+            input: None,
             child: Some(child.clone()),
             stop_requested: stop_requested.clone(),
             slot_reserved: true,
@@ -873,6 +1428,7 @@ fn job_shutdown_reaps_a_sigterm_responsive_child() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-responsive"),
+            input: None,
             child: Some(Arc::clone(&child)),
             stop_requested: Arc::clone(&stop_requested),
             slot_reserved: true,
@@ -921,6 +1477,7 @@ fn job_shutdown_escalates_ignored_sigterm_for_parent_and_descendant() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot: test_job_snapshot("term-ignoring"),
+            input: None,
             child: Some(Arc::clone(&child)),
             stop_requested: Arc::clone(&stop_requested),
             slot_reserved: true,
@@ -1042,7 +1599,7 @@ fn structured_process_helper() -> Arc<StructuredProcessHelper> {
         .get_or_init(|| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/fixtures/process_argv_helper.rs");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::tests::executable_tempdir();
             let output = temp.path().join(format!(
                 "structured-process-helper{}",
                 std::env::consts::EXE_SUFFIX
@@ -1808,6 +2365,7 @@ fn phase_e2_prestart_structured_failure_releases_slot_for_queued_job() {
             client_id: "structured-agent".to_string(),
             runner_instance_id: "structured-instance".to_string(),
             snapshot: failed_snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -2162,6 +2720,7 @@ fn output_only_delivery_coalescing_preserves_authoritative_snapshot_invariants()
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -2468,7 +3027,7 @@ fn structured_process_job_drains_large_output_without_log_observation_and_runs_o
             "{name}: {:?}",
             stream.tail
         );
-        assert!(stream.tail.as_bytes().iter().any(|byte| *byte == tail_byte));
+        assert!(stream.tail.as_bytes().contains(&tail_byte));
         assert!(std::str::from_utf8(stream.tail.as_bytes()).is_ok());
     }
     let starts = std::fs::read_to_string(marker).unwrap();
@@ -3017,6 +3576,14 @@ fn structured_script_job_keeps_its_temporary_file_until_terminal_then_removes_it
         "the Runner-owned script file was removed while its one execution was still running"
     );
     assert_eq!(std::fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            manager.inventory().jobs.iter().any(|snapshot| {
+                snapshot.job_id == "structured-script" && snapshot.status == "running"
+            })
+        }),
+        "structured script never published its running lifecycle after the child started"
+    );
     let active = manager
         .inventory()
         .jobs
@@ -3132,7 +3699,7 @@ fn structured_script_job_drains_large_output_without_log_observation_and_runs_on
             "{name}: {:?}",
             stream.tail
         );
-        assert!(stream.tail.as_bytes().iter().any(|byte| *byte == tail_byte));
+        assert!(stream.tail.as_bytes().contains(&tail_byte));
         assert!(std::str::from_utf8(stream.tail.as_bytes()).is_ok());
     }
     assert_eq!(
@@ -3164,6 +3731,7 @@ fn structured_job_snapshot_preserves_post_spawn_outcome_unknown() {
             client_id: "structured-agent".to_string(),
             runner_instance_id: "structured-instance".to_string(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -3324,6 +3892,7 @@ fn cargo_test_terminal_count_evidence_survives_runner_stream_retention() {
     let mut context = test_job_context(temp.path(), vec!["test".to_string()]);
     context.purpose = Some("test".to_string());
     context.validation = Some(runner_protocol::ShellJobValidationMetadata {
+        project_validation: None,
         source_fence: None,
         tool: "cargo_test".to_string(),
         kind: "test".to_string(),
@@ -3516,6 +4085,7 @@ fn arbitrary_process_output_cannot_forge_cargo_activity() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -3587,6 +4157,7 @@ fn cargo_activity_returns_to_validation_plan_after_fine_phase_ends() {
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -3691,6 +4262,7 @@ fn activity_only_delivery_coalesces_without_consuming_required_semantic_queue() 
             client_id: "test-agent".into(),
             runner_instance_id: "test-instance".into(),
             snapshot,
+            input: None,
             child: None,
             stop_requested: Arc::new(AtomicBool::new(false)),
             slot_reserved: true,
@@ -4344,7 +4916,7 @@ fn job_tree_helper() -> Arc<JobTreeHelper> {
         .get_or_init(|| {
             let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../webcodex-process/src/bin/process_tree_helper.rs");
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::tests::executable_tempdir();
             let output = temp.path().join(format!(
                 "process-tree-helper{}",
                 std::env::consts::EXE_SUFFIX
@@ -4492,6 +5064,7 @@ fn insert_running_job(
             client_id: "tree-agent".to_string(),
             runner_instance_id: "tree-instance".to_string(),
             snapshot: test_job_snapshot(job_id),
+            input: None,
             child,
             stop_requested: Arc::clone(&stop_requested),
             slot_reserved: true,
@@ -4686,6 +5259,7 @@ fn runner_real_process_job_stop_all_terminates_all_trees_and_preserves_completed
                 client_id: "tree-agent".to_string(),
                 runner_instance_id: "tree-instance".to_string(),
                 snapshot,
+                input: None,
                 child: None,
                 stop_requested: Arc::clone(&completed_stop),
                 slot_reserved: false,
@@ -4918,6 +5492,7 @@ fn runner_real_process_job_timeout_terminates_the_whole_tree() {
 
 pub(crate) fn shell_job_request(cwd: &Path, command: &str) -> RunnerRequest {
     RunnerRequest {
+        login: false,
         shell: None,
         request_id: "req-job".to_string(),
         client_id: "ws-client".to_string(),
@@ -4965,6 +5540,7 @@ fn runner_recovery_context_rejects_cross_product_go_test_metadata() {
     context.purpose = Some("validation".to_string());
     context.validation_steps = vec!["test".to_string()];
     context.validation = Some(runner_protocol::ShellJobValidationMetadata {
+        project_validation: None,
         source_fence: None,
         tool: "go_test".to_string(),
         kind: "test".to_string(),
@@ -5046,6 +5622,19 @@ fn runner_recovery_context_accepts_compact_session_base64url_alphabet() {
 }
 
 #[test]
+fn runner_recovery_context_accepts_bash_login_shell() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut request = shell_job_request(temp.path(), "printf ok");
+    request.login = true;
+    request.shell = Some(webcodex_core::workflow_session_contract::ExecutionShell::Bash);
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("bash_login".to_string());
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+}
+
+#[test]
 fn runner_recovery_context_accepts_javascript_script_job() {
     let temp = tempfile::tempdir().unwrap();
     let script = runner_protocol::ShellScriptPayload {
@@ -5082,6 +5671,60 @@ fn runner_recovery_context_accepts_javascript_script_job() {
     invalid.shell = Some("node".to_string());
     let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
     assert!(error.contains("shell is invalid"), "{error}");
+}
+
+#[test]
+fn runner_recovery_context_accepts_python_script_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let script = runner_protocol::ShellScriptPayload {
+        language: runner_protocol::ShellScriptLanguage::Python,
+        script: "print('recovered')\n".to_string(),
+        args: vec!["literal arg".to_string()],
+    };
+    let mut request = shell_job_request(temp.path(), "");
+    request.kind = "start_script_job".to_string();
+    request.timeout_secs = 60;
+    request.script = Some(script.clone());
+    let context = request.job_context.as_mut().unwrap();
+    context.shell = Some("python".to_string());
+    context.command_preview = format!(
+        "python script ({} bytes, {} args)",
+        script.script.len(),
+        script.args.len()
+    );
+    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
+        execution_source: "run_script".to_string(),
+        language: Some(runner_protocol::ShellScriptLanguage::Python),
+        script_bytes: Some(script.script.len()),
+        arg_count: script.args.len(),
+        stdin_present: false,
+        validation_identity: None,
+        validation_tool: None,
+        assertion_name: None,
+    });
+    let context = context.clone();
+
+    validate_runner_job_context(&context, &request, "ws-client").unwrap();
+    assert_eq!(context.shell.as_deref(), Some("python"));
+    assert_eq!(
+        context.structured_execution.as_ref().unwrap().language,
+        Some(runner_protocol::ShellScriptLanguage::Python)
+    );
+    assert_eq!(
+        context
+            .structured_execution
+            .as_ref()
+            .unwrap()
+            .execution_source,
+        "run_script"
+    );
+
+    for concrete_runtime in ["python3", "python.exe"] {
+        let mut invalid = context.clone();
+        invalid.shell = Some(concrete_runtime.to_string());
+        let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
+        assert!(error.contains("shell is invalid"), "{error}");
+    }
 }
 
 #[test]
@@ -5186,6 +5829,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
             client_id: "ws-client".to_string(),
             runner_instance_id: "ws-instance".to_string(),
             snapshot: test_job_snapshot("running-job"),
+            input: None,
             child: Some(Arc::clone(&running_child)),
             stop_requested: stop_requested.clone(),
             slot_reserved: true,
@@ -5193,6 +5837,7 @@ fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
     );
     let (sink, mut rx) = ws_sink("ws-client");
     let request = RunnerRequest {
+        login: false,
         shell: None,
         request_id: "req-queued".to_string(),
         client_id: "ws-client".to_string(),
@@ -5374,4 +6019,173 @@ pub(in crate::webcodex_runner) fn assert_post_spawn_interruption_delta(
         Some(ShellCommandExecutionState::OutcomeUnknown)
     );
     assert!(delta.finished);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "real-process stdin isolation: runs an isolated JobManager with parent-only input"]
+fn runner_real_process_shell_job_stdin_isolated() {
+    assert_local_job_stdin_isolated("runner_real_process_shell_job_stdin_isolated", false);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+#[test]
+#[ignore = "real-process stdin isolation: covers every step of a validation Job"]
+fn runner_real_process_validation_job_stdin_isolated() {
+    assert_local_job_stdin_isolated("runner_real_process_validation_job_stdin_isolated", true);
+}
+
+#[cfg(feature = "runner-real-process-tests")]
+fn assert_local_job_stdin_isolated(test_name: &str, validation: bool) {
+    const FIXTURE_ENV: &str = "WEBCODEX_TEST_JOB_STDIN_FIXTURE";
+    const PARENT_INPUT: &str = "parent-liveness-input-must-not-reach-jobs\n";
+    if std::env::var(FIXTURE_ENV).as_deref() == Ok(test_name) {
+        let root = if validation {
+            crate::tests::executable_tempdir()
+        } else {
+            tempfile::tempdir().unwrap()
+        };
+        let mut shell = ShellConfig::default();
+        #[cfg(windows)]
+        let probe =
+            "if ([Console]::In.ReadToEnd().Length -ne 0) { exit 9 }; Write-Output 'JOB_STDIN_EOF'";
+        #[cfg(unix)]
+        let probe = "if IFS= read -r line; then exit 9; fi; printf 'JOB_STDIN_EOF\\n'";
+        let mut request = shell_job_request(root.path(), probe);
+        request.timeout_secs = 5;
+        if validation {
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            std::fs::copy(
+                &structured_process_helper().path,
+                bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)),
+            )
+            .unwrap();
+            shell.path_prepend.push(bin);
+            let steps = vec![
+                ShellJobValidationStep {
+                    name: "format".into(),
+                    program: "cargo".into(),
+                    args: vec!["fmt".into(), "--".into(), "--check".into()],
+                    env: Vec::new(),
+                },
+                ShellJobValidationStep {
+                    name: "check".into(),
+                    program: "cargo".into(),
+                    args: vec!["check".into(), "--all-targets".into()],
+                    env: Vec::new(),
+                },
+            ];
+            request.kind = "start_validation_job".to_string();
+            request.command = serde_json::to_string(&steps).unwrap();
+            request.job_context = Some(test_job_context(
+                root.path(),
+                vec!["format".into(), "check".into()],
+            ));
+        }
+        let (sink, mut rx) = ws_sink("ws-client");
+        let manager = JobManager::new(1);
+        manager.enqueue(
+            sink,
+            PendingJobStart::from_wire(
+                1,
+                RunnerPolicy {
+                    allow_raw_shell: true,
+                    allow_cwd_anywhere: true,
+                    ..RunnerPolicy::default()
+                },
+                shell,
+                SshConfig::default(),
+                root.path().join("project-registry"),
+                request,
+            ),
+        );
+        let updates = collect_job_updates(&mut rx, Duration::from_secs(10));
+        let terminal = updates.last().expect("Job must emit an update");
+        assert!(
+            terminal.finished,
+            "Job did not reach terminal: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.status, "completed",
+            "Job inherited parent stdin: {terminal:?}"
+        );
+        assert_eq!(
+            terminal.exit_code,
+            Some(0),
+            "Job must receive EOF: {terminal:?}"
+        );
+        if validation {
+            assert_eq!(terminal.validation_progress.as_ref().unwrap().completed, 2);
+        }
+        let stdout = terminal.log_snapshot.as_ref().unwrap().stdout.tail.as_str();
+        assert_eq!(
+            stdout.matches("JOB_STDIN_EOF").count(),
+            if validation { 2 } else { 1 }
+        );
+        let mut remaining = String::new();
+        std::io::stdin().read_to_string(&mut remaining).unwrap();
+        assert_eq!(
+            remaining, PARENT_INPUT,
+            "Jobs must not consume Runner input"
+        );
+        return;
+    }
+
+    // Isolate the inherited input in a subprocess; never replace process-global
+    // stdin in the test runner or depend on an interactive terminal / installed Git.
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("parent-input");
+    std::fs::write(&input, PARENT_INPUT).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            &format!(
+                "{}::{test_name}",
+                module_path!().split_once("::").unwrap().1
+            ),
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(FIXTURE_ENV, test_name)
+        .stdin(std::fs::File::open(input).unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = ManagedChild::spawn(&mut command).unwrap();
+    let mut stdout = child.child_mut().stdout.take().unwrap();
+    let mut stderr = child.child_mut().stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.terminate_tree().unwrap();
+            break child.wait().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // Reclaim descendants even after a failed fixture before joining pipe readers.
+    child.terminate_tree().unwrap();
+    let stdout = out.join().unwrap();
+    let stderr = err.join().unwrap();
+    assert!(
+        status.success(),
+        "isolated {test_name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(String::from_utf8_lossy(&stdout).contains("1 passed"));
 }

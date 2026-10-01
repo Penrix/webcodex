@@ -17,8 +17,39 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
+        trusted_recording_session_id: Option<&str>,
     ) -> ToolResult {
         match call {
+            ToolCall::RecordExternalObservation {
+                project,
+                session_id,
+                adapter_id,
+                event_id,
+                observed_tool,
+                exit_code,
+            } => {
+                self.external_observation_tool(
+                    project,
+                    session_id,
+                    Some(webcodex_store::ExternalObservation {
+                        adapter_id,
+                        event_id,
+                        tool: observed_tool,
+                        exit_code,
+                        recorded_at: chrono::Utc::now().timestamp(),
+                    }),
+                    auth,
+                )
+                .await
+            }
+            ToolCall::ListExternalObservations {
+                project,
+                session_id,
+            } => {
+                self.external_observation_tool(project, session_id, None, auth)
+                    .await
+            }
             ToolCall::StartSession {
                 project,
                 title,
@@ -37,6 +68,15 @@ impl ToolRuntime {
                     auth,
                 )
                 .await
+            }
+            ToolCall::ListSessions {
+                project,
+                lifecycle,
+                offset,
+                limit,
+            } => {
+                self.list_sessions_tool(project, lifecycle, offset, limit, auth)
+                    .await
             }
             ToolCall::SessionSummary { session_id, limit } => {
                 self.session_summary_tool(session_id, limit, auth).await
@@ -74,6 +114,7 @@ impl ToolRuntime {
                 reply_to,
                 priority,
                 requires_ack,
+                delivery_key,
             } => {
                 self.post_session_message_tool(
                     session_id,
@@ -83,7 +124,10 @@ impl ToolRuntime {
                     reply_to,
                     priority,
                     requires_ack,
+                    delivery_key,
                     auth,
+                    window,
+                    trusted_recording_session_id,
                 )
                 .await
             }
@@ -159,6 +203,95 @@ impl ToolRuntime {
             }
             _ => unreachable!("non-session tool routed to session dispatcher"),
         }
+    }
+
+    pub(crate) async fn list_sessions_tool(
+        &self,
+        project: String,
+        lifecycle: Option<webcodex_tool_contracts::SessionLifecycleInput>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error.into_tool_result(),
+        };
+        let owner = match workflow_session_authority_fingerprint(auth) {
+            Ok(owner) => owner,
+            Err(_) => {
+                return ToolResult::err_with_output(
+                    "session_authority_identity_unavailable",
+                    json!({
+                        "error_kind": "session_authority_identity_unavailable", "state_changed": false,
+                    }),
+                )
+            }
+        };
+        let lifecycle = lifecycle.map(|state| match state {
+            webcodex_tool_contracts::SessionLifecycleInput::Active => {
+                sessions::SessionLifecycle::Active
+            }
+            webcodex_tool_contracts::SessionLifecycleInput::Closed => {
+                sessions::SessionLifecycle::Closed
+            }
+        });
+        let offset = offset.unwrap_or(0);
+        let page = self.sessions.discover_sessions(
+            &resolved.resolved_id,
+            &owner,
+            lifecycle,
+            offset,
+            limit.unwrap_or(10),
+        );
+        let mut rows = Vec::new();
+        for item in &page.sessions {
+            // Discovery is no authority grant. Recheck each exact target before
+            // projecting it or minting its caller-scoped short selector.
+            if self
+                .authorize_session_target(&item.session_id, "list_sessions", auth)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let mut row = serde_json::to_value(item).expect("Session discovery item serializes");
+            if let Some(session_ref) = self.session_reference_for_id(&item.session_id, auth) {
+                row["session_ref"] = json!(session_ref);
+            }
+            rows.push(row);
+        }
+        let mut output = json!({
+            "project": resolved.resolved_id,
+            "total": page.total,
+            "offset": offset,
+            "next_offset": page.next_offset,
+            "sessions": rows,
+            "selection": "caller_must_choose_exact_session",
+        });
+        // Bound the actual UTF-8 JSON output, including principal-scoped refs.
+        // Removed rows remain discoverable on the next ordinary inventory page.
+        const MAX_RESULT_BYTES: usize = 32 * 1024;
+        while serde_json::to_vec(&output)
+            .expect("Session discovery serializes")
+            .len()
+            > MAX_RESULT_BYTES
+        {
+            let rows = output["sessions"]
+                .as_array_mut()
+                .expect("Session discovery rows");
+            if rows.pop().is_none() {
+                return ToolResult::err_with_output(
+                    "session_discovery_result_too_large",
+                    json!({
+                        "error_kind": "session_discovery_result_too_large", "state_changed": false,
+                    }),
+                );
+            }
+            let next = offset.saturating_add(rows.len());
+            output["next_offset"] = json!(next);
+        }
+        ToolResult::ok(output)
     }
 
     pub(crate) async fn start_session_tool(
@@ -244,7 +377,8 @@ impl ToolRuntime {
                 return invalid_execution_context_result(error);
             }
         };
-        ToolResult::ok(json!({
+        let session_ref = self.session_reference_for_id(&summary.session_id, auth);
+        let mut output = json!({
             "success": true,
             "session_id": summary.session_id,
             "project": summary.project,
@@ -257,7 +391,11 @@ impl ToolRuntime {
             "lifecycle": summary.lifecycle,
             "created_at": summary.created_at,
             "project_instructions": project_instructions,
-        }))
+        });
+        if let Some(session_ref) = session_ref {
+            output["session_ref"] = json!(session_ref);
+        }
+        ToolResult::ok(output)
     }
 
     pub(crate) async fn update_session_context_tool(
@@ -359,10 +497,15 @@ impl ToolRuntime {
             return result;
         }
         match self.sessions.summary(&session_id, limit) {
-            Some(summary) => ToolResult::ok(
-                serde_json::to_value(summary)
-                    .unwrap_or_else(|_| json!({"session_id": session_id, "events": []})),
-            ),
+            Some(summary) => {
+                let session_ref = self.session_reference_for_id(&session_id, auth);
+                let mut output = serde_json::to_value(summary)
+                    .unwrap_or_else(|_| json!({"session_id": session_id, "events": []}));
+                if let Some(session_ref) = session_ref {
+                    output["session_ref"] = json!(session_ref);
+                }
+                ToolResult::ok(output)
+            }
             None => unknown_session_result(&session_id),
         }
     }
@@ -500,7 +643,10 @@ impl ToolRuntime {
         reply_to: Option<String>,
         priority: sessions::SessionMessagePriority,
         requires_ack: bool,
+        delivery_key: Option<String>,
         auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        trusted_recording_session_id: Option<&str>,
     ) -> ToolResult {
         if let Err(result) = self
             .authorize_session_target(&session_id, "post_session_message", auth)
@@ -508,7 +654,31 @@ impl ToolRuntime {
         {
             return result;
         }
-        match self.sessions.post_message_with_ack(
+        let delivery = match delivery_key {
+            Some(delivery_key) => {
+                let sender_scope =
+                    match message_delivery_sender_scope(auth, window, trusted_recording_session_id)
+                    {
+                        Ok(scope) => scope,
+                        Err(message) => {
+                            return ToolResult::err_with_output(
+                                message,
+                                json!({
+                                    "error_kind": "message_sender_identity_unavailable",
+                                    "session_id": session_id,
+                                    "state_changed": false,
+                                }),
+                            )
+                        }
+                    };
+                Some(sessions::SessionMessageDelivery {
+                    sender_scope,
+                    delivery_key,
+                })
+            }
+            None => None,
+        };
+        match self.sessions.post_message_with_ack_and_delivery(
             sessions::PostSessionMessageInput {
                 session_id: session_id.clone(),
                 kind,
@@ -518,12 +688,15 @@ impl ToolRuntime {
                 priority,
             },
             requires_ack,
+            delivery,
         ) {
-            Ok(message) => ToolResult::ok(json!({
+            Ok(outcome) => ToolResult::ok(json!({
                 "success": true,
                 "session_id": session_id,
-                "message_id": message.message_id,
-                "message": message,
+                "message_id": outcome.message.message_id,
+                "message": outcome.message,
+                "replayed": outcome.replayed,
+                "state_changed": outcome.state_changed,
             })),
             Err(err) => session_message_error_result(&session_id, None, err),
         }
@@ -755,6 +928,26 @@ impl ToolRuntime {
             Err(err) => session_message_error_result(&session_id, None, err),
         }
     }
+}
+
+pub(crate) fn message_delivery_sender_scope(
+    auth: Option<&AuthContext>,
+    window: Option<&crate::client_window::ClientWindow>,
+    recording_session_id: Option<&str>,
+) -> Result<String, String> {
+    let (principal_kind, principal_id) = super::runtime_observation_principal(auth)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"webcodex.message-delivery-sender.v1\0");
+    for field in [
+        principal_kind.as_str(),
+        principal_id.as_str(),
+        window.map_or("", crate::client_window::ClientWindow::key),
+        recording_session_id.unwrap_or_default(),
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn invalid_session_message_observation_request(session_id: &str, message: &str) -> ToolResult {

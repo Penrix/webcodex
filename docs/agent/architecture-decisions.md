@@ -430,28 +430,33 @@ the explicit `WEBCODEX_MCP_TEXT_JSON_COMPAT=true` compatibility projection to
 mirror that same canonical JSON into standard text content without changing the
 source of truth.
 
-The product concept and public lifecycle namespace are **Runner**. Before the
-`v0.4.0` compatibility floor, the local primary config filename is normalized
-from `agent.toml` to `runner.toml`. The compatibility contract is intentionally
-narrow and deterministic: a config directory containing only legacy
-`agent.toml` continues to use that file; one containing only `runner.toml` uses
-the canonical file; a directory containing both fails closed rather than
-choosing a winner; a directory containing neither creates/targets
-`runner.toml`. Explicit `--config PATH` remains exact and does not inspect a
-sibling filename. Explicit `--profile` similarly selects its authoritative
-profile directory before environment defaults are considered.
-`WEBCODEX_RUNNER_CONFIG` is the canonical default-path env override, while
-`WEBCODEX_AGENT_CONFIG` remains a legacy alias; setting both is an error only
-when environment defaults are actually consulted.
+The product concept and public lifecycle namespace are **Runner**. The local
+primary config filename is `runner.toml`, and all newly generated 0.4.x
+configuration uses that name. Persisted pre-0.4 startup state has a deliberately
+narrow compatibility window through the 0.4.x line: automatic/default/profile
+discovery still accepts a legacy-only `agent.toml`, while a directory containing
+both names fails closed so a stale legacy file cannot silently look authoritative.
+A directory containing neither creates/targets `runner.toml`. Explicit
+`--config PATH` remains exact and does not reinterpret the chosen filename.
+Explicit `--profile` similarly selects its authoritative profile directory
+before environment defaults are considered. `WEBCODEX_RUNNER_CONFIG` is the
+canonical default-path env override; legacy-only `WEBCODEX_AGENT_CONFIG` remains
+a deprecated fallback during 0.4.x, while setting both env names is ambiguous and
+fails closed. These persisted startup aliases are scheduled for removal at the
+0.5.0 compatibility boundary rather than a 0.4.x patch/minor restart.
 
-The same pre-`v0.4.0` normalization applies to the Runner-owned project
-registry: `project_registry_dir` and `project-registry/` are canonical for new
-state, while a sole legacy `projects_dir` field or `projects.d/` directory may
-continue to identify existing state in place. New and legacy fields together,
-or both default directory names together, fail closed; WebCodex does not merge,
-copy, rename, or choose between two registries implicitly. The registry remains
-a directory of Runner-owned project registration records, not a second workspace
-or project-root abstraction.
+Runner-owned project registries use `project_registry_dir` and
+`project-registry/` for new state. During 0.4.x, a legacy-only persisted
+`projects_dir` field is normalized into the canonical runtime
+`project_registry_dir`; configuring both fields remains an error. The old
+`--projects-dir` CLI spelling stays retired because interactive CLI aliases are
+not required for cold-start compatibility. The physical legacy `projects.d/`
+directory remains readable in place when it is the sole default registry layout,
+so upgrading does not require an implicit data move. If both default directory
+names exist WebCodex fails closed; it does not merge, copy, rename, or choose
+between two registries implicitly. The registry remains a directory of
+Runner-owned project registration records, not a second workspace or project-root
+abstraction.
 
 Project registration provenance is also normalized before the `v0.4.0` floor.
 The generic project-record `kind` field remains open project metadata, while the
@@ -489,7 +494,10 @@ consumers and are therefore retained rather than cosmetically duplicated. In
 particular, `WEBCODEX_AGENT_TOKEN`, `wc_agent_*`, `agent_instance_id`, runtime
 project ids of the form `agent:<client_id>:<project_id>`, and established
 DB/wire `agent_*` fields keep their existing names. This local filename migration does not imply
-a Server/Runner protocol-generation or wire-identity rename.
+a Server/Runner protocol-generation or wire-identity rename. Public Runner
+observations now use `runner_instance_id`, `runner_protocol_generation`, and
+`runners`; the retained `agent_*` names above refer to wire/persisted contracts,
+not observation aliases. See [Runner observability](runner-observability.md).
 
 Compatibility never requires retaining a known authentication bypass, unsafe
 authority, ambiguous or stale identity, or weakened fail-closed validation. A

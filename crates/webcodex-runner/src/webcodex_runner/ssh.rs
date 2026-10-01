@@ -814,7 +814,16 @@ fn ensure_control_root(state: &mut SshPoolState) -> Result<PathBuf, String> {
         return Ok(root.clone());
     }
     for _ in 0..4 {
-        let candidate = std::env::temp_dir().join(format!(
+        // macOS per-user TMPDIR is already ~50 bytes; appending our random
+        // directory, control name and OpenSSH's temporary mux suffix exceeds
+        // sockaddr_un.sun_path before any remote command can start. Use the
+        // short system temp parent there, retaining exclusive creation, a
+        // full random UUID and 0700 ownership on the actual private directory.
+        #[cfg(target_os = "macos")]
+        let parent = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let parent = std::env::temp_dir();
+        let candidate = parent.join(format!(
             "wc-ssh-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
@@ -844,6 +853,10 @@ fn ensure_control_root(state: &mut SshPoolState) -> Result<PathBuf, String> {
         "ssh_connection_pool_unavailable: could not allocate Runner-local control socket directory; command was not started".to_string(),
     )
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "ssh_macos_control_path_tests.rs"]
+mod macos_control_path_tests;
 
 fn establish_control_socket(connection: &SshConnection) -> Result<(), String> {
     let mut ssh = ssh_command(connection);
@@ -1477,6 +1490,50 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    /// The remote program contract is POSIX shell text, and a real sshd
+    /// session interprets it with the connecting account's login shell.
+    /// Integration tests that assert exact POSIX program behavior therefore
+    /// need a login shell that actually implements POSIX constructs.
+    #[cfg(target_os = "linux")]
+    fn local_login_shell_is_posix() -> bool {
+        let Ok(user) = Command::new("id").args(["-un"]).output() else {
+            return false;
+        };
+        if !user.status.success() {
+            return false;
+        }
+        let user = String::from_utf8_lossy(&user.stdout).trim().to_string();
+        if user.is_empty() {
+            return false;
+        }
+        let Ok(passwd) = Command::new("getent").arg("passwd").arg(&user).output() else {
+            return false;
+        };
+        if !passwd.status.success() {
+            return false;
+        }
+        let passwd_line = String::from_utf8_lossy(&passwd.stdout).trim().to_string();
+        let Some(shell) = passwd_line
+            .rsplit(':')
+            .next()
+            .filter(|shell| !shell.is_empty())
+        else {
+            return false;
+        };
+        let Ok(probe) = Command::new(shell)
+            .args(["-c", "if true; then printf posix-ok; fi"])
+            .output()
+        else {
+            return false;
+        };
+        probe.status.success() && probe.stdout == b"posix-ok"
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn local_login_shell_is_posix() -> bool {
+        true
+    }
 
     #[test]
     fn session_id_validation_uses_canonical_compact_alphabet() {
@@ -2124,6 +2181,10 @@ mod tests {
 
     #[test]
     fn config_generation_change_does_not_interrupt_active_remote_channel() {
+        if !local_login_shell_is_posix() {
+            eprintln!("skipping SSH integration test because the local login shell cannot execute POSIX remote programs");
+            return;
+        }
         let Some(server) = TestSshServer::start() else {
             eprintln!("skipping SSH integration test because sshd is unavailable");
             return;
@@ -2187,6 +2248,10 @@ mod tests {
 
     #[test]
     fn reuses_session_transport_but_not_remote_shell_state_and_reconnects() {
+        if !local_login_shell_is_posix() {
+            eprintln!("skipping SSH integration test because the local login shell cannot execute POSIX remote programs");
+            return;
+        }
         let Some(server) = TestSshServer::start() else {
             eprintln!("skipping SSH integration test because sshd is unavailable");
             return;
@@ -2380,6 +2445,10 @@ mod tests {
 
     #[test]
     fn remote_async_jobs_stream_output_and_stop_through_the_existing_lifecycle() {
+        if !local_login_shell_is_posix() {
+            eprintln!("skipping SSH integration test because the local login shell cannot execute POSIX remote programs");
+            return;
+        }
         let Some(server) = TestSshServer::start() else {
             eprintln!("skipping SSH integration test because sshd is unavailable");
             return;

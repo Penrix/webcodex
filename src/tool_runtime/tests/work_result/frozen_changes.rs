@@ -56,12 +56,12 @@ fn record_first_class_edit(runtime: &ToolRuntime, session_id: &str, project: &st
     let start = runtime.sessions.record_tool_call_started(
         Some(session_id),
         SessionTransport::Mcp,
-        "apply_text_edits",
+        "edit_project_files",
         &json!({
             "project": project,
             "changes": [{"kind": "edit", "path": path}]
         }),
-        crate::tool_runtime::sessions::session_tool_contract("apply_text_edits"),
+        crate::tool_runtime::sessions::session_tool_contract("edit_project_files"),
     );
     runtime.sessions.record_tool_call_finished(
         start,
@@ -77,6 +77,36 @@ fn record_first_class_edit(runtime: &ToolRuntime, session_id: &str, project: &st
             .unwrap()
             .repository_edit_observed
     );
+}
+
+async fn seal_successful_closeout(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: &str,
+    session_id: &str,
+    auth: &crate::auth::AuthContext,
+) -> Option<Value> {
+    let summary = runtime.sessions.summary(session_id, None).unwrap();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.to_string();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .seal_work_result_changes_for_closeout(&project, &summary, Some(&auth))
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !task.is_finished() {
+        assert!(Instant::now() < deadline, "Changes seal task timed out");
+        if let Some(request) = probe_patch_agent_request(runtime, client_id).await {
+            complete_agent_request_by_running_locally(runtime, client_id, request).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    task.await.unwrap().unwrap()
 }
 
 async fn service_agent_task(
@@ -201,6 +231,187 @@ fn file_by_path<'a>(result: &'a Value, path: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("missing {path}: {result}"))
 }
 
+async fn ui_files(
+    runtime: &ToolRuntime,
+    client: &str,
+    project: &str,
+    session: Option<String>,
+    request: webcodex_tool_contracts::WorkResultFilesRequest,
+    auth: &crate::auth::AuthContext,
+) -> ToolResult {
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.to_string();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .work_result_files(project, session, request, Some(&auth))
+                .await
+        }
+    });
+    service_agent_task(runtime, client, &task).await;
+    task.await.unwrap()
+}
+
+#[tokio::test]
+async fn work_result_file_pages_share_frozen_source_and_never_require_a_session() {
+    use webcodex_tool_contracts::WorkResultFilesRequest;
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "base\n", "base");
+    for index in 0..40 {
+        fs::write(
+            tmp.path().join(format!("file_{index:02}.txt")),
+            "original\n",
+        )
+        .unwrap();
+    }
+    fs::write(tmp.path().join(".env"), "PRIVATE_SECRET=do-not-return\n").unwrap();
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let client = "paged-result";
+    let project =
+        register_runner_project_at_path_with_auth(&runtime, client, "demo", tmp.path(), &auth)
+            .await;
+    let first = ui_files(
+        &runtime,
+        client,
+        &project,
+        None,
+        WorkResultFilesRequest {
+            snapshot_id: None,
+            offset: 0,
+            path: None,
+        },
+        &auth,
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    let page = &first.output["work_result_files"];
+    assert_eq!(page["files"].as_array().unwrap().len(), 24);
+    assert_eq!(page["next_offset"], 24);
+    let snapshot = page["snapshot_id"].as_str().unwrap().to_string();
+    fs::write(tmp.path().join("file_39.txt"), "later-work\n").unwrap();
+    let second = ui_files(
+        &runtime,
+        client,
+        &project,
+        None,
+        WorkResultFilesRequest {
+            snapshot_id: Some(snapshot.clone()),
+            offset: 24,
+            path: None,
+        },
+        &auth,
+    )
+    .await;
+    assert!(second.success, "{:?}", second.error);
+    assert_eq!(
+        second.output["work_result_files"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        16
+    );
+    assert!(second.output["work_result_files"]["next_offset"].is_null());
+    assert!(!first.output.to_string().contains("PRIVATE_SECRET"));
+    assert!(!second.output.to_string().contains(".env"));
+    let diff = ui_files(
+        &runtime,
+        client,
+        &project,
+        None,
+        WorkResultFilesRequest {
+            snapshot_id: Some(snapshot.clone()),
+            offset: 0,
+            path: Some("file_39.txt".into()),
+        },
+        &auth,
+    )
+    .await;
+    assert!(diff.success, "{:?}", diff.error);
+    assert!(diff.output["work_result_files"]["diff"]
+        .as_str()
+        .unwrap()
+        .contains("+original"));
+    assert!(!diff.output.to_string().contains("later-work"));
+    for path in ["../outside", ".env", "absent.txt"] {
+        let denied = ui_files(
+            &runtime,
+            client,
+            &project,
+            None,
+            WorkResultFilesRequest {
+                snapshot_id: Some(snapshot.clone()),
+                offset: 0,
+                path: Some(path.into()),
+            },
+            &auth,
+        )
+        .await;
+        assert!(!denied.success, "{path}");
+    }
+    let baseline = git(tmp.path(), &["rev-parse", "HEAD^{tree}"]);
+    let session = start_changes_session(&runtime, &auth, &project, baseline);
+    record_first_class_edit(&runtime, &session.session_id, &project, "file_00.txt");
+    let sealed = seal_successful_closeout(&runtime, client, &project, &session.session_id, &auth)
+        .await
+        .unwrap();
+    assert_eq!(sealed["files"].as_array().unwrap().len(), 24);
+    let final_id = sealed["snapshot_id"].as_str().unwrap().to_string();
+    let final_page = ui_files(
+        &runtime,
+        client,
+        &project,
+        Some(session.session_id.clone()),
+        WorkResultFilesRequest {
+            snapshot_id: Some(final_id.clone()),
+            offset: 24,
+            path: None,
+        },
+        &auth,
+    )
+    .await;
+    assert!(final_page.success, "{:?}", final_page.error);
+    assert_eq!(
+        final_page.output["work_result_files"]["files"]
+            .as_array()
+            .unwrap()
+            .len(),
+        16
+    );
+    let wrong_scope = runtime
+        .work_result_files(
+            project.clone(),
+            None,
+            WorkResultFilesRequest {
+                snapshot_id: Some(final_id),
+                offset: 0,
+                path: None,
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(
+        !wrong_scope.success,
+        "final snapshots cannot be read as unassociated workspace views"
+    );
+    let foreign = crate::auth::shared_key_context("other-ui-principal");
+    let denied = runtime
+        .work_result_files(
+            project,
+            None,
+            WorkResultFilesRequest {
+                snapshot_id: Some(snapshot),
+                offset: 24,
+                path: None,
+            },
+            Some(&foreign),
+        )
+        .await;
+    assert!(!denied.success);
+}
+
 #[tokio::test]
 async fn final_changes_uses_startup_tree_whole_final_workspace_and_frozen_lazy_diff() {
     let tmp = tempfile::tempdir().unwrap();
@@ -255,24 +466,50 @@ async fn final_changes_uses_startup_tree_whole_final_workspace_and_frozen_lazy_d
     assert!(presentation_needed(&runtime, client_id, &project, current).await);
 
     let before = runtime.sessions.summary(&session.session_id, None).unwrap();
-    let result = present(&runtime, client_id, &project, &session.session_id, &auth).await;
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["work_result"]["project"], project);
+    let progress = present(&runtime, client_id, &project, &session.session_id, &auth).await;
+    assert!(progress.success, "{:?}", progress.error);
+    assert_eq!(progress.output["work_result"]["project"], project);
     assert_eq!(
-        result.output["work_result"]["session_id"],
+        progress.output["work_result"]["session_id"],
         session.session_id
     );
+    assert!(progress.output["work_result"]
+        .get("final_changes")
+        .is_none());
+    let pre_closeout = refresh(&runtime, client_id, &project, &session.session_id, &auth).await;
+    assert!(pre_closeout.success, "{:?}", pre_closeout.error);
+    assert!(pre_closeout.output["work_result"]
+        .get("final_changes")
+        .is_none());
+    assert_eq!(
+        pre_closeout.output["work_result"]["state_version"],
+        progress.output["work_result"]["state_version"]
+    );
+
+    let after_progress = runtime.sessions.summary(&session.session_id, None).unwrap();
+    assert_eq!(after_progress.events_total, before.events_total);
+    assert_eq!(after_progress.updated_at, before.updated_at);
+
+    let sealed =
+        seal_successful_closeout(&runtime, client_id, &project, &session.session_id, &auth).await;
+    assert!(sealed.is_some());
+    let after_closeout = runtime.sessions.summary(&session.session_id, None).unwrap();
+    let result = refresh(&runtime, client_id, &project, &session.session_id, &auth).await;
+    assert!(result.success, "{:?}", result.error);
     assert!(result.output["work_result"]["final_changes"]
         .get("project")
         .is_none());
     assert!(result.output["work_result"]["final_changes"]
         .get("session_id")
         .is_none());
-    let live = refresh(&runtime, client_id, &project, &session.session_id, &auth).await;
-    assert!(live.success, "{:?}", live.error);
-    assert!(live.output["work_result"].get("final_changes").is_none());
+    let sealed_again = refresh(&runtime, client_id, &project, &session.session_id, &auth).await;
+    assert!(sealed_again.success, "{:?}", sealed_again.error);
     assert_eq!(
-        live.output["work_result"]["state_version"],
+        sealed_again.output["work_result"]["final_changes"]["snapshot_id"],
+        result.output["work_result"]["final_changes"]["snapshot_id"]
+    );
+    assert_eq!(
+        sealed_again.output["work_result"]["state_version"],
         result.output["work_result"]["state_version"]
     );
     assert_eq!(
@@ -310,7 +547,10 @@ async fn final_changes_uses_startup_tree_whole_final_workspace_and_frozen_lazy_d
     fs::write(tmp.path().join("after-snapshot.txt"), "live-only\n").unwrap();
     let live = refresh(&runtime, client_id, &project, &session.session_id, &auth).await;
     assert!(live.success, "{:?}", live.error);
-    assert!(live.output["work_result"].get("final_changes").is_none());
+    assert_eq!(
+        live.output["work_result"]["final_changes"]["snapshot_id"],
+        snapshot_id
+    );
     assert_ne!(
         live.output["work_result"]["state_version"],
         result.output["work_result"]["state_version"]
@@ -504,11 +744,8 @@ async fn final_changes_uses_startup_tree_whole_final_workspace_and_frozen_lazy_d
     let second = present(&runtime, client_id, &project, &session.session_id, &auth).await;
     assert!(second.success, "{:?}", second.error);
     let changes = &second.output["work_result"]["final_changes"];
-    assert_eq!(changes["files_returned"], 24);
-    assert_eq!(changes["files_truncated"], true);
-    assert!(changes["files_total"].as_u64().unwrap() > 24);
     let second_id = changes["snapshot_id"].as_str().unwrap();
-    assert_ne!(second_id, snapshot_id);
+    assert_eq!(second_id, snapshot_id);
     assert!(!changes["files"]
         .as_array()
         .unwrap()
@@ -544,8 +781,8 @@ async fn final_changes_uses_startup_tree_whole_final_workspace_and_frozen_lazy_d
         frozen.output["changes_file_diff"]["diff"]
     );
     let after = runtime.sessions.summary(&session.session_id, None).unwrap();
-    assert_eq!(after.events_total, before.events_total);
-    assert_eq!(after.updated_at, before.updated_at);
+    assert_eq!(after.events_total, after_closeout.events_total);
+    assert_eq!(after.updated_at, after_closeout.updated_at);
 }
 
 #[tokio::test]
@@ -603,6 +840,11 @@ async fn final_changes_neutralizes_repository_configured_clean_and_process_filte
         "closeout Changes probe must not execute repository-configured filters"
     );
 
+    assert!(
+        seal_successful_closeout(&runtime, client_id, &project, &session.session_id, &auth,)
+            .await
+            .is_some()
+    );
     let result = present(&runtime, client_id, &project, &session.session_id, &auth).await;
     assert!(result.success, "{:?}", result.error);
     assert!(
@@ -640,6 +882,11 @@ async fn committed_final_tree_is_presentable_even_when_worktree_is_clean() {
 
     let summary = runtime.sessions.summary(&session.session_id, None).unwrap();
     assert!(presentation_needed(&runtime, client_id, &project, summary).await);
+    assert!(
+        seal_successful_closeout(&runtime, client_id, &project, &session.session_id, &auth,)
+            .await
+            .is_some()
+    );
     let result = present(&runtime, client_id, &project, &session.session_id, &auth).await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(
@@ -650,6 +897,58 @@ async fn committed_final_tree_is_presentable_even_when_worktree_is_clean() {
         file_by_path(&result.output, "README.md")["kind"],
         "modified"
     );
+}
+
+#[tokio::test]
+async fn final_changes_seal_survives_model_summary_tail_truncation() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "base\n", "base");
+    let baseline = git(tmp.path(), &["rev-parse", "HEAD^{tree}"]);
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let client_id = "changes-long-attempt";
+    let project =
+        register_runner_project_at_path_with_auth(&runtime, client_id, "demo", tmp.path(), &auth)
+            .await;
+    let session = start_changes_session(&runtime, &auth, &project, baseline);
+    record_first_class_edit(&runtime, &session.session_id, &project, "README.md");
+    fs::write(tmp.path().join("README.md"), "long task final state\n").unwrap();
+
+    for index in 0..110 {
+        let start = runtime.sessions.record_tool_call_started(
+            Some(&session.session_id),
+            SessionTransport::Mcp,
+            "read_files",
+            &json!({"project": project, "items": [{"path": format!("src/{index}.rs")}]}),
+            crate::tool_runtime::sessions::session_tool_contract("read_files"),
+        );
+        runtime
+            .sessions
+            .record_tool_call_finished(start, true, &json!({"items": []}), None, None);
+    }
+    let truncated = runtime
+        .sessions
+        .summary(&session.session_id, Some(usize::MAX))
+        .unwrap();
+    assert!(truncated.events_truncated);
+    assert!(truncated
+        .events
+        .iter()
+        .all(|event| event.kind != "task_instruction"));
+    assert!(presentation_needed(&runtime, client_id, &project, truncated).await);
+
+    let sealed =
+        seal_successful_closeout(&runtime, client_id, &project, &session.session_id, &auth).await;
+    assert!(
+        sealed.is_some(),
+        "long attempts must retain closeout identity beyond the model event tail"
+    );
+    let work = present(&runtime, client_id, &project, &session.session_id, &auth).await;
+    assert!(work.success, "{:?}", work.error);
+    assert!(work.output["work_result"]["final_changes"]["snapshot_id"]
+        .as_str()
+        .is_some());
 }
 
 #[tokio::test]
@@ -676,6 +975,11 @@ async fn shell_only_is_ineligible_and_reverted_first_class_edit_has_no_presentat
         .final_changes_presentation_needed(&project, &summary)
         .await
         .unwrap());
+    assert!(
+        seal_successful_closeout(&runtime, client_id, &project, &shell_only.session_id, &auth,)
+            .await
+            .is_none()
+    );
     let work = present(&runtime, client_id, &project, &shell_only.session_id, &auth).await;
     assert!(work.success, "{:?}", work.error);
     assert!(work.output["work_result"].get("final_changes").is_none());
@@ -691,6 +995,11 @@ async fn shell_only_is_ineligible_and_reverted_first_class_edit_has_no_presentat
         .unwrap();
     assert!(summary.repository_edit_observed);
     assert!(!presentation_needed(&runtime, client_id, &project, summary).await);
+    assert!(
+        seal_successful_closeout(&runtime, client_id, &project, &reverted.session_id, &auth,)
+            .await
+            .is_none()
+    );
     let work = present(&runtime, client_id, &project, &reverted.session_id, &auth).await;
     assert!(work.success, "{:?}", work.error);
     assert!(work.output["work_result"].get("final_changes").is_none());

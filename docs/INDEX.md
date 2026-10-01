@@ -11,6 +11,7 @@ Start with the goal that matches what you are trying to do.
 - [Full Setup](PERSONAL_SETUP.md) — CLI, existing Server, Linux, and advanced regular Server + Runner setup
 - [AI-assisted setup](AI_ONBOARDING.md) — have an AI agent configure WebCodex using ordinary user language
 - [MCP](MCP.md) — ChatGPT, Claude, and other MCP clients
+- [Session continuity](SESSION_CONTINUITY.md) — save context, continue across accounts/windows, and delegate model API reviews
 
 ## I only want to try it for a few minutes
 
@@ -32,7 +33,7 @@ Start with the goal that matches what you are trying to do.
 
 ## I need help
 
-- [Troubleshooting](TROUBLESHOOTING.md) — installation, connection, runtime, and Runner problems
+- [Troubleshooting](TROUBLESHOOTING.md) — ChatGPT/MCP Host, installation, connection, runtime, and Runner problems
 - [Security](../SECURITY.md) — safe operating guidance and security model
 
 ## I want to understand or extend WebCodex
@@ -45,6 +46,8 @@ Start with the goal that matches what you are trying to do.
 
 ## I want to contribute or release WebCodex
 
+- [Desktop development](DESKTOP_DEVELOPMENT.md) — run Desktop from source and build/test native Windows/macOS packages
+
 The `docs/agent/` pages below are maintainer/internal contracts. They intentionally
 contain protocol fields, compatibility names, and implementation invariants that
 ordinary users should not need to learn.
@@ -54,7 +57,7 @@ ordinary users should not need to learn.
 - [Testing](TESTING.md) — testing strategy
 - [Release checklist](RELEASE_CHECKLIST.md) — release readiness
 - [Architecture decisions](agent/architecture-decisions.md)
-- [Penrix fork direction](agent/penrix-fork-direction.md) — fork-local design context for ChatGPT Web bridging, cross-conversation continuity, DVR/retrieval, and upstream/fork ownership
+- [Penrix fork direction](agent/penrix-fork-direction.md) — fork-local current boundary for ChatGPT Web Provider, cross-conversation recovery evidence, DVR/retrieval, and upstream/fork ownership
 - [Runtime host context](agent/runtime-host-context.md) — Runner-configured planning context and runtime diagnostics
 - [Job reliability and Runner concurrency](agent/job-reliability-and-concurrency.md) — restart recovery, observation semantics, shared Job capacity, and tool-description requirements
 - [Tool request tracing](agent/tool-request-tracing.md) — maintainer forensic payload/correlation contract

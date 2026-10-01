@@ -2573,7 +2573,7 @@ async fn session_handoff_historical_mixed_current_pass_does_not_block_closeout()
     record_handoff_tool_event(
         &runtime,
         &sid,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": project.clone(),
             "changes": [{"kind": "edit", "path": "src/lib.rs"}]
@@ -2670,7 +2670,7 @@ async fn session_handoff_stale_validation_after_content_change_warns_without_blo
     record_handoff_tool_event(
         &runtime,
         &sid,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": project.clone(),
             "changes": [{"kind": "edit", "path": "src/lib.rs"}]
@@ -3479,7 +3479,7 @@ async fn session_handoff_summary_output_is_bounded() {
 // =========================================================================
 
 #[test]
-fn session_handoff_summary_metadata_mcp_openapi_consistency() {
+fn session_handoff_summary_metadata_and_mcp_consistency() {
     // readOnlyHint must be true.
     let spec = registered_tool_specs()
         .into_iter()
@@ -3545,33 +3545,37 @@ fn session_handoff_summary_metadata_mcp_openapi_consistency() {
         crate::tool_runtime::metadata::ToolAuthorityPolicy::Require("runtime:read")
     );
 
-    let openapi = crate::openapi::build_openapi_spec();
-    let action = &openapi["paths"]["/api/actions/session_handoff_summary"]["post"];
-    assert_eq!(action["operationId"], "session_handoff_summary");
-    let properties = action["requestBody"]["content"]["application/json"]["schema"]["properties"]
-        .as_object()
-        .unwrap();
-    for field in [
-        "session_id",
-        "include_validation",
-        "include_workspace",
-        "include_checkpoints",
-        "diagnostic",
-    ] {
-        assert!(
-            properties.contains_key(field),
-            "session_handoff_summary missing {field}"
-        );
-    }
-    for field in [
-        "expected_failure",
-        "expected_failure_kind",
-        "assertion_name",
-    ] {
-        assert!(
-            !properties.contains_key(field),
-            "unexpected Action field {field}"
-        );
+    #[cfg(feature = "legacy-gpt-actions")]
+    {
+        let openapi = crate::openapi::build_openapi_spec();
+        let action = &openapi["paths"]["/api/actions/session_handoff_summary"]["post"];
+        assert_eq!(action["operationId"], "session_handoff_summary");
+        let properties = action["requestBody"]["content"]["application/json"]["schema"]
+            ["properties"]
+            .as_object()
+            .unwrap();
+        for field in [
+            "session_id",
+            "include_validation",
+            "include_workspace",
+            "include_checkpoints",
+            "diagnostic",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "session_handoff_summary missing {field}"
+            );
+        }
+        for field in [
+            "expected_failure",
+            "expected_failure_kind",
+            "assertion_name",
+        ] {
+            assert!(
+                !properties.contains_key(field),
+                "unexpected Action field {field}"
+            );
+        }
     }
 }
 
@@ -4433,9 +4437,9 @@ async fn handoff_marks_basis_incomplete_when_session_changes_during_workspace_re
             let start = runtime.sessions.record_tool_call_started(
                 Some(&sid),
                 SessionTransport::Mcp,
-                "apply_text_edits",
+                "edit_project_files",
                 &json!({"project": project}),
-                sessions::session_tool_contract("apply_text_edits"),
+                sessions::session_tool_contract("edit_project_files"),
             );
             runtime
                 .sessions
@@ -4462,6 +4466,72 @@ async fn handoff_marks_basis_incomplete_when_session_changes_during_workspace_re
         );
         assert!(result.output.get("session_context_revision").is_none());
     }
+}
+
+#[tokio::test]
+async fn handoff_marks_basis_incomplete_when_external_reports_change_during_workspace_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_root = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    let db = std::sync::Arc::new(crate::db::Database::open(&db_root.path().join("db")).unwrap());
+    let runtime = test_runtime().with_communication_database(db.clone());
+    let client = "handoff-external-race";
+    let project = register_runner_project_at_path(&runtime, client, "demo", tmp.path()).await;
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let sid = session.session_id.clone();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let sid = sid.clone();
+        let project = project.clone();
+        async move {
+            runtime
+                .session_handoff_summary(
+                    sid,
+                    Some(project),
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    true,
+                    Some(20),
+                    None,
+                )
+                .await
+        }
+    });
+
+    // The workspace request proves the initial Session and external-report
+    // snapshots have already been captured while handoff assembly is still open.
+    let request = wait_for_patch_agent_request(&runtime, client).await;
+    db.record_external_observation(
+        &sid,
+        &project,
+        webcodex_store::ExternalObservation {
+            adapter_id: "a".repeat(64),
+            event_id: "b".repeat(64),
+            tool: "Bash".to_string(),
+            exit_code: None,
+            recorded_at: 1,
+        },
+    )
+    .unwrap();
+    complete_agent_request_by_running_locally(&runtime, client, request).await;
+
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    let brief = &result.output["handoff_brief"];
+    assert_eq!(brief["basis"]["complete"], false);
+    assert!(brief["basis"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("external_observations_changed_during_snapshot")));
+    assert_eq!(brief["external_observations"]["status"], "available");
+    assert_eq!(brief["external_observations"]["total"], 0);
+    assert_eq!(brief["external_observations"]["observations"], json!([]));
+    assert_eq!(
+        brief["external_observations"]["coverage"]["complete"],
+        false
+    );
 }
 
 #[test]
@@ -4577,7 +4647,7 @@ async fn session_handoff_workspace_continuity_uses_only_exact_session_history() 
     record_handoff_tool_event(
         &runtime,
         &session.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": project,
             "changes": [{
@@ -4596,7 +4666,7 @@ async fn session_handoff_workspace_continuity_uses_only_exact_session_history() 
     record_handoff_tool_event(
         &runtime,
         &unrelated.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": project,
             "changes": [{
@@ -4669,7 +4739,7 @@ async fn session_handoff_workspace_continuity_uses_full_retained_history_not_sum
     record_handoff_tool_event(
         &runtime,
         &session.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": project,
             "changes": [{

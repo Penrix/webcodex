@@ -2,14 +2,13 @@
 
 [English](GPT_ACTIONS.md) | [简体中文](GPT_ACTIONS.zh-CN.md)
 
-Custom GPT 需要通过 Server 的 OpenAPI 兼容集成调用 WebCodex 时使用 GPT Actions。客户端直接支持 MCP 时优先使用 [MCP](MCP.zh-CN.md)；MCP 仍然是 ChatGPT 的主要接入方式。
+GPT Actions 现在仅作为现有 Custom GPT 部署的 legacy compatibility adapter 保留。默认构建**不会启用**该 adapter；新的 ChatGPT 集成请使用 [MCP](MCP.zh-CN.md)。
 
-`/openapi.json` 使用同一套 canonical Adaptive Runtime routing policy：
-
-- runtime Server 投影 canonical Adaptive Runtime model contract；
-- project-scoped `share` / `run` credential 只收窄 authority/visibility，不定义第二套 Action surface。
+只有使用 `legacy-gpt-actions` Cargo feature 构建或运行 Server 时，才会暴露 `/openapi.json` 与 `/api/actions/{tool_name}`。默认构建不挂载这两个 route；授权与执行仍统一进入 canonical ToolRuntime。
 
 ## 导入 schema
+
+本节只适用于使用 `--features legacy-gpt-actions` 构建的 Server。
 
 导入：
 
@@ -21,23 +20,22 @@ ChatGPT 需要公网 HTTPS。API-key 认证配置为 HTTP Bearer，使用生成�
 
 如果 Server 以前使用过旧 generic GPT Actions schema，升级后请**重新导入 `/openapi.json`**。新的 generic operation 名称直接使用 WebCodex canonical runtime tool 的 snake_case 名称，不再使用旧 camelCase Action vocabulary。
 
-## 普通 Runtime Server
+## 冻结的 legacy runtime surface
 
-Generic GPT Actions 不再拥有独立 tool registry。它只是 Adaptive Runtime MCP 所使用同一份 `ToolDefinition` authority 的受限 OpenAPI projection：
+GPT Actions 不再自动跟随 Adaptive Runtime Direct。其 direct 与 gateway admission 都是冻结的兼容性快照：
 
 ```text
-ToolDefinition
-  -> Adaptive Runtime direct tools
-      -> direct GPT Action operations
-  -> Adaptive Runtime long tail
-      -> call_runtime_tool
+Frozen legacy GPT Action snapshot
+  -> direct Action operations
+  -> frozen long-tail entries via call_runtime_tool
+  -> canonical ToolRuntime authorization/execution
 ```
 
-一个工具被标记为 Adaptive Direct 后，默认会自动成为 direct GPT Action；只有 canonical definition 明确声明 GPT Actions 无法表达其协议语义时才排除。因此以后增删或重新排序 Adaptive Direct 工具时，GPT Actions 会自动跟随，不存在第二套 GPT Action rank 或 operation list。
+新增、删除或重新排序正常维护的 Adaptive Runtime 工具，都不会自动改变 GPT Actions。新的 Host、MCP、Plugin 或 Code Mode 工具不会消耗 Action operation budget，也不需要为 Action 维护额外 presentation。只有明确的 legacy compatibility 修复才应修改该冻结快照。
 
-Direct operation 直接使用 canonical snake_case 名称和 canonical input contract。例如当前 Adaptive Direct 中的 `work_on_project`、`runtime_status`、`tool_manifest`、`search_project_texts`、`read_files`、`apply_text_edits`、`run_process`、`run_detached_process`、`run_shell`、`observe_jobs`、`list_jobs`、`cargo_check`、`cargo_test`、`git_review_summary`、`git_diff_hunks`、`show_changes`、`workspace_hygiene_check`、`finish_coding_task` 等会按当前定义自动投影。
+Direct operation 继续使用 canonical snake_case 名称与 canonical input contract。冻结快照当前保留 `work_on_project`、`runtime_status`、`tool_manifest`、`search_project_texts`、`read_files`、`edit_project_files`、`run_process`、`run_script`、`run_shell`、`observe_jobs`、`cargo_check`、`cargo_test`、`review_changes` 与 `show_changes` 等既有 operation。
 
-Long-tail model-visible 工具统一通过：
+冻结的 long-tail tools 与 exact-manifest specialists 统一通过 `call_runtime_tool`。`apply_patch`、`apply_unified_diff`、`write_project_file` 等 specialist 仍保持 gateway-only：
 
 ```json
 {
@@ -49,7 +47,7 @@ Long-tail model-visible 工具统一通过：
 }
 ```
 
-operation 名就是 `call_runtime_tool`。它只接受 `tool` 与 `arguments`，不再有 `params`，也没有把所有 runtime tool 参数铺平到顶层的巨大 union。当前 direct tool 应优先调用自己的 direct Action。ModelHidden、未知工具以及显式 GPT-Action-unsupported 工具都会 fail closed。
+operation 名就是 `call_runtime_tool`。它只接受 `tool` 与 `arguments`，不再有 `params`，也没有把所有 runtime tool 参数铺平到顶层的巨大 union。当前 direct tool 应优先调用自己的 direct Action。ModelHidden 工具默认 fail closed，只有显式列入 exact-manifest specialist 的例外可通过 gateway 调用；未知工具以及显式 GPT-Action-unsupported 工具始终 fail closed。
 
 MCP-only presentation 不会伪装成 Action 能力。例如 Goal Plan / Agent continuation / Work Result App presentation、基于 MCP ResourceLink 的 artifact export，以及依赖另外授权 MCP Host binding 的 continuation Endpoint rotation 都不会出现在 GPT Actions 中。
 
@@ -61,17 +59,17 @@ Custom GPT Actions 对 operation/tool description 有 300 characters 硬上限�
 
 ### OpenAPI 导入体积
 
-Custom GPT importer 还会拒绝达到 1 MB 的 OpenAPI schema。WebCodex 因此为 generic Action document 保留内部 800,000-byte JSON 预算，并在 CI 中同时检查 compact 与 pretty-printed serialization。Direct Action request schema 继续完整使用 canonical `ToolSpec.input_schema`；response schema 只描述真实的 compact `ToolResult` envelope，并把 `output` 保持为 generic，而不再为每个 operation 内联可能很大的 canonical output schema。这只改变 OpenAPI presentation contract；实际 runtime JSON result 以及 canonical/MCP output schema 都不变。
+Custom GPT importer 还会拒绝达到 1 MB 的 OpenAPI schema。WebCodex 因此为 generic Action document 保留内部 800,000-byte JSON 预算，并在独立的 legacy compatibility CI 中检查 compact 与 pretty-printed serialization。Direct Action request schema 继续完整使用 canonical `ToolSpec.input_schema`；response schema 只描述真实的 compact `ToolResult` envelope，并把 `output` 保持为 generic，而不再为每个 operation 内联可能很大的 canonical output schema。这只改变 OpenAPI presentation contract；实际 runtime JSON result 以及 canonical/MCP output schema 都不变。
 
 ### 对话文件导入
 
-`import_conversation_files_to_project` 在它属于 Adaptive Direct 时仍是 direct generic Action。ChatGPT 提供 `openaiFileIdRefs`；HTTP adapter 把 Action host file-reference shape 转为 canonical 内部 shape，并附加私有 GPT Action host provenance。模型 JSON 自己不能设置这个 provenance。
+`import_conversation_files_to_project` 仍保留在冻结的 direct legacy snapshot 中。ChatGPT 提供 `openaiFileIdRefs`；HTTP adapter 把 Action host file-reference shape 转为 canonical 内部 shape，并附加私有 GPT Action host provenance。模型 JSON 自己不能设置这个 provenance。
 
-MCP host-file import 保留独立的 trusted provenance 路径。普通 network-accessible Server 继续要求配置过的 trusted OAuth MCP client；显式 opt in 的 loopback-only OpenAI Secure Tunnel 部署可以改为信任本机注入的 user API token。Action 与 MCP 两种 provenance 模式共享 canonical authorization，但不能互相伪造。
+MCP host-file import 保留独立的 trusted provenance 路径。普通 network-accessible Server 继续要求配置过的 trusted OAuth MCP client；显式 opt in 的 loopback-only OpenAI Secure Tunnel 部署可以改为信任允许的本地 tunnel credential（普通 user API token，或 Desktop regular Tunnel 使用的已配置 Server bootstrap credential）。Action 与 MCP 两种 provenance 模式共享 canonical authorization，但不能互相伪造。
 
 ## Project-scoped local `share` / `run`
 
-`webcodex share` 或 `webcodex run` 启动的 Server 使用与普通 Server 相同的 generic Adaptive Runtime OpenAPI projection。Project-scoped authentication 只把调用方限制在自己的 ProjectGrant，不会切换到单独的 Connector capability registry。
+`webcodex share` 或 `webcodex run` 启动的 Server 只有在 binary 使用 `legacy-gpt-actions` 构建时才暴露 legacy OpenAPI projection。Project-scoped authentication 只把调用方限制在自己的 ProjectGrant，不会切换到单独的 Connector capability registry。
 
 Custom GPT 可以使用 canonical runtime workflow：
 

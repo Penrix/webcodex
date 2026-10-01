@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
 import { desktopApi } from "../lib/desktop-api";
 import type { ActivityEntry, DesktopError, DesktopState } from "../models/topology";
-import { useLocale } from "../i18n/locale";
 import { normalizeDesktopError } from "../i18n/presentation";
 import { NAVIGATION, type Navigation } from "../components/Sidebar";
 
@@ -12,11 +10,11 @@ const CHATGPT_ACTIVITY_OBSERVATION_INTERVAL_MS = 30_000;
 const ACTIVE_OPERATION_OBSERVATION_INTERVAL_MS = 1_000;
 
 export function useDesktopWorkspace() {
-  const { t } = useLocale();
   const [state, setState] = useState<DesktopState | null>(null);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [navigation, setNavigation] = useState<Navigation>("home");
   const [refreshing, setRefreshing] = useState(false);
+  const [runtimeObservations, setRuntimeObservations] = useState(0);
   const [error, setError] = useState<DesktopError | null>(null);
   const [cancelSubmittingId, setCancelSubmittingId] = useState<string | null>(null);
   const [showSetup, setShowSetup] = useState(false);
@@ -28,6 +26,7 @@ export function useDesktopWorkspace() {
   const hasLoadedState = Boolean(state);
   const shouldObserveChatgptActivity = Boolean(
     state?.readiness.runtime_ready
+      && state?.project?.runtime_project_id
       && !hasCurrentOperation
       && !refreshing
       && windowFocused,
@@ -47,6 +46,8 @@ export function useDesktopWorkspace() {
   useEffect(() => {
     mainRef.current?.focus({ preventScroll: true });
     mainRef.current?.scrollTo?.({ top: 0 });
+    // Narrow layouts scroll the window rather than the main pane.
+    if (window.innerWidth <= 600) window.scrollTo(0, 0);
   }, [navigation, showSetup]);
 
   useEffect(() => {
@@ -91,6 +92,18 @@ export function useDesktopWorkspace() {
     setState(next);
   }, []);
 
+  const observeFailedOperation = useCallback(async (value: unknown, current: () => boolean = () => true) => {
+    if (!current()) return;
+    setError(normalizeDesktopError(value));
+    const observedVersion = stateVersionRef.current;
+    try {
+      const terminal = await desktopApi.getState();
+      if (current() && stateVersionRef.current === observedVersion) commitState(terminal);
+    } catch {
+      // Preserve the original failure if this best-effort observation fails.
+    }
+  }, [commitState]);
+
   const commitChatgptActivity = useCallback((next: DesktopState) => {
     stateVersionRef.current += 1;
     setState((current) => {
@@ -106,30 +119,56 @@ export function useDesktopWorkspace() {
       try {
         const initial = await desktopApi.getState();
         if (cancelled) return;
-        // Keep first-run setup mounted through intermediate topology snapshots
-        // and the optional Tunnel handoff, including their error/retry paths.
-        if (!initial.topology) setShowSetup(true);
+        if (initial.current_operation || initial.configuration_issue) {
+          commitState(initial);
+          return;
+        }
+
+        // Installing persistent services is an explicit first-run choice. Do not
+        // bind a fresh machine to a local Server before it can choose Join, or
+        // trigger administrator/service-password prompts from a status read.
+        if (!initial.topology) {
+          commitState(initial);
+          return;
+        }
+
         commitState(initial);
-        if (initial.current_operation) return;
+        if (initial.persistent_environment) {
+          // System services own persistence. Opening Desktop only observes them;
+          // it must not restart a service the user explicitly stopped.
+          setRefreshing(true);
+          try {
+            const observed = await desktopApi.refresh();
+            if (!cancelled) commitState(observed);
+          } catch (value) {
+            if (!cancelled) setError(normalizeDesktopError(value));
+          } finally {
+            if (!cancelled) setRefreshing(false);
+          }
+          return;
+        }
         const resumeExisting = Boolean(
-          initial.topology
-          && initial.runtime_autostart
+          initial.runtime_autostart
           && initial.topology.experience === "full",
         );
-        // A fresh Desktop must stay in product setup until the user chooses
-        // the real project and runtime topology. Silently bootstrapping the
-        // Desktop workspace creates a fake "configured" happy path and makes
-        // users configure the product twice before ChatGPT can use their code.
-        if (!resumeExisting) return;
+        const resumeConnections = !resumeExisting
+          && initial.topology.experience === "full"
+          && initial.topology.server.kind === "local"
+          && initial.readiness.runtime_ready
+          && !initial.quick_share
+          && initial.connections?.profiles.some(profile => profile.enabled && profile.autostart && !profile.process_started);
+        if (!resumeExisting && !resumeConnections) return;
 
         setRefreshing(true);
         try {
-          const next = await desktopApi.resumeSavedRuntime();
+          const next = resumeExisting
+            ? await desktopApi.resumeSavedRuntime()
+            : await desktopApi.resumeSavedConnections();
           if (cancelled) return;
           // Backend reconciliation owns every profile's autostart policy.
           commitState(next);
         } catch (value) {
-          if (!cancelled) setError(normalizeDesktopError(value));
+          await observeFailedOperation(value, () => !cancelled);
         } finally {
           if (!cancelled) setRefreshing(false);
         }
@@ -140,7 +179,7 @@ export function useDesktopWorkspace() {
     return () => {
       cancelled = true;
     };
-  }, [commitState, startupAttempt]);
+  }, [commitState, observeFailedOperation, startupAttempt]);
 
   useEffect(() => {
     if (!hasLoadedState) return;
@@ -155,8 +194,14 @@ export function useDesktopWorkspace() {
       timeoutId = window.setTimeout(() => {
         void (async () => {
           const observedVersion = stateVersionRef.current;
+          const refreshRuntime = Boolean(state?.persistent_environment && !hasCurrentOperation && !refreshing);
+          // Keep this separate from refreshing: changing that effect dependency
+          // would cancel this observation before it can commit its result.
+          if (refreshRuntime) setRuntimeObservations(count => count + 1);
           try {
-            const next = await desktopApi.getState();
+            const next = refreshRuntime
+              ? await desktopApi.refresh()
+              : await desktopApi.getState();
             if (!cancelled && stateVersionRef.current === observedVersion) {
               commitState(next);
             }
@@ -164,6 +209,7 @@ export function useDesktopWorkspace() {
             // Observation is best-effort. A transient invoke failure must not
             // create an error storm or a second concurrent observer.
           } finally {
+            if (refreshRuntime) setRuntimeObservations(count => count - 1);
             if (!cancelled) scheduleObservation();
           }
         })();
@@ -175,7 +221,7 @@ export function useDesktopWorkspace() {
       cancelled = true;
       if (timeoutId !== undefined) window.clearTimeout(timeoutId);
     };
-  }, [commitState, hasCurrentOperation, hasLoadedState, refreshing]);
+  }, [commitState, hasCurrentOperation, hasLoadedState, refreshing, state?.persistent_environment]);
 
   useEffect(() => {
     if (!shouldObserveChatgptActivity) return;
@@ -217,35 +263,7 @@ export function useDesktopWorkspace() {
     try {
       commitState(await operation());
     } catch (value) {
-      setError(normalizeDesktopError(value));
-    }
-  };
-
-  const chooseLocalProject = async () => {
-    if (!state || state.current_operation) return;
-    const topology = state.topology;
-    if (
-      !topology ||
-      topology.experience !== "full" ||
-      topology.server.kind !== "local" ||
-      !state.project ||
-      !state.readiness.runtime_ready
-    ) {
-      openSetup();
-      return;
-    }
-    setError(null);
-    try {
-      const selection = await open({
-        directory: true,
-        multiple: false,
-        title: t("setup.chooseProject"),
-      });
-      if (typeof selection !== "string") return;
-      commitState(await desktopApi.activateLocalProject(selection));
-      setShowSetup(false);
-    } catch (value) {
-      setError(normalizeDesktopError(value));
+      await observeFailedOperation(value);
     }
   };
 
@@ -264,7 +282,7 @@ export function useDesktopWorkspace() {
     try {
       commitState(await desktopApi.resumeSavedRuntime());
     } catch (value) {
-      setError(normalizeDesktopError(value));
+      await observeFailedOperation(value);
     } finally {
       setRefreshing(false);
     }
@@ -284,5 +302,5 @@ export function useDesktopWorkspace() {
     }
   };
 
-  return { state, activity, navigation, setNavigation, refreshing, error, setError, cancelSubmittingId, showSetup, setShowSetup, setStartupAttempt, mainRef, commitState, openSetup, chooseLocalProject, refresh, resumeRuntime, cancelCurrentOperation, runStateOperation };
+  return { state, activity, navigation, setNavigation, refreshing: refreshing || runtimeObservations > 0, preserveWorkspacePollDeadline: runtimeObservations > 0 && !refreshing, error, setError, cancelSubmittingId, showSetup, setShowSetup, setStartupAttempt, mainRef, commitState, openSetup, refresh, resumeRuntime, cancelCurrentOperation, runStateOperation };
 }

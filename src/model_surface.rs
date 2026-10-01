@@ -19,6 +19,16 @@ pub(crate) const TOOL_SURFACE_AVAILABILITY_DIRECT: &str = "direct";
 pub(crate) const TOOL_SURFACE_AVAILABILITY_GATEWAY: &str = "gateway";
 pub(crate) const TOOL_SURFACE_AVAILABILITY_UNAVAILABLE: &str = "unavailable";
 
+pub(crate) fn tool_requires_direct_app_presentation(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "present_work_result"
+            | "present_goal_plan"
+            | "present_agent_continuation"
+            | "present_job_terminal_continuation"
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdaptiveRuntimeGatewayTargetRoute {
     Gateway,
@@ -41,7 +51,9 @@ pub(crate) fn adaptive_runtime_tool_invocation_route_with_operator_extension(
     tool_name: &str,
     operator_extension_admitted: bool,
 ) -> (&'static str, Option<&'static str>) {
-    if operator_extension_admitted {
+    if operator_extension_admitted
+        || webcodex_tool_contracts::EXACT_MANIFEST_SPECIALIST_TOOL_NAMES.contains(&tool_name)
+    {
         return (
             TOOL_SURFACE_AVAILABILITY_GATEWAY,
             Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
@@ -75,22 +87,22 @@ pub(crate) fn adaptive_runtime_gateway_target_route(
     }
 }
 
-/// GPT Actions derives its route from the same definition and Adaptive surface.
-/// GatewayOnly is a transport exposure exception, never an authority change.
+/// Frozen GPT Actions routing. This legacy adapter no longer inherits Adaptive
+/// Runtime additions or rank changes.
+#[cfg(feature = "legacy-gpt-actions")]
 pub(crate) fn gpt_action_gateway_target_route(target: &str) -> AdaptiveRuntimeGatewayTargetRoute {
-    let route = adaptive_runtime_gateway_target_route(target);
-    if route == AdaptiveRuntimeGatewayTargetRoute::Direct
-        && webcodex_tool_contracts::lookup_tool_definition(target).is_some_and(|definition| {
-            definition.gpt_action_exposure()
-                == webcodex_tool_contracts::ToolGptActionExposure::GatewayOnly
-        })
-    {
-        AdaptiveRuntimeGatewayTargetRoute::Gateway
+    if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
+        return AdaptiveRuntimeGatewayTargetRoute::Recursive;
+    }
+    if !webcodex_tool_contracts::gpt_action_tool_supported(target) {
+        return AdaptiveRuntimeGatewayTargetRoute::Unknown;
+    }
+    if webcodex_tool_contracts::gpt_action_tool_is_direct(target) {
+        AdaptiveRuntimeGatewayTargetRoute::Direct
     } else {
-        route
+        AdaptiveRuntimeGatewayTargetRoute::Gateway
     }
 }
-
 /// Presentation route for one canonical SuggestedToolCall target. This is not
 /// authority: adapters resolve the route from their already-admitted model
 /// surface and the canonical target still runs through ordinary ToolRuntime
@@ -146,6 +158,9 @@ where
                     .get_mut("properties")
                     .and_then(Value::as_object_mut)
                     .expect("recognized SuggestedToolCall schema has properties");
+                let follow_up_kind = properties
+                    .remove("follow_up_kind")
+                    .expect("recognized SuggestedToolCall schema has follow_up_kind");
                 let canonical_tool = properties
                     .remove("tool")
                     .expect("recognized SuggestedToolCall schema has tool");
@@ -156,6 +171,7 @@ where
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                        "follow_up_kind": follow_up_kind,
                         "tool": {"type": "string", "const": gateway},
                         "arguments": {
                             "type": "object",
@@ -167,7 +183,7 @@ where
                             "required": ["tool", "arguments"]
                         }
                     },
-                    "required": ["tool", "arguments"]
+                    "required": ["follow_up_kind", "tool", "arguments"]
                 });
                 if let Some(description) = description {
                     schema["description"] = description;
@@ -177,7 +193,6 @@ where
             SuggestedToolCallRoute::Unavailable => true,
         };
     }
-
     let mut removed_properties = Vec::new();
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         let names = properties.keys().cloned().collect::<Vec<_>>();
@@ -274,22 +289,36 @@ where
     F: Fn(&str) -> SuggestedToolCallRoute,
 {
     if let Some(target) = webcodex_tool_contracts::suggested_tool_call_schema_target(schema) {
-        if value.get("tool").and_then(Value::as_str) != Some(target)
-            || value.get("arguments").is_none()
-        {
-            return false;
-        }
         if !visited.insert(path.to_string()) {
             return false;
+        }
+        let expected_follow_up_kind = schema
+            .pointer("/properties/follow_up_kind/const")
+            .and_then(Value::as_str)
+            .expect("recognized SuggestedToolCall schema has a constant follow_up_kind");
+        if value.get("tool").and_then(Value::as_str) != Some(target)
+            || value.get("arguments").is_none()
+            || value.get("follow_up_kind").and_then(Value::as_str) != Some(expected_follow_up_kind)
+        {
+            // This location is formally declared as a server-generated call. A
+            // runtime target/posture mismatch must not remain machine-actionable:
+            // remove the edge rather than letting a Host infer authority from a
+            // value that contradicts the advertised output contract.
+            return true;
         }
         return match route_for(target) {
             SuggestedToolCallRoute::Direct => false,
             SuggestedToolCallRoute::Gateway(gateway) => {
+                let follow_up_kind = value
+                    .get_mut("follow_up_kind")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null);
                 let arguments = value
                     .get_mut("arguments")
                     .map(Value::take)
                     .unwrap_or(Value::Null);
                 *value = json!({
+                    "follow_up_kind": follow_up_kind,
                     "tool": gateway,
                     "arguments": {
                         "tool": target,
@@ -456,6 +485,24 @@ mod tests {
     }
 
     #[test]
+    fn direct_app_presentation_requirement_is_closed_and_explicit() {
+        for tool in [
+            "present_work_result",
+            "present_goal_plan",
+            "present_agent_continuation",
+            "present_job_terminal_continuation",
+        ] {
+            assert!(tool_requires_direct_app_presentation(tool), "{tool}");
+        }
+        for ordinary in ["run_shell", "run_script", "show_changes"] {
+            assert!(
+                !tool_requires_direct_app_presentation(ordinary),
+                "{ordinary}"
+            );
+        }
+    }
+
+    #[test]
     fn direct_specs_are_definition_derived_and_model_visible() {
         let specs = adaptive_runtime_direct_tool_specs();
         let expected = adaptive_runtime_direct_tool_definitions()
@@ -507,11 +554,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-gpt-actions")]
     #[test]
-    fn job_stop_gateway_only_policy_changes_actions_not_adaptive_route() {
+    fn job_stop_uses_gateway_on_adaptive_and_actions() {
         assert_eq!(
             adaptive_runtime_gateway_target_route("stop_job"),
-            AdaptiveRuntimeGatewayTargetRoute::Direct
+            AdaptiveRuntimeGatewayTargetRoute::Gateway
         );
         assert_eq!(
             gpt_action_gateway_target_route("stop_job"),
@@ -649,7 +697,24 @@ mod tests {
                 "representative edge {source_tool}->{target_tool} should remain Adaptive gateway-routed"
             );
             let canonical_schema = webcodex_tool_contracts::output_schema_for_tool(source_tool);
-            let canonical_call = json!({"tool": target_tool, "arguments": arguments});
+            let follow_up_kind = if matches!(source_tool, "work_on_project" | "skill_install") {
+                "fallback_recovery"
+            } else {
+                "mechanically_followable"
+            };
+            let canonical_call = json!({
+                "follow_up_kind": follow_up_kind,
+                "tool": target_tool,
+                "arguments": arguments
+            });
+            webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(
+                &canonical_call,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "canonical SuggestedToolCall {source_tool}->{target_tool} must pass the target registered inputSchema unchanged: {error}"
+                )
+            });
             let mut projected_value = json!({
                 "success": false,
                 "output": {"suggested_call": canonical_call.clone()},
@@ -662,11 +727,22 @@ mod tests {
             );
             let projected_call = &projected_value["output"]["suggested_call"];
             assert_eq!(projected_call["tool"], ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME);
+            assert_eq!(projected_call["follow_up_kind"], follow_up_kind);
             assert_eq!(projected_call["arguments"]["tool"], target_tool);
             assert_eq!(
                 projected_call["arguments"]["arguments"],
                 canonical_call["arguments"]
             );
+            let gateway_input_schema = crate::mcp::adaptive_runtime_gateway_input_schema_for_test();
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &projected_call["arguments"],
+                &gateway_input_schema,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Adaptive projected SuggestedToolCall {source_tool}->{target_tool} must pass the actual registered call_runtime_tool inputSchema unchanged: {error}"
+                )
+            });
 
             let mut projected_schema = canonical_schema;
             project_suggested_tool_call_schema(&mut projected_schema, &test_suggested_call_route);
@@ -675,6 +751,10 @@ mod tests {
             assert_eq!(
                 suggested_schema["properties"]["tool"]["const"],
                 ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+            );
+            assert_eq!(
+                suggested_schema["properties"]["follow_up_kind"]["const"],
+                follow_up_kind
             );
             assert_eq!(
                 suggested_schema["properties"]["arguments"]["properties"]["tool"]["const"],
@@ -693,10 +773,111 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_generated_follow_up_posture_is_removed_fail_closed() {
+        let mut value = json!({
+            "type": "result",
+            "next": {
+                "follow_up_kind": "mechanically_followable",
+                "tool": "list_runners",
+                "arguments": {"include_projects": false, "summary_only": true}
+            }
+        });
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "type": {"type": "string"},
+                "next": webcodex_tool_contracts::suggested_tool_call_schema(
+                    webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery,
+                    "list_runners",
+                    webcodex_tool_contracts::input_schema_for_tool("list_runners"),
+                    "recovery-only edge"
+                )
+            },
+            "required": ["type"]
+        });
+
+        project_suggested_tool_calls_in_value(&mut value, &schema, &|_| {
+            SuggestedToolCallRoute::Direct
+        });
+
+        assert!(value.get("next").is_none());
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&value, &schema)
+            .expect("removing a mismatched optional generated edge must stay schema-valid");
+    }
+
+    #[test]
+    fn continuation_follow_ups_use_current_routes_in_both_schema_and_value() {
+        use webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery;
+        for (target, arguments, available) in [
+            (
+                "wait_for_job_terminal",
+                json!({"job_id":"wc_job_exact", "idempotency_key":"wait-once"}),
+                true,
+            ),
+            (
+                "wait_for_agent_events",
+                json!({
+                    "agent_id":"wc_dagent_qqqqqqqqqqqqqqqq", "endpoint_id":"wc_endpoint_qqqqqqqqqqqqqqqq",
+                    "expected_controller_generation":1, "events":[{"kind":"agent_task_terminal", "task_id":"wc_agent_task_qqqqqqqqqqqqqqqq"}],
+                    "idempotency_key":"wait-once"
+                }),
+                true,
+            ),
+            (
+                "present_job_terminal_continuation",
+                json!({"wait_id":"wc_job_wait_qqqqqqqqqqqqqqqq"}),
+                false,
+            ),
+            (
+                "present_agent_continuation",
+                json!({
+                    "agent_id":"wc_dagent_qqqqqqqqqqqqqqqq", "endpoint_id":"wc_endpoint_qqqqqqqqqqqqqqqq", "expected_controller_generation":1
+                }),
+                false,
+            ),
+        ] {
+            let input = webcodex_tool_contracts::input_schema_for_tool(target);
+            crate::tool_runtime::ToolCall::from_tool_name(target, arguments.clone()).unwrap();
+            let mut schema = json!({
+                "type":"object", "additionalProperties":false,
+                "properties":{"next":webcodex_tool_contracts::suggested_tool_call_schema(FallbackRecovery, target, input, "continuation edge")},
+                "required":["next"]
+            });
+            let mut value = json!({"next":{"follow_up_kind":"fallback_recovery", "tool":target, "arguments":arguments}});
+            project_suggested_tool_calls_in_value(&mut value, &schema, &|name| {
+                suggested_tool_call_route(name, false)
+            });
+            project_suggested_tool_call_schema(&mut schema, &|name| {
+                suggested_tool_call_route(name, false)
+            });
+            if available {
+                assert_eq!(value["next"]["tool"], ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME);
+                assert_eq!(value["next"]["arguments"]["tool"], target);
+                assert_eq!(value["next"]["arguments"]["arguments"], arguments);
+                assert_eq!(
+                    schema["properties"]["next"]["properties"]["tool"]["const"],
+                    ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+                );
+            } else {
+                assert!(value.get("next").is_none(), "{target}");
+                assert!(schema["properties"].get("next").is_none(), "{target}");
+                assert_eq!(schema["required"], json!([]));
+            }
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&value, &schema)
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn unavailable_suggested_call_is_removed_from_value_and_schema() {
         let mut value = json!({
             "type": "result",
-            "next": {"tool": "not_available_here", "arguments": {"x": 1}}
+            "next": {
+                "follow_up_kind": "mechanically_followable",
+                "tool": "not_available_here",
+                "arguments": {"x": 1}
+            }
         });
         let mut schema = json!({
             "type": "object",
@@ -704,6 +885,7 @@ mod tests {
             "properties": {
                 "type": {"type": "string"},
                 "next": webcodex_tool_contracts::suggested_tool_call_schema(
+                    webcodex_core::runtime_contract::GeneratedFollowUpKind::MechanicallyFollowable,
                     "not_available_here",
                     json!({
                         "type": "object",
@@ -735,6 +917,7 @@ mod tests {
         let canonical_schema =
             webcodex_tool_contracts::output_schema_for_tool("finish_coding_task");
         let canonical_call = json!({
+            "follow_up_kind": "mechanically_followable",
             "tool": "git_diff_hunks",
             "arguments": {
                 "project": "demo",
@@ -763,13 +946,15 @@ mod tests {
             &canonical_schema,
             &|target| suggested_tool_call_route(target, false),
         );
+        let current_call = &current_adaptive["output"]["changes"]["show_changes"]
+            ["diff_review_handoff"]["next_call"];
+        assert_eq!(current_call["tool"], ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME);
+        assert_eq!(current_call["follow_up_kind"], "mechanically_followable");
+        assert_eq!(current_call["arguments"]["tool"], "git_diff_hunks");
         assert_eq!(
-            current_adaptive["output"]["changes"]["show_changes"]["diff_review_handoff"]
-                ["next_call"],
-            canonical_call,
-            "current Adaptive direct routing must preserve the canonical nested call"
+            current_call["arguments"]["arguments"], canonical_call["arguments"],
+            "current Adaptive routing must gateway-wrap the exact specialist recovery call"
         );
-
         let synthetic_gateway_route = |target: &str| {
             if target == "git_diff_hunks" {
                 SuggestedToolCallRoute::Gateway(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)

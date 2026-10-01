@@ -23,6 +23,7 @@ async fn post_session_message(
             reply_to: None,
             priority,
             requires_ack: false,
+            delivery_key: None,
         })
         .await;
     assert!(result.success, "{:?}", result.error);
@@ -42,14 +43,14 @@ async fn read_agent_file_for_session(
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
                             expected_read_revision: None,
                         }],
-                        session_id: session_id,
+                        session_id,
                         with_line_numbers: None,
                         max_result_bytes: None,
                     },
@@ -97,7 +98,7 @@ async fn read_files_with_session_id_records_event_without_content() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
@@ -170,7 +171,7 @@ async fn read_files_without_session_id_omits_session_telemetry() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
@@ -750,6 +751,7 @@ async fn closed_session_blocks_write_tools_and_message_post() {
             reply_to: None,
             priority: SessionMessagePriority::Normal,
             requires_ack: false,
+            delivery_key: None,
         })
         .await;
     assert!(!post.success);

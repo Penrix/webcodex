@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import sys
 from collections import Counter
@@ -30,6 +31,8 @@ LEGACY_CODE_MODE_SURFACE_ALIASES = {
     "e2b": "guarded_edit",
 }
 CODE_MODE_SURFACE_CHOICES = (*CANONICAL_CODE_MODE_SURFACES, *LEGACY_CODE_MODE_SURFACE_ALIASES)
+HOST_CODE_MODE_SURFACE = "host_code_mode"
+BENCHMARK_VARIANTS = ("direct", "host_code_mode", "code_mode")
 RUN_ANNOTATION_SCHEMA_VERSION = 1
 REPAIR_REASONS = frozenset((
     "invalid_arguments",
@@ -58,6 +61,16 @@ CODE_MODE_COMPOSITION_NUMERIC_FIELDS = (
 # Additive fields may be absent from historical ActionAudit rows. They get their
 # own availability/missing accounting and never invalidate the core composition.
 CODE_MODE_COMPOSITION_OPTIONAL_NUMERIC_FIELDS = ("input_bytes",)
+
+# Closed v13 persisted wire vocabulary for this offline consumer, not alias rules.
+# Runtime/schema spellings are owned by ToolInputNormalizationCode in tool-contracts.
+INPUT_NORMALIZATION_CODES = frozenset((
+    "argv_to_args",
+    "run_process_sh_c_to_run_shell",
+    "run_process_bash_c_to_run_shell",
+    "run_process_bash_lc_to_login_run_shell",
+))
+INPUT_NORMALIZATION_SCHEMA_VERSION = 13
 
 
 class ReportError(ValueError):
@@ -187,12 +200,15 @@ def validate_run_annotation(value: Any) -> dict[str, Any]:
         raise ReportError("unsupported run annotation schema_version")
     _require_nonempty_string(value.get("case_id"), "run annotation case_id")
     variant = value.get("variant")
-    if variant not in ("direct", "code_mode"):
-        raise ReportError("run annotation variant must be direct or code_mode")
+    if variant not in BENCHMARK_VARIANTS:
+        raise ReportError("run annotation variant must be direct, host_code_mode, or code_mode")
     surface = value.get("surface")
     if variant == "direct":
         if surface != "direct":
             raise ReportError("direct run annotation requires surface=direct")
+    elif variant == "host_code_mode":
+        if surface != HOST_CODE_MODE_SURFACE:
+            raise ReportError("host_code_mode run annotation requires surface=host_code_mode")
     elif _canonical_code_mode_surface(surface) is None:
         raise ReportError("code_mode run annotation requires surface=read_only, validation, or guarded_edit")
     if not _is_exact_git_revision(value.get("base_revision")):
@@ -309,11 +325,17 @@ e.window_continuity_eligible, e.window_meaningful, e.started_at
 """.strip()
 
 _CONTINUITY_COLUMNS = """
-e.event_id, e.action_name, e.client_window_key,
+e.event_id, e.operation, e.action_name, e.client_window_key,
 e.principal_correlation_kind, e.principal_correlation_id,
 e.window_started_at_ms, e.request_observed_at_ms, e.response_handed_at_ms,
 e.window_transition_kind, e.window_continuity_eligible,
-e.window_meaningful, e.started_at
+e.window_meaningful, e.started_at, e.server_trace_id, e.response_streaming,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.model_ergonomics.schema_version') END AS model_ergonomics_version,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.model_ergonomics.tool_name') END AS model_ergonomics_tool,
+CASE WHEN json_valid(e.summary_json) THEN json_type(e.summary_json, '$.model_ergonomics.success') END AS model_ergonomics_success_type,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.model_ergonomics.job_convergence') END AS job_convergence_json,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.model_ergonomics.readiness') END AS readiness_json,
+CASE WHEN json_valid(e.summary_json) THEN json_extract(e.summary_json, '$.previous_meaningful_call') END AS previous_meaningful_call
 """.strip()
 
 
@@ -367,7 +389,21 @@ def _row_to_audit_event(row: sqlite3.Row) -> dict[str, Any]:
 
 def _row_to_continuity_event(row: sqlite3.Row) -> dict[str, Any]:
     return {
+        "server_trace_id": row["server_trace_id"],
+        "response_streaming": None if row["response_streaming"] is None else bool(row["response_streaming"]),
+        "summary": {
+            "previous_meaningful_call": row["previous_meaningful_call"],
+            "model_ergonomics": {
+                "schema_version": row["model_ergonomics_version"],
+                "tool_name": row["model_ergonomics_tool"],
+                "success": (row["model_ergonomics_success_type"] == "true"
+                            if row["model_ergonomics_success_type"] in ("true", "false") else None),
+                "job_convergence": _parse_json_object(row["job_convergence_json"] or "{}", "job_convergence", str(row["event_id"])),
+                "readiness": _parse_json_object(row["readiness_json"] or "{}", "readiness", str(row["event_id"])),
+            },
+        },
         "event_id": str(row["event_id"]),
+        "operation": row["operation"],
         "action_name": row["action_name"],
         "client_window_key": row["client_window_key"],
         "principal_correlation_kind": row["principal_correlation_kind"],
@@ -464,6 +500,7 @@ def load_audit_continuity_events(
     last_started = max(event["request_observed_at_ms"] for event in keyed)
     connection = _open_sqlite_readonly(audit_db)
     rows: list[sqlite3.Row] = []
+    by_id = {event["event_id"]: event for event in selected_meaningful}
     try:
         for start in range(0, len(windows), 400):
             chunk = windows[start:start + 400]
@@ -480,27 +517,665 @@ def load_audit_continuity_events(
             rows.extend(
                 connection.execute(sql, [first_started, last_started, *chunk]).fetchall()
             )
+        for row in rows:
+            event = _row_to_continuity_event(row)
+            key = (
+                event.get("client_window_key"),
+                event.get("principal_correlation_kind"),
+                event.get("principal_correlation_id"),
+            )
+            if key in keys:
+                by_id[event["event_id"]] = event
+
+        # The first selected call for a Window may serially continue an exact
+        # meaningful predecessor outside the benchmark Session. Resolve that
+        # one persisted predecessor hop by trace id so the summarizer can treat
+        # it as an explicit run boundary instead of missing continuity. Never
+        # widen backwards by time range.
+        first_selected_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for event in keyed:
+            key = (
+                event["client_window_key"],
+                event["principal_correlation_kind"],
+                event["principal_correlation_id"],
+            )
+            current = first_selected_by_key.get(key)
+            if current is None or event["request_observed_at_ms"] < current["request_observed_at_ms"]:
+                first_selected_by_key[key] = event
+        incoming_predecessors = {
+            previous
+            for event in first_selected_by_key.values()
+            if event.get("window_transition_kind") == "serial"
+            and isinstance(event.get("summary"), dict)
+            and isinstance(
+                previous := event.get("summary", {}).get("previous_meaningful_call"), str
+            )
+            and previous
+        }
+        seen_traces = {
+            event.get("server_trace_id")
+            for event in by_id.values()
+            if isinstance(event.get("server_trace_id"), str)
+            and event.get("server_trace_id")
+        }
+        incoming_predecessors.difference_update(seen_traces)
+        ordered_incoming_predecessors = sorted(incoming_predecessors)
+        for start in range(0, len(ordered_incoming_predecessors), 400):
+            chunk = ordered_incoming_predecessors[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"""
+                SELECT {_CONTINUITY_COLUMNS}
+                FROM action_events e
+                WHERE e.action_name = 'toolsCall'
+                  AND e.window_meaningful = 1
+                  AND e.server_trace_id IN ({placeholders})
+                ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms, e.started_at * 1000), e.event_id
+            """
+            for row in connection.execute(sql, chunk).fetchall():
+                event = _row_to_continuity_event(row)
+                key = (
+                    event.get("client_window_key"),
+                    event.get("principal_correlation_kind"),
+                    event.get("principal_correlation_id"),
+                )
+                trace = event.get("server_trace_id")
+                if key in keys and isinstance(trace, str) and trace:
+                    by_id[event["event_id"]] = event
+
+
+        # Workflow-session links describe business provenance, not every follow-up
+        # observation. An exact observe may therefore be the next meaningful call
+        # after the final linked row. Follow only the persisted exact predecessor
+        # relation from each selected tail; never widen by an arbitrary time window.
+        tails: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for event in keyed:
+            key = (
+                event["client_window_key"],
+                event["principal_correlation_kind"],
+                event["principal_correlation_id"],
+            )
+            if key not in tails or event["request_observed_at_ms"] > tails[key]["request_observed_at_ms"]:
+                tails[key] = event
+        frontier = {
+            event["server_trace_id"]
+            for event in tails.values()
+            if isinstance(event.get("server_trace_id"), str) and event["server_trace_id"]
+        }
+        seen_traces = {
+            event.get("server_trace_id")
+            for event in by_id.values()
+            if isinstance(event.get("server_trace_id"), str) and event.get("server_trace_id")
+        }
+        # The summarizer bounds len(selected)+len(context), even though exact
+        # selected traces are deduplicated again by trace id. Stay within that
+        # public report bound here rather than filling the context to 100k alone.
+        remaining = max(0, 100_000 - len(selected_events) - len(by_id))
+        while frontier and remaining:
+            next_frontier: set[str] = set()
+            ordered = sorted(frontier)
+            frontier.clear()
+            for start in range(0, len(ordered), 400):
+                chunk = ordered[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                sql = f"""
+                    SELECT {_CONTINUITY_COLUMNS}
+                    FROM action_events e
+                    WHERE e.action_name = 'toolsCall'
+                      AND e.window_meaningful = 1
+                      AND json_valid(e.summary_json)
+                      AND json_extract(e.summary_json, '$.previous_meaningful_call') IN ({placeholders})
+                    ORDER BY COALESCE(e.request_observed_at_ms, e.window_started_at_ms, e.started_at * 1000), e.event_id
+                """
+                for row in connection.execute(sql, chunk).fetchall():
+                    event = _row_to_continuity_event(row)
+                    key = (
+                        event.get("client_window_key"),
+                        event.get("principal_correlation_kind"),
+                        event.get("principal_correlation_id"),
+                    )
+                    trace = event.get("server_trace_id")
+                    if key not in keys or not isinstance(trace, str) or not trace or trace in seen_traces:
+                        continue
+                    by_id[event["event_id"]] = event
+                    seen_traces.add(trace)
+                    next_frontier.add(trace)
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+                if remaining == 0:
+                    break
+            frontier = next_frontier
     except sqlite3.Error as exc:
         raise ReportError(f"could not query audit continuity context: {exc}") from exc
     finally:
         connection.close()
 
-    by_id = {event["event_id"]: event for event in selected_meaningful}
-    for row in rows:
-        event = _row_to_continuity_event(row)
-        key = (
-            event.get("client_window_key"),
-            event.get("principal_correlation_kind"),
-            event.get("principal_correlation_id"),
-        )
-        if key in keys:
-            by_id[event["event_id"]] = event
     return sorted(by_id.values(), key=_audit_sort_key)
 
 
 def _telemetry(event: dict[str, Any]) -> dict[str, Any] | None:
     value = event.get("summary", {}).get("model_ergonomics")
     return value if isinstance(value, dict) else None
+
+
+def _input_ergonomics_record(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Require canonical identity/outcome evidence; never read raw arguments/errors."""
+    value = _telemetry(event)
+    if value is None or event.get("action_name") != "toolsCall":
+        return None
+    version, tool = value.get("schema_version"), value.get("tool_name")
+    if (type(version) is not int or version < 1 or type(value.get("success")) is not bool
+            or not isinstance(tool, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,127}", tool) is None
+            or tool != event.get("operation")):
+        return None
+    return value
+
+
+def _immediate_input_repair_proxy(
+    candidates: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    context: list[dict[str, Any]],
+    *, evidence_available: bool,
+) -> dict[str, Any]:
+    """Exact immediate meaningful-call adjacency, never a model-turn/causal claim."""
+    def key(event: dict[str, Any]) -> tuple[str, str, str] | None:
+        values = tuple(event.get(field) for field in (
+            "client_window_key", "principal_correlation_kind", "principal_correlation_id"))
+        return values if all(isinstance(value, str) and value for value in values) else None
+
+    def eligible(event: dict[str, Any]) -> bool:
+        started, handed = event.get("request_observed_at_ms"), event.get("response_handed_at_ms")
+        return (key(event) is not None and event.get("window_continuity_eligible") is True
+                and event.get("response_streaming") is False
+                and isinstance(event.get("server_trace_id"), str) and bool(event["server_trace_id"])
+                and type(started) is int and type(handed) is int and 0 <= started <= handed)
+
+    reasons: Counter[str] = Counter()
+    observed: Counter[str] = Counter()
+    evaluated = 0
+    if len(selected) + len(context) > 100_000:
+        reasons["continuity_context_limit"] = len(candidates) or 1
+    else:
+        # Selected full rows win over their bounded continuity projections.
+        by_id = {str(event["event_id"]): event for event in [*context, *selected]}
+        groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for event in sorted(by_id.values(), key=_audit_sort_key):
+            if event.get("action_name") == "toolsCall" and event.get("window_meaningful"):
+                scope = key(event)
+                if scope is not None:
+                    groups.setdefault(scope, []).append(event)
+        next_by_id: dict[str, dict[str, Any]] = {}
+        trace_counts: Counter[tuple[Any, Any]] = Counter()
+        successor_counts: Counter[tuple[Any, Any]] = Counter()
+        for scope, calls in groups.items():
+            next_by_id.update((str(before["event_id"]), after) for before, after in zip(calls, calls[1:]))
+            for event in calls:
+                trace = event.get("server_trace_id")
+                previous = event.get("summary", {}).get("previous_meaningful_call")
+                if isinstance(trace, str):
+                    trace_counts[(scope, trace)] += 1
+                if isinstance(previous, str):
+                    successor_counts[(scope, previous)] += 1
+        for failed in candidates:
+            if not eligible(failed):
+                reasons["rejection_continuity_unavailable"] += 1
+                continue
+            successor = next_by_id.get(str(failed["event_id"]))
+            if successor is None:
+                reasons["no_observed_successor"] += 1
+                continue
+            scope, trace = key(failed), failed["server_trace_id"]
+            if (trace_counts[(scope, trace)] != 1
+                    or successor_counts[(scope, trace)] > 1):
+                reasons["ambiguous_serial_identity"] += 1
+                continue
+            # Never skip an intervening meaningful call, even one missing telemetry.
+            next_record = _input_ergonomics_record(successor)
+            if (not eligible(successor) or next_record is None
+                    or successor.get("window_transition_kind") != "serial"
+                    or successor.get("summary", {}).get("previous_meaningful_call") != trace
+                    or successor["request_observed_at_ms"] < failed["response_handed_at_ms"]
+                    or trace_counts[(scope, successor.get("server_trace_id"))] != 1):
+                reasons["successor_continuity_unavailable"] += 1
+                continue
+            evaluated += 1
+            failed_record = _input_ergonomics_record(failed)
+            if next_record["success"] is True and next_record["tool_name"] == failed_record["tool_name"]:
+                observed[next_record["tool_name"]] += 1
+    available = evidence_available and not reasons
+    return {
+        "available": available,
+        "reason": (None if available else "canonical meaningful-call evidence is unavailable"
+                   if not evidence_available else "one or more rejections lack exact immediate successor continuity"),
+        "count": sum(observed.values()) if available else None,
+        "by_tool": dict(sorted(observed.items())) if available else None,
+        "observed_count": sum(observed.values()),
+        "observed_by_tool": dict(sorted(observed.items())),
+        "candidate_rejections": len(candidates),
+        "evaluated_rejections": evaluated,
+        "unavailable_rejections": len(candidates) - evaluated,
+        "unavailable_by_reason": dict(sorted(reasons.items())),
+        "interpretation": "WebCodex-observed immediate same-tool corrective-call proxy; does not prove model turn identity, causality, or a field-spelling failure",
+    }
+
+
+def _summarize_input_ergonomics(
+    audit_events: list[dict[str, Any]],
+    context: list[dict[str, Any]],
+    *, action_audit_available: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    outer = [event for event in audit_events if event.get("action_name") == "toolsCall"]
+    records = [(event, value) for event in outer if (value := _input_ergonomics_record(event)) is not None]
+    eligible = [(event, value) for event, value in records
+                if value["schema_version"] >= INPUT_NORMALIZATION_SCHEMA_VERSION]
+    successful = [(event, value) for event, value in eligible if value["success"] is True]
+    by_code: Counter[str] = Counter()
+    by_tool: Counter[str] = Counter()
+    unknown_codes = 0
+    for _, value in successful:
+        code = value.get("input_normalization_code")
+        if code is None:
+            continue
+        if not isinstance(code, str) or code not in INPUT_NORMALIZATION_CODES:
+            unknown_codes += 1
+            continue
+        by_code[code] += 1
+        by_tool[value["tool_name"]] += 1
+    rejected = [(event, value) for event, value in records
+                if value["success"] is False and value.get("error_kind") == "invalid_arguments"]
+    rejection_tools = Counter(value["tool_name"] for _, value in rejected)
+    normalization_available = action_audit_available and bool(successful) and unknown_codes == 0
+    reason = (None if normalization_available else "unknown or malformed normalization codes"
+              if unknown_codes else "no successful canonical ModelErgonomics v13+ records")
+    return {
+        "measured_canonical_calls": len(records),
+        "eligible_events": len(eligible),
+        "eligible_successful_events": len(successful),
+        "legacy_schema_events": len(records) - len(eligible),
+        "missing_or_invalid_record_events": len(outer) - len(records),
+        "unrecognized_normalization_events": unknown_codes,
+        "normalization_events": sum(by_code.values()),
+        "normalization_by_code": dict(sorted(by_code.items())),
+        "normalization_by_tool": dict(sorted(by_tool.items())),
+        "normalization_rate": sum(by_code.values()) / len(successful) if normalization_available else None,
+        "normalization_rate_denominator": "eligible_successful_events: successful canonical ModelErgonomics v13+ records in the selected audit set",
+        "invalid_argument_rejections": len(rejected),
+        "invalid_arguments_by_tool": dict(sorted(rejection_tools.items())),
+        "immediate_same_tool_repair_proxy": _immediate_input_repair_proxy(
+            [event for event, _ in rejected if event.get("window_meaningful")], outer, context,
+            evidence_available=action_audit_available and any(event.get("window_meaningful") for event, _ in records),
+        ),
+    }, {"available": normalization_available, "reason": reason}
+
+
+def _summarize_job_convergence(selected: list[dict[str, Any]], context: list[dict[str, Any]]) -> dict[str, Any]:
+    """Exact audit joins; no identities or content are returned in the aggregate.
+
+    Missing links, overlap, non-MCP timing and correlation gaps remain unknown.
+    Work is bounded to 100k rows and one million predecessor links per report.
+    """
+    if len(selected) + len(context) > 100_000:
+        raise ReportError("Job convergence analysis exceeds 100000 audit rows")
+    rows = {row.get("server_trace_id"): row for row in context + selected if row.get("server_trace_id")}
+    counts = Counter({name: 0 for name in (
+        "pending_handoff_count", "pending_followed_immediately_by_observe_count", "pending_followup_known_count",
+        "passive_terminal_delivery_count", "passive_failure_delivery_count",
+        "passive_terminal_before_explicit_observe_count", "terminal_failure_followed_by_observe_count",
+        "wait_for_job_terminal_count", "uncorrelated_calls", "unknown_relations",
+        "passive_validation_failure_delivery_count", "terminal_validation_failure_followed_by_observe_count",
+    )})
+    timings: list[int] = []
+    timing_missing = 0
+    links_remaining = 1_000_000
+    failure_observed: set[str] = set()
+    timed: set[str] = set()
+    pending_observed: set[str] = set()
+
+    def facts(row: dict[str, Any]) -> dict[str, Any]:
+        value = (_telemetry(row) or {}).get("job_convergence")
+        return value if isinstance(value, dict) else {}
+
+    def events(row: dict[str, Any]) -> list[dict[str, Any]]:
+        raw = facts(row).get("events", [])
+        if not isinstance(raw, list) or len(raw) > 9:
+            return []
+        return [event for event in raw if isinstance(event, dict)
+                and _is_exact_sha256(event.get("relation"))
+                and event.get("kind") in ("pending_handoff", "explicit_observe", "passive_terminal")]
+
+    def predecessor(row: dict[str, Any]) -> dict[str, Any] | None:
+        nonlocal links_remaining
+        if links_remaining <= 0:
+            return None
+        links_remaining -= 1
+        previous = rows.get(row.get("summary", {}).get("previous_meaningful_call"))
+        if not previous or row.get("window_transition_kind") != "serial":
+            return None
+        for field in ("client_window_key", "principal_correlation_kind", "principal_correlation_id"):
+            if not row.get(field) or row.get(field) != previous.get(field):
+                return None
+        if any(call.get("window_continuity_eligible") is not True or call.get("response_streaming") is not False
+               for call in (row, previous)):
+            return None
+        start, end = row.get("request_observed_at_ms"), previous.get("response_handed_at_ms")
+        if not isinstance(start, int) or not isinstance(end, int) or start < end:
+            return None
+        return previous
+
+    def history(row: dict[str, Any]):
+        seen: set[str] = set()
+        while (row := predecessor(row)) is not None:
+            trace = row["server_trace_id"]
+            version = (_telemetry(row) or {}).get("schema_version")
+            if (trace in seen or facts(row).get("correlation_complete") is False
+                    or not isinstance(version, int) or version < 10):
+                return
+            seen.add(trace)
+            yield row
+
+    selected_relations = {event["relation"] for row in selected for event in events(row)}
+    selected_traces = {row.get("server_trace_id") for row in selected}
+    measured_rows = [row for row in rows.values() if row.get("server_trace_id") in selected_traces
+                     or any(event["relation"] in selected_relations for event in events(row))]
+    # Missing trace/timing still contributes observed invocation counts, but
+    # cannot participate in a relation chain.
+    measured_rows.extend(row for row in selected if not row.get("server_trace_id"))
+    known_followups: set[str] = set()
+    for row in rows.values():
+        version = (_telemetry(row) or {}).get("schema_version")
+        if facts(row).get("correlation_complete") is False or not isinstance(version, int) or version < 10:
+            continue
+        previous = predecessor(row)
+        if previous:
+            for event in events(previous):
+                if event["kind"] == "pending_handoff" and event["relation"] in selected_relations:
+                    known_followups.add(event["relation"])
+    counts["pending_followup_known_count"] = len(known_followups)
+    for row in measured_rows:
+        data = facts(row)
+        for name in ("pending_handoff_count", "passive_terminal_delivery_count", "passive_failure_delivery_count", "wait_for_job_terminal_count"):
+            value = data.get(name, 0)
+            if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 9:
+                counts[name] += value
+        if data.get("correlation_complete") is False:
+            counts["uncorrelated_calls"] += 1
+        for event in events(row):
+            relation_id = event["relation"]
+            pending = None
+            if event["kind"] == "explicit_observe":
+                previous = predecessor(row)
+                if previous and any(old["kind"] == "pending_handoff" and old["relation"] == relation_id for old in events(previous)):
+                    if relation_id not in pending_observed:
+                        counts["pending_followed_immediately_by_observe_count"] += 1
+                        pending_observed.add(relation_id)
+                if relation_id in failure_observed:
+                    continue
+                for previous in history(row):
+                    matching = [old for old in events(previous) if old["relation"] == relation_id]
+                    if any(old["kind"] == "passive_terminal" and old.get("failure") is True for old in matching):
+                        counts["terminal_failure_followed_by_observe_count"] += 1
+                        failure_observed.add(relation_id)
+                        if any(old.get("validation_failure") is True for old in matching if old["kind"] == "passive_terminal"):
+                            counts["terminal_validation_failure_followed_by_observe_count"] += 1
+                        break
+                    if any(old["kind"] == "pending_handoff" for old in matching):
+                        break
+            elif event["kind"] == "passive_terminal":
+                counts["passive_validation_failure_delivery_count"] += int(event.get("validation_failure") is True)
+                observed = False
+                pending = None
+                for previous in history(row):
+                    matching = [old for old in events(previous) if old["relation"] == relation_id]
+                    observed |= any(old["kind"] == "explicit_observe" for old in matching)
+                    if any(old["kind"] == "pending_handoff" for old in matching):
+                        pending = previous
+                        break
+                if pending is None:
+                    counts["unknown_relations"] += 1
+                elif not observed:
+                    counts["passive_terminal_before_explicit_observe_count"] += 1
+            if event["kind"] == "explicit_observe" and event.get("terminal_observed_at_ms") is not None:
+                for previous in history(row):
+                    if any(old["kind"] == "pending_handoff" and old["relation"] == relation_id for old in events(previous)):
+                        pending = previous
+                        break
+            if event["kind"] == "passive_terminal" or event.get("terminal_observed_at_ms") is not None:
+                if relation_id not in timed:
+                    timed.add(relation_id)
+                    handed = pending.get("response_handed_at_ms") if pending else None
+                    terminal = event.get("terminal_observed_at_ms")
+                    if isinstance(handed, int) and isinstance(terminal, int) and terminal >= handed:
+                        timings.append(terminal - handed)
+                    else:
+                        timing_missing += 1
+    return {**counts, "pending_to_terminal_ms": _metric_distribution(timings, missing=timing_missing)}
+
+
+
+JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS = 120_000
+
+
+_JOB_SCHEDULING_INDEPENDENT_TOOLS = frozenset(
+    {
+        "read_files",
+        "search_project_texts",
+        "search_and_read",
+        "review_changes",
+        "show_changes",
+        "git_log",
+        "git_status",
+        "git_diff_hunks",
+        "git_review_summary",
+        "project_artifact",
+    }
+)
+
+
+def _readiness_facts(event: dict[str, Any]) -> dict[str, Any] | None:
+    value = (_telemetry(event) or {}).get("readiness")
+    if not isinstance(value, dict):
+        return None
+    mode = value.get("mode")
+    wait_state = value.get("wait_state")
+    numeric = {
+        field: value.get(field)
+        for field in ("requested_jobs", "unique_jobs", "waited_ms", "ready_count", "pending_count")
+    }
+    if mode not in ("any", "all") or wait_state not in ("ready", "deadline"):
+        return None
+    if any(isinstance(item, bool) or not isinstance(item, int) or item < 0 for item in numeric.values()):
+        return None
+    return {
+        "mode": mode,
+        "wait_state": wait_state,
+        **numeric,
+    }
+
+
+def _job_scheduling_pending_relations(event: dict[str, Any]) -> set[str]:
+    telemetry = _telemetry(event) or {}
+    version = telemetry.get("schema_version")
+    facts = telemetry.get("job_convergence")
+    if not isinstance(version, int) or version < 10 or not isinstance(facts, dict):
+        return set()
+    if facts.get("correlation_complete") is False:
+        return set()
+    raw = facts.get("events")
+    if not isinstance(raw, list) or len(raw) > 9:
+        return set()
+    return {
+        relation
+        for item in raw
+        if isinstance(item, dict)
+        and item.get("kind") == "pending_handoff"
+        and _is_exact_sha256(relation := item.get("relation"))
+    }
+
+def _summarize_job_scheduling(
+    selected: list[dict[str, Any]],
+    context: list[dict[str, Any]],
+    job_convergence: dict[str, Any] | None = None,
+    *,
+    action_audit_available: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Summarize pending/readiness scheduling without claiming Host-turn identity.
+
+    Serial adjacency is exact ClientWindow continuity only. Readiness telemetry is
+    identity-free, so deadline->rewait cannot prove that the blocked Job set is
+    unchanged; that limitation is explicit in the result.
+    """
+    if not action_audit_available:
+        unavailable = {
+            "pending_handoffs": None,
+            "pending_followup_known": None,
+            "pending_then_independent_work": None,
+            "pending_then_immediate_readiness": None,
+            "pending_then_immediate_observe": None,
+            "readiness_calls": None,
+            "readiness_measured_calls": None,
+            "readiness_ready": None,
+            "readiness_deadline": None,
+            "readiness_any": None,
+            "readiness_all": None,
+            "deadline_then_nearby_rewait": None,
+            "nearby_rewait_max_gap_ms": JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS,
+            "readiness_waited_ms": _metric_distribution([]),
+            "same_model_turn_proven": False,
+            "same_blocked_set_proven": False,
+        }
+        return unavailable, {
+            "available": False,
+            "reason": "job scheduling analysis requires ActionAudit ModelErgonomics and serial ClientWindow continuity",
+        }
+
+    selected_outer = [row for row in selected if row.get("action_name") == "toolsCall"]
+    if len(selected_outer) + len(context) > 100_000:
+        raise ReportError("Job scheduling analysis exceeds 100000 audit rows")
+    if job_convergence is None:
+        job_convergence = _summarize_job_convergence(selected, context)
+
+    readiness_rows = [
+        row for row in selected_outer if row.get("operation") == "wait_for_job_readiness"
+    ]
+    readiness = [(row, _readiness_facts(row)) for row in readiness_rows]
+    measured = [(row, facts) for row, facts in readiness if facts is not None]
+    readiness_complete = len(measured) == len(readiness_rows)
+    waits = [facts["waited_ms"] for _, facts in measured]
+    ready_observed = sum(facts["wait_state"] == "ready" for _, facts in measured)
+    deadline_observed = sum(facts["wait_state"] == "deadline" for _, facts in measured)
+    any_observed = sum(facts["mode"] == "any" for _, facts in measured)
+    all_observed = sum(facts["mode"] == "all" for _, facts in measured)
+
+    rows: dict[str, dict[str, Any]] = {}
+    for row in context + selected:
+        trace = row.get("server_trace_id")
+        if isinstance(trace, str) and trace:
+            rows[trace] = row
+    selected_traces = {
+        row["server_trace_id"]
+        for row in selected_outer
+        if isinstance(row.get("server_trace_id"), str) and row["server_trace_id"]
+    }
+
+    def predecessor(row: dict[str, Any]) -> dict[str, Any] | None:
+        if row.get("window_transition_kind") != "serial":
+            return None
+        previous_trace = row.get("summary", {}).get("previous_meaningful_call")
+        previous = rows.get(previous_trace)
+        if previous is None:
+            return None
+        for field in ("client_window_key", "principal_correlation_kind", "principal_correlation_id"):
+            if not row.get(field) or row.get(field) != previous.get(field):
+                return None
+        if any(
+            call.get("window_continuity_eligible") is not True
+            or call.get("response_streaming") is not False
+            for call in (row, previous)
+        ):
+            return None
+        started = row.get("request_observed_at_ms")
+        handed = previous.get("response_handed_at_ms")
+        if not isinstance(started, int) or not isinstance(handed, int) or started < handed:
+            return None
+        return previous
+
+    independent_observed = 0
+    immediate_readiness_observed = 0
+    deadline_rewait_observed = 0
+    chain_missing = 0
+    for row in selected_outer:
+        if row.get("window_transition_kind") != "serial":
+            continue
+        operation = row.get("operation")
+        relevant = (
+            operation in _JOB_SCHEDULING_INDEPENDENT_TOOLS
+            or operation == "wait_for_job_readiness"
+        )
+        if not relevant:
+            continue
+        previous = predecessor(row)
+        if previous is None:
+            chain_missing += 1
+            continue
+        if previous.get("server_trace_id") not in selected_traces:
+            continue
+        pending_relations = _job_scheduling_pending_relations(previous)
+        if pending_relations:
+            if operation in _JOB_SCHEDULING_INDEPENDENT_TOOLS:
+                independent_observed += 1
+            elif operation == "wait_for_job_readiness":
+                immediate_readiness_observed += 1
+        if (
+            operation == "wait_for_job_readiness"
+            and (previous_readiness := _readiness_facts(previous)) is not None
+            and previous_readiness["wait_state"] == "deadline"
+        ):
+            started = row.get("request_observed_at_ms")
+            handed = previous.get("response_handed_at_ms")
+            if (
+                isinstance(started, int)
+                and isinstance(handed, int)
+                and 0 <= started - handed <= JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS
+            ):
+                deadline_rewait_observed += 1
+
+    chain_complete = chain_missing == 0
+    pending_handoffs = job_convergence.get("pending_handoff_count")
+    pending_followup_known = job_convergence.get("pending_followup_known_count")
+    pending_immediate_observe = job_convergence.get(
+        "pending_followed_immediately_by_observe_count"
+    )
+
+    summary = {
+        "pending_handoffs": pending_handoffs,
+        "pending_followup_known": pending_followup_known,
+        "pending_then_independent_work": independent_observed if chain_complete else None,
+        "pending_then_immediate_readiness": immediate_readiness_observed if chain_complete else None,
+        "pending_then_immediate_observe": pending_immediate_observe,
+        "readiness_calls": len(readiness_rows),
+        "readiness_measured_calls": len(measured),
+        "readiness_ready": ready_observed if readiness_complete else None,
+        "readiness_deadline": deadline_observed if readiness_complete else None,
+        "readiness_any": any_observed if readiness_complete else None,
+        "readiness_all": all_observed if readiness_complete else None,
+        "deadline_then_nearby_rewait": deadline_rewait_observed if chain_complete else None,
+        "nearby_rewait_max_gap_ms": JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS,
+        "readiness_waited_ms": _metric_distribution(
+            waits, missing=len(readiness_rows) - len(measured)
+        ),
+        "same_model_turn_proven": False,
+        "same_blocked_set_proven": False,
+    }
+    complete = readiness_complete and chain_complete
+    reasons = []
+    if not readiness_complete:
+        reasons.append("one or more readiness calls lack complete ModelErgonomics readiness telemetry")
+    if not chain_complete:
+        reasons.append("one or more relevant serial calls lack exact predecessor continuity evidence")
+    return summary, {
+        "available": complete,
+        "reason": None if complete else "; ".join(reasons),
+    }
 
 
 def _code_mode_composition(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -605,9 +1280,9 @@ def _summarize_code_mode_composition(
             "no Code Mode outer ActionAudit row was selected; benchmark calls must link their outer "
             "ActionAudit rows with recording_session_id"
         )
-    elif variant == "direct" and code_mode_outer:
+    elif variant in ("direct", "host_code_mode") and code_mode_outer:
         missing = max(missing, 1)
-        reason = "a direct report selected one or more Code Mode outer calls"
+        reason = f"a {variant} report selected one or more Code Mode outer calls"
     elif missing:
         reason = "one or more Code Mode outer calls lack a valid code_mode_composition summary"
 
@@ -692,6 +1367,109 @@ def _window_timing(
     return _metric_distribution(gaps, missing=missing_serial), overlap_count, missing_serial
 
 
+def _summarize_host_short_chains(
+    outer: list[dict[str, Any]],
+    continuity_events: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Summarize exact serial Window chains without inferring Host/model turns."""
+    selected_ids = {str(event["event_id"]) for event in outer}
+    previous: dict[tuple[str, str, str], dict[str, Any]] = {}
+    edges: list[tuple[str, str, str, str]] = []
+    missing_serial = 0
+    source = continuity_events if continuity_events is not None else outer
+    for event in sorted(source, key=_audit_sort_key):
+        if not event.get("window_meaningful"):
+            continue
+        selected = str(event["event_id"]) in selected_ids
+        window_key = event.get("client_window_key")
+        principal_kind = event.get("principal_correlation_kind")
+        principal_id = event.get("principal_correlation_id")
+        transition = event.get("window_transition_kind")
+        if not all(
+            isinstance(value, str) and value
+            for value in (window_key, principal_kind, principal_id)
+        ):
+            if selected and transition == "serial":
+                missing_serial += 1
+            continue
+        key = (window_key, principal_kind, principal_id)
+        predecessor = previous.pop(key, None)
+        if selected and transition == "serial":
+            predecessor_selected = (
+                predecessor is not None
+                and str(predecessor["event_id"]) in selected_ids
+            )
+            previous_tool = predecessor.get("operation") if predecessor else None
+            current_tool = event.get("operation")
+            if predecessor_selected:
+                if (
+                    predecessor.get("response_streaming") is False
+                    and event.get("response_streaming") is False
+                    and event.get("window_continuity_eligible") is True
+                    and isinstance(previous_tool, str)
+                    and previous_tool
+                    and isinstance(current_tool, str)
+                    and current_tool
+                ):
+                    edges.append(
+                        (
+                            str(predecessor["event_id"]),
+                            str(event["event_id"]),
+                            previous_tool,
+                            current_tool,
+                        )
+                    )
+                else:
+                    missing_serial += 1
+            elif predecessor is None:
+                # A serial transition claims a predecessor. If the continuity
+                # loader cannot resolve that exact predecessor, the aggregate
+                # remains unavailable rather than guessing whether the edge was
+                # inside or outside the selected benchmark run.
+                missing_serial += 1
+        if event.get("window_continuity_eligible") is True:
+            previous[key] = event
+
+    successor = {before: after for before, after, _, _ in edges}
+    starts = sorted(set(successor) - set(successor.values()))
+    chain_lengths: list[int] = []
+    for start in starts:
+        seen = {start}
+        current = start
+        length = 1
+        while current in successor:
+            current = successor[current]
+            if current in seen:
+                break
+            seen.add(current)
+            length += 1
+        if length > 1:
+            chain_lengths.append(length)
+    pair_counts = Counter(
+        f"{before_tool}->{after_tool}" for _, _, before_tool, after_tool in edges
+    )
+    complete = missing_serial == 0
+    summary = {
+        "serial_transitions": len(edges) if complete else None,
+        "observed_serial_transitions": len(edges),
+        "missing_serial_transitions": missing_serial,
+        "multi_call_chains": len(chain_lengths) if complete else None,
+        "calls_in_multi_call_chains": sum(chain_lengths) if complete else None,
+        "max_chain_calls": max(chain_lengths, default=0) if complete else None,
+        "observed_by_tool_pair": dict(sorted(pair_counts.items())),
+        "same_model_turn_proven": False,
+    }
+    availability = {
+        "available": complete,
+        "reason": (
+            None
+            if complete
+            else "one or more selected serial Window transitions lack exact predecessor continuity evidence"
+        ),
+    }
+    return summary, availability
+
+
 def _observed_span_ms(outer: list[dict[str, Any]]) -> int | None:
     starts = [event["request_observed_at_ms"] for event in outer if isinstance(event.get("request_observed_at_ms"), int)]
     ends = [event["response_handed_at_ms"] for event in outer if event.get("response_streaming") is False and isinstance(event.get("response_handed_at_ms"), int)]
@@ -742,9 +1520,12 @@ def _summarize_audit(
                 counter[item] += 1
 
     gaps, overlap_count, missing_serial = _window_timing(outer, continuity_events)
+    host_short_chain, host_short_chain_availability = _summarize_host_short_chains(
+        outer, continuity_events
+    )
     canonical_observed = len(present_telemetries)
     canonical_by_name = Counter(value["tool_name"] for _, value in present_telemetries if isinstance(value.get("tool_name"), str) and value["tool_name"])
-    if variant == "direct":
+    if variant in ("direct", "host_code_mode"):
         canonical_total = canonical_observed if canonical_observed == len(outer) else None
         canonical_reason = None if canonical_total is not None else "one or more outer calls lack ModelErgonomics evidence"
     elif variant == "code_mode":
@@ -752,7 +1533,7 @@ def _summarize_audit(
         canonical_reason = "canonical_calls.total keeps the outer/direct counting contract; use composition.nested_calls for persisted Code Mode child-call totals"
     else:
         canonical_total = None
-        canonical_reason = "declare --variant direct or code_mode before interpreting canonical call count"
+        canonical_reason = "declare --variant direct, host_code_mode, or code_mode before interpreting canonical call count"
 
     return {
         "observed_span_ms": _observed_span_ms(outer),
@@ -773,6 +1554,7 @@ def _summarize_audit(
             "by_name": dict(sorted(canonical_by_name.items())),
         },
         "composition": composition,
+        "host_short_chain": host_short_chain,
         "child_calls": {
             "failed": failed_child_calls,
             "failure_kind_by_name": None,
@@ -818,6 +1600,11 @@ def _summarize_audit(
             "window_timing": {"available": missing_serial == 0, "reason": None if missing_serial == 0 else "one or more canonical serial transitions lack the predecessor timestamps needed for a gap"},
             "canonical_calls": {"available": canonical_total is not None, "reason": canonical_reason},
             "code_mode_composition": composition_availability,
+            "host_short_chain": host_short_chain_availability,
+            "host_same_model_turn_identity": {
+                "available": False,
+                "reason": "serial ClientWindow continuity proves call ordering, not that calls came from one Host cell or one model response",
+            },
             "serialized_tool_result_bytes": {"available": result_byte_metric["total"] is not None, "reason": None if result_byte_metric["total"] is not None else "one or more outer calls lack a serialized ToolResult byte count; missing values are not treated as zero"},
             "resolved_recoveries": {"available": False, "reason": "recovery_kind is guidance metadata, not proof that a later call resolved the failure"},
         },
@@ -863,6 +1650,8 @@ def _summarize_trace_only(trace_events: list[dict[str, Any]], variant: str | Non
         "webcodex_service_timing": {"available": False, "reason": "tool_handler_returned duration is not the canonical request-observed to response-handoff service interval"},
         "tool_runtime_timing": {"available": False, "reason": "events.jsonl does not persist canonical ModelErgonomics runtime duration evidence"},
         "window_timing": {"available": False, "reason": "events.jsonl does not persist canonical meaningful/continuity transition facts"},
+        "host_short_chain": {"available": False, "reason": "events.jsonl does not persist canonical serial ClientWindow continuity"},
+        "host_same_model_turn_identity": {"available": False, "reason": "trace lifecycle metadata has no Host cell or model response identity"},
         "canonical_calls": {"available": False, "reason": "outer trace lifecycle metadata is not a complete canonical nested-call ledger"},
         "serialized_tool_result_bytes": {"available": False, "reason": "estimated HTTP response bytes are not ToolResult serialized bytes"},
         "resolved_recoveries": {"available": False, "reason": "trace lifecycle metadata does not prove recovery completion"},
@@ -875,6 +1664,16 @@ def _summarize_trace_only(trace_events: list[dict[str, Any]], variant: str | Non
         "tools": {"outer_by_name": dict(sorted(tools.items()))},
         "canonical_calls": {"total": None, "observed_outer_runtime_records": None, "by_name": {}},
         "composition": composition,
+        "host_short_chain": {
+            "serial_transitions": None,
+            "observed_serial_transitions": None,
+            "missing_serial_transitions": None,
+            "multi_call_chains": None,
+            "calls_in_multi_call_chains": None,
+            "max_chain_calls": None,
+            "observed_by_tool_pair": {},
+            "same_model_turn_proven": False,
+        },
         "child_calls": {"failed": None, "failure_kind_by_name": None},
         "timing": {
             "webcodex_service_ms": _metric_distribution([], missing=len(handlers)),
@@ -972,6 +1771,11 @@ def _benchmark_metadata(*, case_manifest: Path | None, case_id: str | None, vari
             surface = "direct"
         elif surface != "direct":
             raise ReportError("--variant direct requires --surface direct")
+    elif variant == "host_code_mode":
+        if surface is None:
+            surface = HOST_CODE_MODE_SURFACE
+        elif surface != HOST_CODE_MODE_SURFACE:
+            raise ReportError("--variant host_code_mode requires --surface host_code_mode")
     elif variant == "code_mode":
         if surface is None:
             raise ReportError("--variant code_mode benchmark runs require --surface read_only, validation, or guarded_edit")
@@ -1127,6 +1931,21 @@ def summarize(*, trace_root: Path | None, audit_db: Path | None, workflow_sessio
     jobs, jobs_availability = _job_summary(trace_events, trace_metadata_present)
     core["runner"] = runner
     core["jobs"] = jobs
+    job_convergence = _summarize_job_convergence(audit_events, continuity_events or [])
+    core["job_convergence"] = job_convergence
+    job_scheduling, job_scheduling_availability = _summarize_job_scheduling(
+        audit_events,
+        continuity_events or [],
+        job_convergence,
+        action_audit_available=audit_db is not None,
+    )
+    core["job_scheduling"] = job_scheduling
+    core["availability"]["job_scheduling"] = job_scheduling_availability
+    input_ergonomics, input_ergonomics_availability = _summarize_input_ergonomics(
+        audit_events, continuity_events or [], action_audit_available=audit_db is not None,
+    )
+    core["input_ergonomics"] = input_ergonomics
+    core["availability"]["input_ergonomics"] = input_ergonomics_availability
     core["availability"]["runner_requests"] = runner_availability
     core["availability"]["job_handoffs"] = jobs_availability
     benchmark = _benchmark_metadata(case_manifest=case_manifest, case_id=case_id, variant=variant, surface=surface, base_revision=base_revision)
@@ -1154,9 +1973,12 @@ def summarize(*, trace_root: Path | None, audit_db: Path | None, workflow_sessio
         "notes": [
             "observed_span_ms is the span between observed WebCodex outer-call timestamps, not task wall time",
             "outside_webcodex_gap_ms contains only canonical serial meaningful-Window gaps and is not model reasoning time",
+            "input_ergonomics normalization rate excludes legacy/missing telemetry; its immediate same-tool corrective-call proxy proves neither model turns nor why the rejected call failed",
             "Runner request counts are observed enqueue events, not an asserted complete total",
             "repair_turns come only from the bounded run annotation sidecar and are never inferred from model text or private reasoning",
             "task_wall_time_ms is reported only when the sidecar supplies explicit independent task start/end timestamps",
+            "job_scheduling.pending_then_independent_work counts only exact immediate serial follow-up calls from a conservative read/review allowlist; generic process/script work is not inferred to be independent",
+            "job_scheduling.deadline_then_nearby_rewait counts only exact serial readiness adjacency within the reported nearby_rewait_max_gap_ms; it does not prove one Host turn or the same blocked Job set",
         ],
     }
 
@@ -1188,7 +2010,34 @@ _COMPARISON_METRICS = [
     "timing.tool_runtime_ms.total", "timing.outside_webcodex_gap_ms.total",
     "timing.outside_webcodex_gap_ms.p50", "timing.outside_webcodex_gap_ms.p95",
     "timing.overlap_count", "results.serialized_tool_result_bytes.total",
+    "host_short_chain.serial_transitions", "host_short_chain.multi_call_chains",
+    "host_short_chain.calls_in_multi_call_chains", "host_short_chain.max_chain_calls",
     "jobs.handoffs", "jobs.terminal",
+    "job_convergence.pending_handoff_count",
+    "job_convergence.pending_followed_immediately_by_observe_count",
+    "job_convergence.pending_followup_known_count",
+    "job_convergence.passive_terminal_delivery_count",
+    "job_convergence.passive_failure_delivery_count",
+    "job_convergence.passive_terminal_before_explicit_observe_count",
+    "job_convergence.terminal_failure_followed_by_observe_count",
+    "job_convergence.wait_for_job_terminal_count",
+    "job_convergence.passive_validation_failure_delivery_count",
+    "job_convergence.terminal_validation_failure_followed_by_observe_count",
+    "job_convergence.pending_to_terminal_ms.p50",
+    "job_convergence.pending_to_terminal_ms.p95",
+    "job_scheduling.pending_handoffs",
+    "job_scheduling.pending_followup_known",
+    "job_scheduling.pending_then_independent_work",
+    "job_scheduling.pending_then_immediate_readiness",
+    "job_scheduling.pending_then_immediate_observe",
+    "job_scheduling.readiness_calls",
+    "job_scheduling.readiness_ready",
+    "job_scheduling.readiness_deadline",
+    "job_scheduling.readiness_any",
+    "job_scheduling.readiness_all",
+    "job_scheduling.deadline_then_nearby_rewait",
+    "job_scheduling.readiness_waited_ms.p50",
+    "job_scheduling.readiness_waited_ms.p95",
 ]
 
 
@@ -1235,13 +2084,18 @@ def _pair_compatibility(
             "comparable": False,
             "reason": "baseline must be the direct variant with surface=direct",
         }
-    if (
-        right.get("variant") != "code_mode"
-        or _canonical_code_mode_surface(right.get("surface")) is None
-    ):
+    candidate_variant = right.get("variant")
+    candidate_surface = right.get("surface")
+    candidate_ok = (
+        candidate_variant == "host_code_mode" and candidate_surface == HOST_CODE_MODE_SURFACE
+    ) or (
+        candidate_variant == "code_mode"
+        and _canonical_code_mode_surface(candidate_surface) is not None
+    )
+    if not candidate_ok:
         return {
             "comparable": False,
-            "reason": "candidate must be code_mode with explicit surface=read_only, validation, or guarded_edit",
+            "reason": "candidate must be host_code_mode with surface=host_code_mode or code_mode with surface=read_only, validation, or guarded_edit",
         }
     return {"comparable": True, "reason": None}
 
@@ -1344,6 +2198,11 @@ def compare_reports(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict
             "baseline_by_reason": _get_path(baseline, "repair_turns.by_reason") or {},
             "candidate_by_reason": _get_path(candidate, "repair_turns.by_reason") or {},
         },
+        "host_short_chain": {
+            "baseline_observed_by_tool_pair": _get_path(baseline, "host_short_chain.observed_by_tool_pair") or {},
+            "candidate_observed_by_tool_pair": _get_path(candidate, "host_short_chain.observed_by_tool_pair") or {},
+            "same_model_turn_proven": False,
+        },
         "contract_surface_evidence": {
             "baseline": {
                 "error_kind_by_name": _get_path(baseline, "failures.error_kind_by_name") or {},
@@ -1391,8 +2250,8 @@ def _build_parser() -> argparse.ArgumentParser:
     summarize_parser.add_argument("--workflow-session-id")
     summarize_parser.add_argument("--case-manifest", type=Path)
     summarize_parser.add_argument("--case-id")
-    summarize_parser.add_argument("--variant", choices=("direct", "code_mode"))
-    summarize_parser.add_argument("--surface", choices=("direct", *CODE_MODE_SURFACE_CHOICES))
+    summarize_parser.add_argument("--variant", choices=BENCHMARK_VARIANTS)
+    summarize_parser.add_argument("--surface", choices=("direct", HOST_CODE_MODE_SURFACE, *CODE_MODE_SURFACE_CHOICES))
     summarize_parser.add_argument("--base-revision")
     summarize_parser.add_argument("--run-annotation", type=Path)
     summarize_parser.add_argument("--output", type=Path)

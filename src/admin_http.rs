@@ -54,8 +54,10 @@ fn compatibility_by_client(status: &Value) -> HashMap<String, String> {
             Some((
                 runner.get("client_id")?.as_str()?.to_string(),
                 runner
-                    .get("status")
+                    .get("protocol_compatibility")
+                    .or_else(|| runner.get("status"))
                     .and_then(Value::as_str)
+                    .filter(|value| matches!(*value, "compatible" | "incompatible" | "unknown"))
                     .unwrap_or("unknown")
                     .to_string(),
             ))
@@ -96,6 +98,21 @@ fn project_dashboard(
         Value::Null
     };
     let compatibility = compatibility_by_client(&status);
+    let alignment: HashMap<String, Value> = status
+        .pointer("/version_compatibility/runners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|runner| {
+            Some((
+                runner.get("client_id")?.as_str()?.to_string(),
+                runner
+                    .get("build_alignment")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ))
+        })
+        .collect();
     let global_compat = status
         .pointer("/version_compatibility/status")
         .and_then(Value::as_str)
@@ -104,7 +121,7 @@ fn project_dashboard(
     let mut device_rows = if devices_ok {
         agents_result
             .output
-            .get("agents")
+            .get("runners")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default()
@@ -124,8 +141,10 @@ fn project_dashboard(
                     "capabilities": enabled_capabilities(agent.get("capabilities")),
                     "project_count": agent.get("projects_count").cloned().unwrap_or_else(|| json!(0)),
                     "active_jobs": agent.get("active_jobs").cloned().unwrap_or_else(|| json!(0)),
-                    "runner_protocol_generation": agent.get("agent_protocol_generation").cloned().unwrap_or(Value::Null),
+                    "runner_protocol_generation": agent.get("runner_protocol_generation").cloned().unwrap_or(Value::Null),
                     "compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
+                    "protocol_compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
+                    "build_alignment": alignment.get(client_id).cloned().unwrap_or(Value::Null),
                 })
             })
             .collect::<Vec<_>>()
@@ -182,6 +201,8 @@ fn project_dashboard(
                     },
                     "shell_profile_status": project.get("shell_profile_status").cloned().unwrap_or(Value::Null),
                     "compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
+                    "protocol_compatibility": compatibility.get(client_id).map(String::as_str).unwrap_or("unknown"),
+                    "build_alignment": alignment.get(client_id).cloned().unwrap_or(Value::Null),
                     "console_hint": "Use /runtime with that project's credential; credentials never belong in URLs.",
                 })
             })
@@ -202,12 +223,15 @@ fn project_dashboard(
             "version": status.get("version").cloned().unwrap_or(Value::Null),
             "build_commit": status.pointer("/build/git_commit").cloned().unwrap_or(Value::Null),
             "authority_mode": status.pointer("/authority/mode").cloned().unwrap_or(Value::Null),
-            "agents_total": status.pointer("/agents/count").cloned().unwrap_or_else(|| json!(0)),
-            "agents_online": status.pointer("/agents/online_count").cloned().unwrap_or_else(|| json!(0)),
-            "projects_total": status.pointer("/projects/agent_registered/count").cloned().unwrap_or_else(|| json!(0)),
-            "projects_online": status.pointer("/projects/agent_registered/online_count").cloned().unwrap_or_else(|| json!(0)),
+            "runners_total": status.pointer("/runners/count").cloned().unwrap_or_else(|| json!(0)),
+            "runners_online": status.pointer("/runners/online_count").cloned().unwrap_or_else(|| json!(0)),
+            "projects_total": status.pointer("/projects/runner_registered/count").cloned().unwrap_or_else(|| json!(0)),
+            "projects_online": status.pointer("/projects/runner_registered/online_count").cloned().unwrap_or_else(|| json!(0)),
             "active_jobs": status.pointer("/jobs/active_count").cloned().unwrap_or_else(|| json!(0)),
             "version_compatibility": global_compat,
+            "protocol_compatibility": status.get("protocol_compatibility").cloned().unwrap_or_else(|| json!("unknown")),
+            "build_alignment": status.get("build_alignment").cloned().unwrap_or(Value::Null),
+            "desktop_runtime_contract": status.get("desktop_runtime_contract").cloned().unwrap_or(Value::Null),
         })
     } else {
         Value::Null
@@ -481,16 +505,18 @@ mod tests {
         let status = ToolResult::ok(json!({
             "version": "1.2.3",
             "version_compatibility": {
-                "status": "version_mismatch",
+                "status": "compatible",
+                "protocol_compatibility": "compatible",
+                "build_alignment": "different_version",
                 "runners": [
-                    {"client_id":"runner-b","status":"version_mismatch","agent_protocol_generation":2},
-                    {"client_id":"runner-a","status":"compatible","agent_protocol_generation":2}
+                    {"client_id":"runner-b","status":"compatible","protocol_compatibility":"compatible","build_alignment":"different_version","runner_protocol_generation":2},
+                    {"client_id":"runner-a","status":"compatible","protocol_compatibility":"compatible","build_alignment":"exact","runner_protocol_generation":2}
                 ]
             }
         }));
-        let agents = ToolResult::ok(json!({"agents":[
-            {"client_id":"runner-b","display_name":"B","status":"stale","transport":"quic","agent_protocol_generation":2,"capabilities":{"shell":true,"patch":false,"git":true}},
-            {"client_id":"runner-a","display_name":"A","status":"online","transport":"websocket","agent_protocol_generation":2,"capabilities":{"shell":true,"git":true}}
+        let agents = ToolResult::ok(json!({"runners":[
+            {"client_id":"runner-b","display_name":"B","status":"stale","transport":"quic","runner_protocol_generation":2,"capabilities":{"shell":true,"patch":false,"git":true}},
+            {"client_id":"runner-a","display_name":"A","status":"online","transport":"websocket","runner_protocol_generation":2,"capabilities":{"shell":true,"git":true}}
         ]}));
         let projects = ToolResult::ok(json!({"projects":[
             {"id":"agent:runner-b:zeta","client_id":"runner-b","name":"Zeta","path":"/secret/zeta","connected":false,"capabilities":{"git_available":false}},
@@ -549,18 +575,17 @@ mod tests {
         assert_eq!(body["devices"][0]["transport"], "websocket");
         assert_eq!(body["devices"][1]["status"], "stale");
         assert_eq!(body["devices"][1]["capabilities"], json!(["git", "shell"]));
-        assert_eq!(body["devices"][1]["compatibility"], "version_mismatch");
+        assert_eq!(body["devices"][1]["compatibility"], "compatible");
+        assert_eq!(body["devices"][1]["build_alignment"], "different_version");
         assert_eq!(body["devices"][1]["runner_protocol_generation"], 2);
         assert_eq!(body["devices"][1]["transport"], "quic");
         assert_eq!(body["projects"][0]["id"], "agent:runner-a:alpha");
         assert_eq!(body["projects"][0]["compatibility"], "compatible");
-        assert_eq!(body["projects"][1]["compatibility"], "version_mismatch");
+        assert_eq!(body["projects"][1]["compatibility"], "compatible");
+        assert_eq!(body["projects"][1]["build_alignment"], "different_version");
         assert_eq!(body["projects"][2]["compatibility"], "unknown");
         assert_eq!(body["projects"][0]["path"], "/safe/alpha");
-        assert_eq!(
-            body["overview"]["version_compatibility"],
-            "version_mismatch"
-        );
+        assert_eq!(body["overview"]["version_compatibility"], "compatible");
     }
 
     #[test]
@@ -578,7 +603,7 @@ mod tests {
         let cases = [
             project_dashboard(
                 ToolResult::err("secret /path"),
-                ToolResult::ok(json!({"agents":[]})),
+                ToolResult::ok(json!({"runners":[]})),
                 ToolResult::ok(json!({"projects":[]})),
                 Ok(vec![]),
                 true,
@@ -592,14 +617,14 @@ mod tests {
             ),
             project_dashboard(
                 ToolResult::ok(json!({})),
-                ToolResult::ok(json!({"agents":[]})),
+                ToolResult::ok(json!({"runners":[]})),
                 ToolResult::err("secret env"),
                 Ok(vec![]),
                 true,
             ),
             project_dashboard(
                 ToolResult::ok(json!({})),
-                ToolResult::ok(json!({"agents":[]})),
+                ToolResult::ok(json!({"runners":[]})),
                 ToolResult::ok(json!({"projects":[]})),
                 Err(()),
                 true,

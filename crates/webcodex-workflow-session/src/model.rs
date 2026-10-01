@@ -13,9 +13,10 @@ pub use webcodex_core::workflow_session_contract::{
     SessionMode,
 };
 pub use webcodex_core::workflow_session_contract::{
-    MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, MAX_TOOL_CALL_ACK_MESSAGE_IDS, SESSION_ID_PREFIX,
+    MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, MAX_TOOL_CALL_ACK_MESSAGE_IDS,
+    MAX_TOOL_CALL_ACK_REF_CHARS, SESSION_ID_PREFIX,
     SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION, SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON,
-    TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD,
+    TOOL_ACCEPTED_EXIT_CODES_FIELD, TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_REF_FIELD,
     TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
     TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTED_FAILURE_FIELD,
     TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
@@ -26,7 +27,12 @@ pub const CALL_ID_PREFIX: &str = "wc_call_";
 pub const LOGICAL_INVOCATION_ID_PREFIX: &str = "wc_inv_";
 pub const LOGICAL_INVOCATION_ROLE_RECORDER: &str = "recorder";
 pub const LOGICAL_INVOCATION_ROLE_BUSINESS: &str = "business";
+/// Backward-compatible default for the hot/materialized Session capacity target.
+/// Active canonical Workflow Sessions are authoritative durable identities and are never
+/// deleted merely because this advisory target is exceeded.
 pub const DEFAULT_MAX_SESSIONS: usize = 100;
+/// Independent retained Closed-Session history limit. Active Sessions do not count toward it.
+pub const DEFAULT_MAX_RETAINED_CLOSED_SESSIONS: usize = 100;
 /// Durable per-Session event retention. This is intentionally larger than the
 /// model-facing summary ceiling: long-running coding Sessions keep forensic and
 /// recovery evidence without forcing that history into one model response.
@@ -63,6 +69,7 @@ pub const MAX_MESSAGE_TAGS: usize = 16;
 pub const MAX_MESSAGE_TAG_CHARS: usize = 64;
 pub const MAX_MESSAGE_RESOLUTION_CHARS: usize = 8000;
 pub const MAX_MESSAGE_COMPLETION_KEY_CHARS: usize = 128;
+pub const MAX_MESSAGE_DELIVERY_KEY_CHARS: usize = 128;
 pub const MESSAGE_COMPLETION_FINGERPRINT_HEX_CHARS: usize = 64;
 pub const MAX_MESSAGE_SUMMARY_CHARS: usize = 240;
 pub const SUMMARY_MESSAGE_GROUP_LIMIT: usize = 5;
@@ -83,7 +90,8 @@ pub const TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS: &str = "unexpected_success
 /// - Explicit `close_session` may transition `Active → Closed`.
 /// - `Closed → Active` is not allowed.
 ///
-/// LRU eviction remains capacity management, not a lifecycle transition.
+/// Residency / historical-retention pressure remains capacity management, not a lifecycle
+/// transition. In particular, an Active canonical Session is never deleted by capacity pressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionLifecycle {
@@ -164,6 +172,10 @@ pub struct SessionRecord {
     /// deque so event FIFO eviction cannot resurrect an authoritative Job.
     pub materialized_validation_job_ids: VecDeque<String>,
     pub messages: VecDeque<Arc<SessionMessage>>,
+    /// Durable replay identity for optional message delivery keys. Both map keys
+    /// and payload fingerprints are domain-separated SHA-256 digests; raw keys,
+    /// principals, Window metadata, and message bodies are never retained here.
+    pub message_delivery_replays: BTreeMap<String, SessionMessageDeliveryReplay>,
     /// Durable Session-local monotonic message-state revision. This is never
     /// exposed as a public cursor; callers receive an opaque Session-bound token.
     pub message_observation_revision: u64,
@@ -193,9 +205,10 @@ pub struct SessionRecord {
 }
 
 /// Internal residency state is deliberately orthogonal to business lifecycle.
-/// Active sessions stay hot; historical closed sessions may keep only one
-/// compact, immutable durable JSON object plus the small metadata required for
-/// lifecycle/authorization checks and LRU bookkeeping.
+/// Active sessions currently stay hot even when the advisory hot target is exceeded; they are
+/// never deleted to enforce that target. Historical closed sessions may keep only one compact,
+/// immutable durable JSON object plus the small metadata required for lifecycle/authorization
+/// checks and retention bookkeeping.
 #[derive(Debug)]
 pub enum StoredSession {
     Hot(SessionRecord),
@@ -271,6 +284,25 @@ impl StoredSession {
             Self::Cold(_) => None,
         }
     }
+}
+
+/// Compact recovery inventory. No ledger, credentials, or execution defaults.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionDiscoveryItem {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub title_truncated: bool,
+    pub lifecycle: SessionLifecycle,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SessionDiscoveryPage {
+    pub total: usize,
+    pub offset: usize,
+    pub next_offset: Option<usize>,
+    pub sessions: Vec<SessionDiscoveryItem>,
 }
 
 /// Options for creating a new session. Using a struct keeps the
@@ -410,7 +442,23 @@ pub enum SessionExecutionContextUpdateError {
 pub struct SessionStoreStatus {
     pub persistence: String,
     pub restored_sessions: usize,
+    /// Backward-compatible alias for `hot_session_capacity_target`. This is not a durable
+    /// Session deletion bound.
     pub max_sessions: usize,
+    pub retained_sessions: usize,
+    pub active_sessions: usize,
+    pub closed_sessions: usize,
+    pub hot_sessions: usize,
+    pub cold_sessions: usize,
+    /// Advisory materialized working-set target. Active Sessions may exceed it rather than be
+    /// destructively evicted.
+    pub hot_session_capacity_target: usize,
+    /// Independent bound for retained Closed historical records. Active Sessions do not count
+    /// toward this limit.
+    pub historical_session_retention_limit: usize,
+    /// Process-local count of Closed historical records dropped by the explicit retention policy,
+    /// including restore-time pruning.
+    pub capacity_evictions: u64,
     pub max_events_per_session: usize,
     pub max_messages_per_session: usize,
     pub last_persist_error: Option<String>,
@@ -464,6 +512,8 @@ pub struct PersistedSessionRecord {
     pub updated_at: i64,
     pub events: Vec<Arc<SessionEvent>>,
     pub messages: Vec<Arc<SessionMessage>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub message_delivery_replays: BTreeMap<String, SessionMessageDeliveryReplay>,
     pub message_observation_revision: u64,
     pub message_observation_floor: u64,
     pub message_observation_revisions: BTreeMap<String, u64>,
@@ -832,6 +882,28 @@ pub struct PostSessionMessageInput {
     pub priority: SessionMessagePriority,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionMessageDelivery {
+    /// Runtime-derived, domain-separated stable sender-scope digest.
+    pub sender_scope: String,
+    /// Caller replay key. Persistence retains only its domain-separated digest.
+    pub delivery_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionMessageDeliveryReplay {
+    pub payload_fingerprint: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionMessageDeliveryOutcome {
+    pub message: SessionMessage,
+    pub replayed: bool,
+    pub state_changed: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionAckObservation {
     pub accepted_ids: Vec<String>,
@@ -1003,6 +1075,8 @@ pub enum SessionMessageError {
     MessageNotOpen,
     NotTodo,
     IdempotencyConflict,
+    DeliveryKeyConflict,
+    DeliveryPersistenceUncertain,
     AlreadyCompleted {
         answer_message_id: Option<String>,
         completion_id: Option<String>,

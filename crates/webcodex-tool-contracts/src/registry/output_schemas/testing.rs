@@ -7,10 +7,9 @@ use super::common::{
 };
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
-    match name {
-        "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test" => Some(cargo_output_schema(name)),
-        _ => None,
-    }
+    crate::runtime_tool_execution_contract(name)
+        .filter(|execution| execution.form == crate::ToolExecutionForm::StructuredValidation)
+        .map(|_| cargo_output_schema(name))
 }
 
 fn cargo_output_schema(tool_name: &str) -> Value {
@@ -79,7 +78,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ),
             (
                 "execution_state",
-                schema_type("string", "not_started, outcome_unknown, completed, timed_out, queued, or running. not_started proves pre-execution rejection; outcome_unknown means side effects may have occurred and blind retry is unsafe; queued/running indicate promotion to a Job."),
+                schema_type("string", "pending, not_started, outcome_unknown, completed, or timed_out. pending is the normal same-execution durable handoff and carries one exact fallback continuation; not_started proves pre-execution rejection; outcome_unknown means side effects may have occurred and blind retry is unsafe."),
             ),
             (
                 "job_id",
@@ -133,7 +132,10 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ),
         ]);
     }
-    if matches!(tool_name, "cargo_check" | "cargo_test" | "go_test") {
+    if matches!(
+        tool_name,
+        "project_validate" | "cargo_check" | "cargo_test" | "go_test"
+    ) {
         fields.push((
             "diagnostics",
             cargo_test_diagnostics_schema(
@@ -141,7 +143,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ),
         ));
     }
-    if matches!(tool_name, "cargo_test" | "go_test") {
+    if matches!(tool_name, "project_validate" | "cargo_test" | "go_test") {
         fields.extend([
             (
                 "tests_detected",
@@ -166,7 +168,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ),
         ]);
     }
-    if tool_name == "cargo_test" {
+    if matches!(tool_name, "cargo_test" | "project_validate") {
         fields.extend([
             (
                 "require_tests",
@@ -182,7 +184,16 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                     "Echo of an explicitly supplied no_run policy. true is compile-only validation and does not require executed-test count proof.",
                 ),
             ),
-            ("test_count_assertion", cargo_test_count_assertion_schema()),
+            ("test_count_assertion", model_test_count_assertion_schema()),
+        ]);
+    }
+    if tool_name == "project_validate" {
+        fields.extend([
+            ("backend", json!({"type":"string", "enum":["rust","go"]})),
+            ("action", json!({"type":"string", "enum":["format_check","check","test"]})),
+            ("adapter", json!({"type":"string", "enum":["cargo_fmt","cargo_check","cargo_test","go_vet","go_test"]})),
+            ("validation_target_id", schema_type("string", "Canonical resolved validation target, independent of source freshness.")),
+            ("detected_backend", json!({"type":["string","null"], "enum":["rust","go","node","python",null]})),
         ]);
     }
     let properties = fields
@@ -251,7 +262,8 @@ fn cargo_output_schema(tool_name: &str) -> Value {
     let output = json!({
         "type": "object",
         "properties": properties,
-        "additionalProperties": false
+        "additionalProperties": false,
+        "allOf": [{"if":{"anyOf":[{"required":["execution_state"]},{"required":["failure_kind"]}]},"then":rich_assertion_schema()}]
     });
     json!({
         "type": "object",
@@ -279,11 +291,9 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                     "success": {"const": true},
                     "error": {"type": "null"},
                     "output": {
-                        "required": [
-                            "command_summary", "execution_state", "job_id", "job_status",
-                            "activity", "continuation", "effective_timeout_secs"
-                        ],
+                        "required": ["execution_state", "continuation"],
                         "properties": {
+                            "execution_state": {"const": "pending"},
                             "promoted_to_job": {"enum": []},
                             "terminal": {"enum": []},
                             "command_started": {"enum": []},
@@ -294,9 +304,11 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                             "tool_failure": {"enum": []},
                             "project": {"enum": []},
                             "cwd": {"enum": []},
-                            "execution_state": {"enum": ["queued", "running"]},
-                            "job_id": {"type": "string", "minLength": 1},
-                            "job_status": {"type": "string", "minLength": 1},
+                            "command_summary": {"enum": []},
+                            "job_id": {"enum": []},
+                            "job_status": {"enum": []},
+                            "activity": {"enum": []},
+                            "effective_timeout_secs": {"enum": []},
                             "passed": {"enum": []},
                             "failure_kind": {"enum": []},
                             "warnings_count": {"enum": []},
@@ -316,7 +328,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                     "success": {"const": true},
                     "error": {"type": "null"},
                     "output": {
-                        "required": terminal_success_required.clone(),
+                        "allOf": [validation_success_evidence_schema(tool_name, &terminal_success_required)],
                         "properties": {
                             "project": {"enum": []},
                             "command_summary": {"enum": []},
@@ -476,7 +488,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
     })
 }
 
-fn cargo_test_diagnostics_schema(description: &str) -> Value {
+pub(super) fn cargo_test_diagnostics_schema(description: &str) -> Value {
     json!({
         "type": "object",
         "description": description,
@@ -576,4 +588,97 @@ fn failed_test_detail_schema() -> Value {
         },
         "required": ["name", "failure_kind", "file", "line", "column"]
     })
+}
+
+// The canonical assertion schema remains rich for Session/Job/failure consumers.
+fn model_test_count_assertion_schema() -> Value {
+    let mut schema = cargo_test_count_assertion_schema();
+    let required = schema.as_object_mut().unwrap().remove("required").unwrap();
+    schema["oneOf"] = json!([
+        {"required": required},
+        {"required":["minimum_tests"], "properties": {
+            "actual_tests_run":{"enum":[]}, "status":{"enum":[]},
+            "reason_code":{"enum":[]}, "evidence_reason_code":{"enum":[]}
+        }}
+    ]);
+    schema
+}
+
+fn rich_assertion_schema() -> Value {
+    json!({"properties":{"test_count_assertion":cargo_test_count_assertion_schema()}})
+}
+
+fn validation_success_evidence_schema(tool: &str, rich_required: &[Value]) -> Value {
+    if tool == "cargo_fmt" {
+        return json!({});
+    }
+    let mut rich_required = rich_required.to_vec();
+    // Every terminal-success validation receipt, compact or rich, must preserve
+    // the independent source-coverage proposition. Exceptional success cannot
+    // fall back to a schema shape that silently permits source_state to vanish.
+    rich_required.push(json!("source_state"));
+    if tool == "project_validate" {
+        rich_required.extend([
+            json!("backend"),
+            json!("action"),
+            json!("adapter"),
+            json!("validation_target_id"),
+        ]);
+    }
+    let mut rich = json!({
+        "required": rich_required,
+        "allOf": [rich_assertion_schema()],
+        "properties": {"diagnostics":{"required":["available","parser"]}}
+    });
+    if tool == "project_validate" {
+        rich["allOf"] = json!([rich_assertion_schema(), {"oneOf":[
+            {"properties":{"action":{"const":"format_check"}}},
+            {"properties":{"action":{"const":"check"}},"required":["warnings_count","errors_count","diagnostics"]},
+            {"properties":{"action":{"const":"test"}},"required":["tests_detected","tests_run_count","tests_passed","tests_failed","zero_tests_run","diagnostics"]}
+        ]}]);
+    }
+    let mut compact = json!({
+        "required":["source_state"],
+        "properties": {
+            "source_state":{"properties":{"freshness":{"const":"unproven"},"observed_mutation_fence":{"const":"uncrossed"}}},
+            "tests_detected":{"enum":[]}, "tests_passed":{"enum":[]},
+            "tests_failed":{"enum":[]}, "zero_tests_run":{"enum":[]},
+            "errors_count":{"enum":[]}, "warnings_count":{"type":"integer","minimum":1},
+            "stdout_truncated":{"const":false}, "stderr_truncated":{"const":false},
+            "validation_target_id":{"type":"string","minLength":1},
+            "require_tests":{"const":false}, "no_run":{"const":true},
+            "tests_run_count":{"type":"integer","minimum":0},
+            "action":{"enum":[]}, "backend":{"enum":[]}, "detected_backend":{"enum":[]},
+            "test_count_assertion":{
+                "type":"object", "required":["minimum_tests"], "additionalProperties":false,
+                "properties":{"minimum_tests":{"type":"integer","minimum":1}}
+            },
+            "diagnostics":{
+                "type":"object", "required":["diagnostics"], "additionalProperties":false,
+                "properties":{"diagnostics":{"type":"array","minItems":1,"maxItems":20,"items":{"allOf":[cargo_diagnostic_schema(),{"properties":{"severity":{"const":"warning"}}}]}}}
+            }
+        }
+    });
+    let test = json!({"oneOf":[
+        {"required":["tests_run_count"], "properties":{"tests_run_count":{"minimum":1},"no_run":{"enum":[]},"require_tests":{"enum":[]}}},
+        {"required":["tests_run_count","require_tests"],"properties":{"tests_run_count":{"const":0},"require_tests":{"const":false},"no_run":{"enum":[]},"test_count_assertion":{"enum":[]}}},
+        {"required":["no_run"],"properties":{"no_run":{"const":true},"tests_run_count":{"enum":[]},"require_tests":{"enum":[]},"test_count_assertion":{"enum":[]}}}
+    ]});
+    match tool {
+        "cargo_test" => compact["allOf"] = json!([test]),
+        "go_test" => compact["allOf"] = json!([test["oneOf"][0].clone()]),
+        "project_validate" => {
+            compact["required"] = json!(["source_state", "adapter", "validation_target_id"]);
+            compact["oneOf"] = json!([
+                {"properties":{"adapter":{"const":"cargo_check"},"tests_run_count":{"enum":[]},"test_count_assertion":{"enum":[]},"no_run":{"enum":[]},"require_tests":{"enum":[]}}},
+                {"properties":{"adapter":{"const":"go_vet"},"tests_run_count":{"enum":[]},"test_count_assertion":{"enum":[]},"no_run":{"enum":[]},"require_tests":{"enum":[]}}},
+                {"allOf":[test["oneOf"][0].clone()],"properties":{"adapter":{"const":"cargo_test"},"test_count_assertion":{"enum":[]}}},
+                {"allOf":[test["oneOf"][0].clone()],"properties":{"adapter":{"const":"go_test"},"test_count_assertion":{"enum":[]}}}
+            ]);
+        }
+        _ => {
+            compact["allOf"] = json!([{"properties":{"tests_run_count":{"enum":[]},"test_count_assertion":{"enum":[]},"require_tests":{"enum":[]},"no_run":{"enum":[]}}}])
+        }
+    }
+    json!({"oneOf":[rich, compact]})
 }

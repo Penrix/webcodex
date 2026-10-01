@@ -1,11 +1,17 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render as testingRender, screen, waitFor, within } from "@testing-library/react";
+import type { ReactElement } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { RuntimeV2Client } from "../src/runtime-v2/api/client.js";
 import { workItemFromRecent } from "../src/runtime-v2/model/work.js";
 import { ProjectsView } from "../src/runtime-v2/views/ProjectsView.js";
 import { RuntimeView } from "../src/runtime-v2/views/RuntimeView.js";
+import { WindowWorkbench } from "../src/runtime-v2/components/WindowWorkbench.js";
+import { WindowActivityFeed } from "../src/runtime-v2/components/WindowActivityFeed.js";
 import { WorkView } from "../src/runtime-v2/views/WorkView.js";
+import { UiProvider } from "../src/ui/UiProvider.js";
 import { recentSession, runtimeOverview, sessionDetail, sessionItem, windowDetail } from "./fixtures.js";
+
+const render = (ui: ReactElement) => testingRender(<UiProvider>{ui}</UiProvider>);
 
 function fakeClient(handler: (path: string, payload: any) => any): RuntimeV2Client {
   return {
@@ -19,7 +25,7 @@ function ok(data: unknown) {
 }
 
 describe("Project / Session / Window relationships", () => {
-  it("renders Project -> multiple active Sessions and bounded Window counts", async () => {
+  it("renders active Sessions without fetching per-Session or Git details", async () => {
     const sessions = [
       sessionItem({ session_id: "wc_sess_1111111111111111", title: "Runtime E2E hardening", running_jobs: 1 }),
       sessionItem({ session_id: "wc_sess_2222222222222222", title: "WebUI v2 rewrite", running_call: true }),
@@ -29,6 +35,7 @@ describe("Project / Session / Window relationships", () => {
       if (path === "projects") return ok({ projects: overview.projects, total: 1, truncated: false });
       if (path === "project-git") return ok({ branch: "prototype/runtime-webui-v2", clean: false, git_available: true });
       if (path === "workflow-sessions") return ok({ sessions, total: 2, returned: 2, truncated: false });
+      if (path === "windows") return ok({ windows: [], returned: 0, total: 0, truncated: false, visibility: { scope: "principal" } });
       if (path === "workflow-session") {
         const count = payload.session_id.endsWith("1111111111111111") ? 2 : 1;
         return ok(sessionDetail({
@@ -54,15 +61,17 @@ describe("Project / Session / Window relationships", () => {
         language="en"
         runners={overview.runners}
         onOpenSession={vi.fn()}
+        onOpenWindow={vi.fn()}
         onUnauthorized={vi.fn()}
       />,
     );
 
     expect(await screen.findByText("Runtime E2E hardening")).toBeTruthy();
     expect(screen.getByText("WebUI v2 rewrite")).toBeTruthy();
-    await waitFor(() => expect(screen.getByText(/2 Windows/)).toBeTruthy());
-    expect(screen.getByText(/1 Windows/)).toBeTruthy();
-    expect(screen.getByText("View Sessions")).toBeTruthy();
+    expect(vi.mocked(client.post).mock.calls.map(([path]) => path).sort()).toEqual(["projects", "windows", "workflow-sessions"]);
+    fireEvent.click(screen.getByRole("button", { name: "Check branch" }));
+    expect(await screen.findByText("prototype/runtime-webui-v2")).toBeTruthy();
+    expect(vi.mocked(client.post).mock.calls.filter(([path]) => path === "project-git")).toHaveLength(1);
   });
 
   it("loads the selected Project's retained Sessions when its card is opened", async () => {
@@ -78,13 +87,14 @@ describe("Project / Session / Window relationships", () => {
         const sessions = payload.project === second.id ? [secondSession] : [firstSession];
         return ok({ sessions, total: 1, returned: 1, truncated: false });
       }
+      if (path === "windows") return ok({ windows: [], returned: 0, total: 0, truncated: false, visibility: { scope: "principal" } });
       if (path === "workflow-session") return ok(sessionDetail({ session_id: payload.session_id, linked_windows: [] }));
       throw new Error("unexpected path " + path);
     });
     const client = fakeClient(handler);
 
     render(
-      <ProjectsView client={client} language="en" runners={overview.runners} onOpenSession={vi.fn()} onUnauthorized={vi.fn()} />,
+      <ProjectsView client={client} language="en" runners={overview.runners} onOpenSession={vi.fn()} onOpenWindow={vi.fn()} onUnauthorized={vi.fn()} />,
     );
     expect(await screen.findByText("First project Session")).toBeTruthy();
 
@@ -99,24 +109,25 @@ describe("Project / Session / Window relationships", () => {
       if (path === "projects") return ok({ projects: overview.projects, total: 1, truncated: false });
       if (path === "project-git") return ok({ branch: "main" });
       if (path === "workflow-sessions") return ok({ sessions: [], total: 0, returned: 0, truncated: false });
+      if (path === "windows") return ok({ windows: [], returned: 0, total: 0, truncated: false, visibility: { scope: "principal" } });
       if (path === "/api/projects/resolve-or-register") return { ok: false, status: 0, data: null };
       throw new Error("unexpected path " + path);
     });
     const client = fakeClient(handler);
 
     render(
-      <ProjectsView client={client} language="en" runners={overview.runners} onOpenSession={vi.fn()} onUnauthorized={vi.fn()} />,
+      <ProjectsView client={client} language="en" runners={overview.runners} onOpenSession={vi.fn()} onOpenWindow={vi.fn()} onUnauthorized={vi.fn()} />,
     );
     fireEvent.click(await screen.findByRole("button", { name: "Add Project" }));
-    fireEvent.change(screen.getByPlaceholderText("Absolute folder path on the selected Runner"), {
+    fireEvent.change(await screen.findByPlaceholderText("Absolute folder path on the selected Runner"), {
       target: { value: "/root/git/new-project" },
     });
-    fireEvent.click(screen.getAllByRole("button", { name: "Add Project" }).at(-1)!);
+    fireEvent.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Add Project" }));
     await screen.findByText("The result could not be confirmed. Refresh Projects before trying again.");
     expect(handler.mock.calls.filter(([path]) => path === "/api/projects/resolve-or-register")).toHaveLength(1);
   });
 
-  it("renders Window -> multiple Sessions with relation kinds and no ownership implication", async () => {
+  it("renders Window calls without Session relationships or technical disclosures", async () => {
     const overview = runtimeOverview();
     const firstKey = "a".repeat(64);
     const secondKey = "b".repeat(64);
@@ -195,37 +206,23 @@ describe("Project / Session / Window relationships", () => {
     });
 
     render(
-      <RuntimeView
-        client={client}
-        language="en"
-        overview={overview}
-        overviewAvailability="available"
-        projects={overview.projects}
-        onOpenSession={vi.fn()}
-        onUnauthorized={vi.fn()}
-      />,
+      <WindowWorkbench client={client} language="en" projects={overview.projects}
+        surface="windows" onSurfaceChange={vi.fn()} onUnauthorized={vi.fn()} />,
     );
-    fireEvent.click(screen.getByRole("tab", { name: /Window Activity/ }));
 
-    expect(await screen.findByText("Read Runtime source")).toBeTruthy();
-    expect(screen.getByTestId("window-project-tag").textContent).toBe("WebCodex");
-    const workflowStep = screen.getByText("Read Runtime source").closest("details") as HTMLDetailsElement;
-    expect(workflowStep.open).toBe(false);
-    fireEvent.click(screen.getByText("Read Runtime source").closest("summary")!);
-    expect(workflowStep.open).toBe(true);
-    expect(screen.getByText("tools/call")).toBeTruthy();
-    expect(screen.getByText(/recording · wc_sess_/)).toBeTruthy();
+    fireEvent.click(await screen.findByTestId("work-window-row-" + firstKey));
+    expect((await screen.findAllByText("read_files")).length).toBeGreaterThan(0);
+    const workflowStep = screen.getByTestId("window-workflow-step");
+    expect(within(workflowStep).getByText("/root/git/webcodex")).toBeTruthy();
+    expect(within(workflowStep).getByText("120ms")).toBeTruthy();
+    expect(within(workflowStep).getByText("Succeeded")).toBeTruthy();
+    expect(screen.queryByText("Technical details")).toBeNull();
+    expect(screen.queryByText("Linked Sessions")).toBeNull();
+    expect(screen.queryByText("Runtime E2E hardening")).toBeNull();
+    expect((client.post as ReturnType<typeof vi.fn>).mock.calls.some(([path]) => path === "workflow-session")).toBe(false);
 
-    fireEvent.click(screen.getByText("Linked Sessions").closest("summary")!);
-    expect(screen.getByText("Runtime E2E hardening")).toBeTruthy();
-    expect(screen.getByText("WebUI v2 rewrite")).toBeTruthy();
-    expect(screen.getByText("recording")).toBeTruthy();
-    expect(screen.getByText("work_on_project")).toBeTruthy();
-    expect(screen.getAllByText(/observation evidence/i).length).toBeGreaterThan(0);
-    expect(screen.getByTestId("window-scope-note").textContent).toContain("observation principal");
-
-    fireEvent.click(screen.getByRole("button", { name: /Window bbbbbbbbbb/ }));
-    expect(await screen.findByText("Window with no current Session")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("work-window-row-" + secondKey));
+    expect(await screen.findByText("No tool calls yet")).toBeTruthy();
   });
 
   it("renders Session Evidence -> multiple Windows and handles Session with no Window", async () => {
@@ -279,6 +276,8 @@ describe("Project / Session / Window relationships", () => {
       projects: overview.projects,
       language: "en" as const,
       inventoryIncomplete: false,
+      surface: "session" as const,
+      onSurfaceChange: vi.fn(),
       onOpenSession: vi.fn(),
       onLocateSession: vi.fn(async () => false),
       onUnauthorized: vi.fn(),
@@ -286,8 +285,10 @@ describe("Project / Session / Window relationships", () => {
     const rendered = render(<WorkView {...props} />);
     expect(await screen.findByText("/root/git/webcodex")).toBeTruthy();
     fireEvent.click(await screen.findByRole("tab", { name: "Evidence" }));
-    expect(await screen.findByText(/Window 1111111111/)).toBeTruthy();
-    expect(screen.getByText(/Window 2222222222/)).toBeTruthy();
+    const sessionContext = within(screen.getByRole("complementary", { name: "Session context" }));
+    expect(sessionContext.getByText("1".repeat(64))).toBeTruthy();
+    expect(sessionContext.getByText("2".repeat(64))).toBeTruthy();
+    expect(sessionContext.getAllByRole("button", { name: "Copy Window" })).toHaveLength(2);
     expect(screen.getAllByText(/A very long Session title A very long Session title/).length).toBeGreaterThan(0);
 
     rendered.unmount();
@@ -295,6 +296,45 @@ describe("Project / Session / Window relationships", () => {
     render(<WorkView {...props} />);
     fireEvent.click(await screen.findByRole("tab", { name: "Evidence" }));
     expect(await screen.findByText("No linked Windows in retained evidence.")).toBeTruthy();
+  });
+
+  it("keeps build diagnostics collapsed and defers Runtime inventories until requested", () => {
+    const base = runtimeOverview();
+    const overview = runtimeOverview({
+      runners: [{
+        ...base.runners[0],
+        version: "0.4.1",
+        build_alignment: "different_version",
+        build_git_commit: "f080c8f3ea700000000000000000000000000000",
+        protocol_compatibility: "compatible",
+      }],
+    });
+    const client = fakeClient((path) => {
+      if (path === "windows") return { ok: false, status: 403, data: null };
+      if (path === "communication/agents") return { ok: false, status: 403, data: null };
+      throw new Error("unexpected path " + path);
+    });
+
+    const { container } = render(
+      <RuntimeView
+        client={client}
+        language="en"
+        overview={overview}
+        overviewAvailability="available"
+        onOpenWork={vi.fn()}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+
+    const build = container.querySelector(".runtime-row-build");
+    expect(build).toBeTruthy();
+    expect(build?.textContent).toContain("Build alignment: Different version");
+    expect(container.querySelector(".runtime-diagnostics")?.hasAttribute("open")).toBe(false);
+    expect(container.querySelector(".runtime-diagnostics")?.textContent).toContain("f080c8f3ea700000000000000000000000000000");
+    expect(client.post).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("Build diagnostics"));
+    expect(container.querySelector(".runtime-diagnostics")?.hasAttribute("open")).toBe(true);
+    expect(build?.textContent).not.toContain("different_version");
   });
 
   it("surfaces Runtime availability truth instead of presenting denied state as connected", () => {
@@ -311,8 +351,7 @@ describe("Project / Session / Window relationships", () => {
         language="en"
         overview={null}
         overviewAvailability="denied"
-        projects={overview.projects}
-        onOpenSession={vi.fn()}
+        onOpenWork={vi.fn()}
         onUnauthorized={vi.fn()}
       />,
     );
@@ -321,7 +360,7 @@ describe("Project / Session / Window relationships", () => {
     expect(screen.queryByText(/^connected$/)).toBeNull();
   });
 
-  it("progressively reveals retained Window activity instead of silently dropping rows", async () => {
+  it("renders all server-returned Window activity, including new tool names, without a client allowlist", async () => {
     const overview = runtimeOverview();
     const key = "d".repeat(64);
     const activity = Array.from({ length: 205 }, (_, index) => ({
@@ -329,8 +368,8 @@ describe("Project / Session / Window relationships", () => {
       ended_at_ms: 1_790_000_000_001 + index,
       duration_ms: 1,
       method: "tools/call",
-      tool_name: "tool-" + index,
-      activity_presentation: "tool-" + index,
+      tool_name: index === 100 ? "wait_for_job_readiness" : "tool-" + index,
+      activity_presentation: index === 100 ? "transport" : "tool-" + index,
       status: "ok",
       meaningful: true,
       workflow_sessions: [],
@@ -355,30 +394,18 @@ describe("Project / Session / Window relationships", () => {
     });
 
     render(
-      <RuntimeView
-        client={client}
-        language="en"
-        overview={overview}
-        overviewAvailability="available"
-        projects={overview.projects}
-        onOpenSession={vi.fn()}
-        onUnauthorized={vi.fn()}
-      />,
+      <WindowWorkbench client={client} language="en" projects={overview.projects}
+        surface="windows" onSurfaceChange={vi.fn()} onUnauthorized={vi.fn()} />,
     );
-    fireEvent.click(screen.getByRole("tab", { name: /Window Activity/ }));
     expect((await screen.findAllByText("tool-204")).length).toBeGreaterThan(0);
-    expect(screen.queryAllByText("tool-0")).toHaveLength(0);
-    let steps = screen.getAllByTestId("window-workflow-step");
-    expect(steps[0].textContent).toContain("tool-5");
-    expect(steps.at(-1)?.textContent).toContain("tool-204");
-    const more = screen.getByRole("button", { name: /Show more activity/ });
-    expect(more.textContent).toContain("5 remaining");
-    fireEvent.click(more);
     expect(screen.getAllByText("tool-0").length).toBeGreaterThan(0);
-    steps = screen.getAllByTestId("window-workflow-step");
+    expect(screen.getAllByText("wait_for_job_readiness").length).toBeGreaterThan(0);
+    const steps = screen.getAllByTestId("window-workflow-step");
+    expect(steps).toHaveLength(205);
     expect(steps[0].textContent).toContain("tool-0");
     expect(steps.at(-1)?.textContent).toContain("tool-204");
-    expect(screen.getByText("Server activity history is bounded; older Window activity is not loaded.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Show more activity/ })).toBeNull();
+    expect(screen.getByText("Earlier calls are not available in this view. Showing retained activity from oldest to newest.")).toBeTruthy();
   });
 
   it("stops presenting stale Session detail as current after authority is denied", async () => {
@@ -398,6 +425,8 @@ describe("Project / Session / Window relationships", () => {
         projects={overview.projects}
         language="en"
         inventoryIncomplete={false}
+        surface="session"
+        onSurfaceChange={vi.fn()}
         onOpenSession={vi.fn()}
         onLocateSession={vi.fn(async () => false)}
         onUnauthorized={vi.fn()}
@@ -408,4 +437,39 @@ describe("Project / Session / Window relationships", () => {
     expect(screen.getByText("This Session is no longer visible to the current credential.")).toBeTruthy();
     expect(screen.queryByRole("textbox", { name: "Send a message to this work session…" })).toBeNull();
   });
+});
+
+
+it("shows individual calls in order with exact Project paths and authoritative Session tags", () => {
+  const first = runtimeOverview().projects[0];
+  const second = { ...first, id: "agent:special:second", path: "/worktrees/second" };
+  const base = { started_at_ms: 1_790_000_100_000, ended_at_ms: 1_790_000_100_120, duration_ms: 120, method: "tools/call", status: "success", meaningful: false, workflow_sessions: [] };
+  const { container } = render(<WindowActivityFeed language="en" projects={[first, second]} detail={windowDetail({
+    active_requests: [
+      { server_trace_id: "running", method: "tools/call", tool_name: "run_process", project: second.id, started_at_ms: base.started_at_ms + 500, elapsed_ms: 4200 },
+      { server_trace_id: "finished", method: "tools/call", tool_name: "runtime_info", started_at_ms: base.started_at_ms, elapsed_ms: 100 },
+    ],
+    activity: [
+      { ...base, started_at_ms: base.started_at_ms + 300, tool_name: "apply_patch", project: second.id, status: "error" },
+      { ...base, tool_name: "runtime_info", activity_presentation: "Inspect runtime", server_trace_id: "finished", workflow_sessions: [{ workflow_session_id: "hidden-session", project: first.id, relation: "recording" }] },
+      { ...base, started_at_ms: base.started_at_ms + 100, tool_name: "runtime_info", project: first.id },
+    ],
+  })} />);
+  const calls = screen.getAllByTestId("window-workflow-step");
+  expect(calls.map((call) => call.querySelector("header strong")?.textContent)).toEqual(["runtime_info", "runtime_info", "apply_patch", "run_process"]);
+  expect(within(calls[0]).queryByTestId("window-project-tag")).toBeNull();
+  expect(within(calls[1]).getByTestId("window-project-tag").textContent).toBe(first.path);
+  expect(within(calls[2]).getByTestId("window-project-tag").textContent).toBe(second.path);
+  expect(within(calls[2]).getByText("Failed")).toBeTruthy();
+  expect(within(calls[0]).getByText("Succeeded")).toBeTruthy();
+  expect(within(calls[3]).getByText("Running")).toBeTruthy();
+  expect(within(calls[3]).getByText("4s")).toBeTruthy();
+  expect(calls.slice(0, 3).every((call) => call.querySelector("time[datetime]"))).toBe(true);
+  expect(calls[3].querySelector("time[datetime]")).toBeNull();
+  expect(calls[3].querySelector(".window-call-live-time")?.textContent).toBe("Running · 4s");
+  expect(container.querySelector("details")).toBeNull();
+  const sessionTag = screen.getByTestId("window-session-tag");
+  expect(sessionTag.textContent).toBe("hidden-session");
+  expect(sessionTag.getAttribute("data-session-tone")).toBe("0");
+  expect(screen.queryByText("Inspect runtime")).toBeNull();
 });

@@ -39,6 +39,14 @@ mod tests {
         assert!(observe_schema_bytes <= 8 * 1024);
         assert!(act_schema_bytes <= 16 * 1024);
         assert!(combined_description_bytes <= 2 * 1024);
+        assert_eq!(
+            DEFINITIONS[1].host_orchestration.concurrency,
+            super::super::ToolHostConcurrencyHint::Sequential
+        );
+        assert_eq!(
+            DEFINITIONS[1].host_orchestration.native_batch_field,
+            Some("operations")
+        );
     }
 }
 
@@ -66,7 +74,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Guaranteed read-only Browser observation gateway with a closed action vocabulary: targets, browsers, pages, semantic snapshot, and screenshot. Browser/Page/Element identities are opaque and process-local; semantic snapshots are bounded, expose typed form-control state and snapshot-local group context when Chromium provides it, and navigation makes older element identities stale. Screenshots use the shared native-image delivery contract at the MCP boundary. Exact Runner capability and browser:read authority are checked before dispatch. No effect, process launch, arbitrary protocol input, script execution, profile attachment, or shell fallback is available here.",
+        "Guaranteed read-only Browser observation gateway with the closed actions targets, browsers, pages, snapshot, screenshot, console, network, and diagnostics. Browser/Page/Element identities are opaque and process-local. Snapshot auto mode compacts large pages to admitted controls and semantic choices such as select options; full/interactive and bounded max_nodes/max_depth are explicit overrides. An actionable node includes element_id and actions, the only browser_act effects it admits. Diagnostics supports a monotonic since_cursor delta for new console/network activity, with summarized new errors/warnings/4xx/5xx/failures; include_all flags expose the matching retained events. Projections stay bounded and report truncation. Screenshots use the shared native-image delivery contract at the MCP boundary. Exact Runner capability and browser:read authority are checked before dispatch. No effect, process launch, arbitrary protocol input, script execution, profile attachment, or shell fallback is available here.",
     ),
     require_any_scopes(
         permission_risk(
@@ -92,8 +100,12 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     true,
                     false,
                     super::ToolSessionEvidencePolicy::NONE,
+                )
+                .with_host_orchestration_hint(
+                    super::ToolHostOrchestrationHint::sequential()
+                        .with_native_batch_field("operations"),
                 ),
-                "Effectful Browser action gateway with the closed actions launch, new_page, navigate, click, input_text, select_option, set_value, upload_file, key, close_page, and close_browser. Exact action authority is resolved by canonical specialized governance before dispatch: launch requires browser:launch, upload_file requires browser:control plus project:read, and the remaining effects require browser:control. Uploads accept only one project-relative regular file from the same Runner and are Runner-policy bounded. Effects preserve not_started/completed/outcome_unknown certainty and never blindly retry an uncertain action. Element effects revalidate Browser, Page, document, and snapshot identity before dispatch. No arbitrary protocol, executable, profile, remote endpoint, or script input is accepted.",
+                "Browser effects use opaque ids; no selectors or scripts. launch needs browser:launch; effects need browser:control; uploads also need project:read and a same-Runner project-relative regular file. Use only snapshot-admitted actions. Batch runs 1..32 ordered input_text/select_option/set_value/click/upload_file operations on one Browser/page/current snapshot, with freshness checks between effects and one final bounded settle. Rejection, document change, uncertainty or budget exhaustion stops dispatch without retry. completed_count records known effects; stopped_at_index is zero-based; stopped_execution_state preserves the stopped action's certainty. remaining_count counts definitely unstarted operations. Missing counts mean unknown progress. Ordinary effects preserve sibling ids; navigation, document replacement and new snapshots stale them. Follow needs_snapshot/recovery with observation, never blindly retry outcome_unknown or stability=false. Observe after structural changes; snapshot to verify filling.",
             ),
             PERMISSION_RISK_BROWSER_CONTROL,
         ),

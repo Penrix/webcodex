@@ -87,6 +87,7 @@ class AgentLoopReportTests(unittest.TestCase):
         window: str = "hashed-window-a",
         principal: str = "principal-a",
         trace_id: str | None = None,
+        previous_trace_id: str | None = None,
         result_bytes: int | None = 100,
         duration_ms: int = 5,
         action_name: str = "toolsCall",
@@ -94,9 +95,14 @@ class AgentLoopReportTests(unittest.TestCase):
         link: bool = True,
         ids: dict[str, object] | None = None,
         composition: dict[str, object] | None = None,
+        readiness: dict[str, object] | None = None,
+        job_convergence: dict[str, object] | None = None,
+        error_kind: str | None = None,
+        normalization_code: object | None = None,
+        schema_version: int = 12,
     ) -> None:
         telemetry: dict[str, object] = {
-            "schema_version": 5,
+            "schema_version": schema_version,
             "tool_name": tool,
             "success": success,
             "duration_ms": duration_ms,
@@ -105,12 +111,20 @@ class AgentLoopReportTests(unittest.TestCase):
         if not success:
             telemetry.update(
                 {
-                    "error_kind": "validation_failed",
+                    "error_kind": error_kind or "validation_failed",
                     "failure_kind": "completed_failure",
                     "recovery_kind": "inspect_diagnostic",
                 }
             )
+        if normalization_code is not None:
+            telemetry["input_normalization_code"] = normalization_code
+        if readiness is not None:
+            telemetry["readiness"] = readiness
+        if job_convergence is not None:
+            telemetry["job_convergence"] = job_convergence
         summary: dict[str, object] = {}
+        if previous_trace_id is not None:
+            summary["previous_meaningful_call"] = previous_trace_id
         if include_telemetry:
             summary["model_ergonomics"] = telemetry
         if composition is not None:
@@ -154,6 +168,190 @@ class AgentLoopReportTests(unittest.TestCase):
                     "INSERT INTO action_event_workflow_links (event_id, workflow_session_id) VALUES (?, ?)",
                     (event_id, session),
                 )
+
+    def insert_input_event(self, event_id: str, **kwargs: object) -> None:
+        values = {"tool": "run_process", "schema_version": 13, "trace_id": event_id,
+                  "status": "success" if kwargs.get("success", True) else "failed"}
+        values.update(kwargs)
+        self.insert_event(event_id, **values)
+
+    def test_input_normalization_counts_and_v13_denominator(self) -> None:
+        for index, code in enumerate(sorted(report.INPUT_NORMALIZATION_CODES)):
+            self.insert_input_event(f"n{index}", normalization_code=code,
+                                    tool="run_detached_process" if index == 0 else "run_process")
+        self.insert_input_event("plain")
+        self.insert_input_event("rejected", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("legacy", schema_version=12, normalization_code="argv_to_args")
+        self.insert_input_event("missing", include_telemetry=False)
+        result = self.summarize()
+        metrics = result["input_ergonomics"]
+        self.assertEqual(metrics["normalization_events"], 4)
+        self.assertEqual(metrics["normalization_by_code"], {code: 1 for code in report.INPUT_NORMALIZATION_CODES})
+        self.assertEqual(metrics["normalization_by_tool"], {"run_process": 3, "run_detached_process": 1})
+        self.assertEqual(metrics["measured_canonical_calls"], 7)
+        self.assertEqual(metrics["eligible_events"], 6)
+        self.assertEqual(metrics["eligible_successful_events"], 5)
+        self.assertEqual(metrics["legacy_schema_events"], 1)
+        self.assertEqual(metrics["missing_or_invalid_record_events"], 1)
+        self.assertEqual(metrics["normalization_rate"], 0.8)
+        self.assertEqual(metrics["invalid_argument_rejections"], 1)
+        self.assertEqual(metrics["invalid_arguments_by_tool"], {"run_process": 1})
+        self.assertTrue(result["availability"]["input_ergonomics"]["available"])
+
+    def test_input_repair_proxy_is_exact_adjacency_without_time_threshold(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments", schema_version=12)
+        self.insert_input_event("b", started=99_999_999, handed=100_000_000, transition="serial", previous_trace_id="a")
+        metrics = self.summarize()["input_ergonomics"]
+        proxy = metrics["immediate_same_tool_repair_proxy"]
+        self.assertTrue(proxy["available"])
+        self.assertEqual(proxy["count"], 1)
+        self.assertEqual(proxy["by_tool"], {"run_process": 1})
+        self.assertEqual(metrics["legacy_schema_events"], 1)
+        self.assertIn("does not prove model turn identity", proxy["interpretation"])
+        self.assertNotIn("repair_turns", metrics)
+
+    def test_input_repair_proxy_never_skips_a_different_meaningful_call(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", tool="read_files", started=130, handed=140, transition="serial", previous_trace_id="a")
+        self.insert_input_event("c", started=150, handed=160, transition="serial", previous_trace_id="b")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertTrue(proxy["available"])
+        self.assertEqual(proxy["count"], 0)
+        self.assertEqual(proxy["evaluated_rejections"], 1)
+
+    def test_input_repair_proxy_noncanonical_meaningful_call_is_a_barrier(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", include_telemetry=False, started=130, handed=140, transition="serial", previous_trace_id="a")
+        self.insert_input_event("c", started=150, handed=160, transition="serial", previous_trace_id="b")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertFalse(proxy["available"])
+        self.assertIsNone(proxy["count"])
+        self.assertEqual(proxy["observed_count"], 0)
+
+    def test_input_repair_proxy_ignores_only_nonmeaningful_calls(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", meaningful=False, started=130, handed=140)
+        self.insert_input_event("c", started=150, handed=160, transition="serial", previous_trace_id="a")
+        self.assertEqual(self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]["count"], 1)
+
+    def test_input_repair_proxy_resolves_unlinked_intervening_calls(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", tool="read_files", link=False, started=130, handed=140, transition="serial", previous_trace_id="a")
+        self.insert_input_event("c", started=150, handed=160, transition="serial", previous_trace_id="b")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertTrue(proxy["available"])
+        self.assertEqual(proxy["count"], 0)
+
+    def test_input_repair_proxy_reads_exact_unlinked_successor_without_expanding_denominator(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", link=False, normalization_code="argv_to_args", started=130, handed=140, transition="serial", previous_trace_id="a")
+        result = self.summarize()["input_ergonomics"]
+        self.assertEqual(result["immediate_same_tool_repair_proxy"]["count"], 1)
+        self.assertEqual(result["eligible_events"], 1)
+        self.assertEqual(result["eligible_successful_events"], 0)
+        self.assertEqual(result["normalization_events"], 0)
+        self.assertIsNone(result["normalization_rate"])
+
+    def test_input_repair_proxy_missing_evidence_does_not_become_zero(self) -> None:
+        for index, changes in enumerate([{"eligible": False}, {"window": None}, {"principal": None}, {"trace_id": None}]):
+            scope = f"window-{index}"
+            self.insert_input_event(f"a{index}", success=False, error_kind="invalid_arguments", **({"window": scope} | changes))
+            self.insert_input_event(f"b{index}", window=scope, started=130, handed=140, transition="serial", previous_trace_id=f"a{index}")
+        self.insert_input_event("good-a", window="good", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("good-b", window="good", started=130, handed=140, transition="serial", previous_trace_id="good-a")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertFalse(proxy["available"])
+        self.assertIsNone(proxy["count"])
+        self.assertIsNone(proxy["by_tool"])
+        self.assertEqual(proxy["observed_count"], 1)
+        self.assertEqual(proxy["unavailable_rejections"], 4)
+
+    def test_input_repair_proxy_never_crosses_window_or_principal(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", principal="foreign", started=130, handed=140, transition="serial", previous_trace_id="a")
+        self.insert_input_event("c", window="other", started=150, handed=160, transition="serial", previous_trace_id="a")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertFalse(proxy["available"])
+        self.assertEqual(proxy["observed_count"], 0)
+
+    def test_input_repair_proxy_rejects_overlap_and_wrong_predecessor(self) -> None:
+        for index, changes in enumerate([{"transition": "overlap"}, {"previous_trace_id": "not-the-failure"}, {"started": 110}]):
+            scope = f"window-{index}"
+            self.insert_input_event(f"a{index}", window=scope, success=False, error_kind="invalid_arguments")
+            args = {"window": scope, "started": 130, "handed": 140, "transition": "serial", "previous_trace_id": f"a{index}"}
+            args.update(changes)
+            self.insert_input_event(f"b{index}", **args)
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertFalse(proxy["available"])
+        self.assertEqual(proxy["observed_count"], 0)
+        self.assertEqual(proxy["unavailable_rejections"], 3)
+
+    def test_input_repair_proxy_rejects_ambiguous_successor(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", started=130, handed=140, transition="serial", previous_trace_id="a")
+        self.insert_input_event("c", started=150, handed=160, transition="serial", previous_trace_id="a")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertFalse(proxy["available"])
+        self.assertEqual(proxy["observed_count"], 0)
+        self.assertEqual(proxy["unavailable_by_reason"], {"ambiguous_serial_identity": 1})
+
+    def test_input_normalization_unknown_codes_and_raw_summary_never_leak(self) -> None:
+        self.insert_input_event("a", normalization_code="PRIVATE_UNKNOWN_CODE")
+        self.insert_input_event("b", normalization_code={"PRIVATE_KEY": "PRIVATE_VALUE"})
+        with sqlite3.connect(self.audit_db) as connection:
+            connection.execute("UPDATE action_events SET summary_json = json_set(summary_json, '$.raw_arguments', 'PRIVATE_ARGS', '$.output', 'PRIVATE_OUTPUT')")
+        result = self.summarize()
+        metrics = result["input_ergonomics"]
+        self.assertEqual(metrics["unrecognized_normalization_events"], 2)
+        self.assertEqual(metrics["normalization_events"], 0)
+        self.assertIsNone(metrics["normalization_rate"])
+        self.assertFalse(result["availability"]["input_ergonomics"]["available"])
+        self.assertNotIn("PRIVATE_", json.dumps(result))
+
+    def test_input_normalization_legacy_only_and_failed_codes_do_not_inflate_rate(self) -> None:
+        self.insert_input_event("old", schema_version=12, normalization_code="argv_to_args")
+        self.insert_input_event("failed", success=False, normalization_code="argv_to_args")
+        result = self.summarize()
+        metrics = result["input_ergonomics"]
+        self.assertEqual(metrics["legacy_schema_events"], 1)
+        self.assertEqual(metrics["eligible_events"], 1)
+        self.assertEqual(metrics["eligible_successful_events"], 0)
+        self.assertEqual(metrics["normalization_events"], 0)
+        self.assertIsNone(metrics["normalization_rate"])
+        self.assertFalse(result["availability"]["input_ergonomics"]["available"])
+
+    def test_input_repair_proxy_requires_boolean_success_in_context(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", link=False, started=130, handed=140, transition="serial", previous_trace_id="a")
+        with sqlite3.connect(self.audit_db) as connection:
+            connection.execute("UPDATE action_events SET summary_json = json_set(summary_json, '$.model_ergonomics.success', 1) WHERE event_id = 'b'")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertFalse(proxy["available"])
+        self.assertEqual(proxy["observed_count"], 0)
+
+    def test_input_repair_proxy_missing_successor_is_unavailable(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertFalse(proxy["available"])
+        self.assertIsNone(proxy["count"])
+        self.assertEqual(proxy["unavailable_by_reason"], {"no_observed_successor": 1})
+
+    def test_input_repair_proxy_same_tool_failure_is_not_a_repair(self) -> None:
+        self.insert_input_event("a", success=False, error_kind="invalid_arguments")
+        self.insert_input_event("b", success=False, error_kind="invalid_arguments", started=130, handed=140, transition="serial", previous_trace_id="a")
+        self.insert_input_event("c", started=150, handed=160, transition="serial", previous_trace_id="b")
+        proxy = self.summarize()["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertTrue(proxy["available"])
+        self.assertEqual(proxy["count"], 1)
+        self.assertEqual(proxy["evaluated_rejections"], 2)
+
+    def test_input_ergonomics_trace_only_is_unavailable(self) -> None:
+        root = self.write_trace("trace-input", [])
+        result = self.summarize(trace_root=root, audit_db=None, workflow_session_id=None)
+        self.assertFalse(result["availability"]["input_ergonomics"]["available"])
+        proxy = result["input_ergonomics"]["immediate_same_tool_repair_proxy"]
+        self.assertFalse(proxy["available"])
+        self.assertIsNone(proxy["count"])
 
     def summarize(self, **kwargs: object) -> dict[str, object]:
         arguments: dict[str, object] = {
@@ -245,6 +443,107 @@ class AgentLoopReportTests(unittest.TestCase):
         self.assertEqual(gap["total"], 30)
         self.assertEqual(gap["p50"], 30)
         self.assertEqual(result["canonical_calls"]["total"], 3)
+
+    def test_host_short_chain_reports_exact_serial_window_evidence(self) -> None:
+        self.insert_event("read", tool="read_files", started=100, handed=120)
+        self.insert_event(
+            "search",
+            tool="search_project_texts",
+            started=150,
+            handed=170,
+            transition="serial",
+        )
+        self.insert_event(
+            "edit",
+            tool="edit_project_files",
+            started=200,
+            handed=230,
+            transition="serial",
+        )
+
+        result = self.summarize(variant="host_code_mode")
+        chain = result["host_short_chain"]
+
+        self.assertEqual(result["canonical_calls"]["total"], 3)
+        self.assertEqual(chain["serial_transitions"], 2)
+        self.assertEqual(chain["multi_call_chains"], 1)
+        self.assertEqual(chain["calls_in_multi_call_chains"], 3)
+        self.assertEqual(chain["max_chain_calls"], 3)
+        self.assertEqual(
+            chain["observed_by_tool_pair"],
+            {
+                "read_files->search_project_texts": 1,
+                "search_project_texts->edit_project_files": 1,
+            },
+        )
+        self.assertFalse(chain["same_model_turn_proven"])
+        self.assertTrue(result["availability"]["host_short_chain"]["available"])
+        self.assertFalse(
+            result["availability"]["host_same_model_turn_identity"]["available"]
+        )
+
+    def test_host_short_chain_fails_closed_when_serial_predecessor_is_missing(self) -> None:
+        self.insert_event(
+            "search",
+            tool="search_project_texts",
+            started=150,
+            handed=170,
+            transition="serial",
+        )
+
+        result = self.summarize(variant="host_code_mode")
+        chain = result["host_short_chain"]
+
+        self.assertIsNone(chain["serial_transitions"])
+        self.assertEqual(chain["observed_serial_transitions"], 0)
+        self.assertEqual(chain["missing_serial_transitions"], 1)
+        self.assertIsNone(chain["multi_call_chains"])
+        self.assertFalse(result["availability"]["host_short_chain"]["available"])
+        self.assertIn(
+            "predecessor continuity evidence",
+            result["availability"]["host_short_chain"]["reason"],
+        )
+
+    def test_host_short_chain_ignores_serial_predecessor_outside_selected_run(self) -> None:
+        self.insert_event(
+            "outside",
+            tool="tool_manifest",
+            started=50,
+            handed=70,
+            trace_id="trace-outside",
+            link=False,
+        )
+        self.insert_event(
+            "read",
+            tool="read_files",
+            started=100,
+            handed=120,
+            transition="serial",
+            trace_id="trace-read",
+            previous_trace_id="trace-outside",
+        )
+        self.insert_event(
+            "search",
+            tool="search_project_texts",
+            started=150,
+            handed=170,
+            transition="serial",
+        )
+
+        result = self.summarize(variant="host_code_mode")
+        chain = result["host_short_chain"]
+
+        self.assertEqual(chain["serial_transitions"], 1)
+        self.assertEqual(chain["observed_serial_transitions"], 1)
+        self.assertEqual(chain["missing_serial_transitions"], 0)
+        self.assertEqual(chain["multi_call_chains"], 1)
+        self.assertEqual(chain["calls_in_multi_call_chains"], 2)
+        self.assertEqual(chain["max_chain_calls"], 2)
+        self.assertEqual(
+            chain["observed_by_tool_pair"],
+            {"read_files->search_project_texts": 1},
+        )
+        self.assertTrue(result["availability"]["host_short_chain"]["available"])
 
     def test_overlap_is_counted_without_fabricating_negative_gap(self) -> None:
         self.insert_event("read_only", started=100, handed=180)
@@ -528,6 +827,139 @@ class AgentLoopReportTests(unittest.TestCase):
         self.assertEqual(metric["samples"], 1)
         self.assertEqual(metric["missing"], 1)
 
+
+    def test_job_scheduling_reports_pending_independent_join_modes_and_rewait(self) -> None:
+        def convergence(kind: str | None, relation: str) -> dict[str, object]:
+            event = {"kind": kind, "relation": relation} if kind is not None else None
+            return {
+                "pending_handoff_count": int(kind == "pending_handoff"),
+                "passive_terminal_delivery_count": 0,
+                "passive_failure_delivery_count": 0,
+                "wait_for_job_terminal_count": 0,
+                "correlation_complete": True,
+                "events": [event] if event is not None else [],
+            }
+
+        def readiness(mode: str, state: str, waited_ms: int) -> dict[str, object]:
+            return {
+                "mode": mode,
+                "requested_jobs": 2,
+                "unique_jobs": 2,
+                "waited_ms": waited_ms,
+                "wait_state": state,
+                "ready_count": 1 if state == "ready" else 0,
+                "pending_count": 1 if state == "ready" else 2,
+            }
+
+        relation_a, relation_b, relation_c = "a" * 64, "b" * 64, "c" * 64
+        self.insert_event(
+            "p1", tool="cargo_check", trace_id="p1", started=100, handed=120,
+            job_convergence=convergence("pending_handoff", relation_a),
+        )
+        self.insert_event(
+            "read1", tool="read_files", trace_id="read1", previous_trace_id="p1",
+            started=130, handed=140, transition="serial",
+        )
+        self.insert_event(
+            "w1", tool="wait_for_job_readiness", trace_id="w1", previous_trace_id="read1",
+            started=150, handed=160, transition="serial", readiness=readiness("any", "ready", 1000),
+        )
+        self.insert_event(
+            "p2", tool="cargo_test", trace_id="p2", previous_trace_id="w1",
+            started=170, handed=180, transition="serial",
+            job_convergence=convergence("pending_handoff", relation_b),
+        )
+        self.insert_event(
+            "w2", tool="wait_for_job_readiness", trace_id="w2", previous_trace_id="p2",
+            started=190, handed=200, transition="serial", readiness=readiness("all", "deadline", 4000),
+        )
+        self.insert_event(
+            "w3", tool="wait_for_job_readiness", trace_id="w3", previous_trace_id="w2",
+            started=210, handed=220, transition="serial", readiness=readiness("all", "ready", 2000),
+        )
+        self.insert_event(
+            "p3", tool="cargo_check", trace_id="p3", previous_trace_id="w3",
+            started=230, handed=240, transition="serial",
+            job_convergence=convergence("pending_handoff", relation_c),
+        )
+        self.insert_event(
+            "obs", tool="observe_jobs", trace_id="obs", previous_trace_id="p3",
+            started=250, handed=260, transition="serial",
+            job_convergence=convergence("explicit_observe", relation_c),
+        )
+
+        result = self.summarize(variant="host_code_mode")
+        scheduling = result["job_scheduling"]
+        self.assertEqual(scheduling["pending_handoffs"], 3)
+        self.assertEqual(scheduling["pending_then_independent_work"], 1)
+        self.assertEqual(scheduling["pending_then_immediate_readiness"], 1)
+        self.assertEqual(scheduling["pending_then_immediate_observe"], 1)
+        self.assertEqual(scheduling["readiness_calls"], 3)
+        self.assertEqual(scheduling["readiness_measured_calls"], 3)
+        self.assertEqual(scheduling["readiness_ready"], 2)
+        self.assertEqual(scheduling["readiness_deadline"], 1)
+        self.assertEqual(scheduling["readiness_any"], 1)
+        self.assertEqual(scheduling["readiness_all"], 2)
+        self.assertEqual(scheduling["deadline_then_nearby_rewait"], 1)
+        self.assertEqual(
+            scheduling["nearby_rewait_max_gap_ms"],
+            report.JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS,
+        )
+        self.assertEqual(scheduling["readiness_waited_ms"]["samples"], 3)
+        self.assertFalse(scheduling["same_model_turn_proven"])
+        self.assertFalse(scheduling["same_blocked_set_proven"])
+        self.assertTrue(result["availability"]["job_scheduling"]["available"])
+
+    def test_job_scheduling_nearby_rewait_excludes_far_serial_followup(self) -> None:
+        def readiness(state: str) -> dict[str, object]:
+            return {
+                "mode": "all",
+                "requested_jobs": 1,
+                "unique_jobs": 1,
+                "waited_ms": 45_000,
+                "wait_state": state,
+                "ready_count": int(state == "ready"),
+                "pending_count": int(state != "ready"),
+            }
+
+        self.insert_event(
+            "deadline",
+            tool="wait_for_job_readiness",
+            trace_id="deadline",
+            started=100,
+            handed=200,
+            readiness=readiness("deadline"),
+        )
+        self.insert_event(
+            "later",
+            tool="wait_for_job_readiness",
+            trace_id="later",
+            previous_trace_id="deadline",
+            started=200 + report.JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS + 1,
+            handed=200 + report.JOB_SCHEDULING_NEARBY_REWAIT_MAX_GAP_MS + 10,
+            transition="serial",
+            readiness=readiness("ready"),
+        )
+
+        scheduling = self.summarize(variant="host_code_mode")["job_scheduling"]
+        self.assertEqual(scheduling["deadline_then_nearby_rewait"], 0)
+        self.assertFalse(scheduling["same_model_turn_proven"])
+        self.assertFalse(scheduling["same_blocked_set_proven"])
+
+    def test_job_scheduling_missing_readiness_telemetry_stays_unknown(self) -> None:
+        self.insert_event(
+            "wait", tool="wait_for_job_readiness", trace_id="wait", started=100, handed=120
+        )
+        result = self.summarize(variant="host_code_mode")
+        scheduling = result["job_scheduling"]
+        self.assertEqual(scheduling["readiness_calls"], 1)
+        self.assertEqual(scheduling["readiness_measured_calls"], 0)
+        self.assertIsNone(scheduling["readiness_ready"])
+        self.assertIsNone(scheduling["readiness_deadline"])
+        self.assertEqual(scheduling["readiness_waited_ms"]["samples"], 0)
+        self.assertEqual(scheduling["readiness_waited_ms"]["missing"], 1)
+        self.assertFalse(result["availability"]["job_scheduling"]["available"])
+
     def test_trace_only_marks_window_bytes_and_canonical_calls_unavailable(self) -> None:
         trace_root = self.write_trace(
             "trace-a",
@@ -563,6 +995,8 @@ class AgentLoopReportTests(unittest.TestCase):
         self.assertFalse(result["availability"]["window_timing"]["available"])
         self.assertIsNone(result["timing"]["webcodex_service_ms"]["total"])
         self.assertFalse(result["availability"]["webcodex_service_timing"]["available"])
+        self.assertFalse(result["availability"]["host_short_chain"]["available"])
+        self.assertFalse(result["host_short_chain"]["same_model_turn_proven"])
 
     def test_code_mode_canonical_count_stays_separate_from_persisted_child_count(self) -> None:
         self.insert_event(
@@ -832,6 +1266,25 @@ class AgentLoopReportTests(unittest.TestCase):
         )
         self.assertEqual(metadata["surface"], "direct")
 
+    def test_benchmark_host_code_mode_surface_is_inferred(self) -> None:
+        metadata = report._benchmark_metadata(
+            case_manifest=None,
+            case_id="readonly_review",
+            variant="host_code_mode",
+            surface=None,
+            base_revision="a" * 40,
+        )
+        self.assertEqual(metadata["surface"], "host_code_mode")
+
+        with self.assertRaisesRegex(report.ReportError, "surface.*host_code_mode"):
+            report._benchmark_metadata(
+                case_manifest=None,
+                case_id="readonly_review",
+                variant="host_code_mode",
+                surface="direct",
+                base_revision="a" * 40,
+            )
+
     def test_run_annotation_validation_is_bounded_and_payload_safe(self) -> None:
         value = {
             "schema_version": 1,
@@ -864,6 +1317,11 @@ class AgentLoopReportTests(unittest.TestCase):
         legacy["variant"] = "code_mode"
         legacy["surface"] = "e1"
         self.assertEqual(report.validate_run_annotation(copy.deepcopy(legacy)), legacy)
+
+        host = copy.deepcopy(value)
+        host["variant"] = "host_code_mode"
+        host["surface"] = "host_code_mode"
+        self.assertEqual(report.validate_run_annotation(copy.deepcopy(host)), host)
 
         leaked = copy.deepcopy(value)
         leaked["session_id"] = "wc_sess_should_not_be_stored"
@@ -1041,6 +1499,10 @@ class AgentLoopReportTests(unittest.TestCase):
         self.assertTrue(
             report.compare_reports(direct, legacy_code)["pair_compatibility"]["comparable"]
         )
+        host = copy.deepcopy(direct)
+        host["benchmark"]["variant"] = "host_code_mode"
+        host["benchmark"]["surface"] = "host_code_mode"
+        self.assertTrue(report.compare_reports(direct, host)["pair_compatibility"]["comparable"])
         self.assertTrue(comparison["correctness_compatibility"]["comparable"])
         self.assertTrue(comparison["throughput_compatibility"]["comparable"])
         self.assertFalse(metrics["model_round_trips"]["comparable"])
@@ -1262,11 +1724,168 @@ class AgentLoopReportTests(unittest.TestCase):
             "variant": "code_mode",
             "case_fingerprint": "f" * 64,
         }
+        candidate["job_convergence"]["pending_followed_immediately_by_observe_count"] = 2
+        candidate["job_convergence"]["passive_terminal_delivery_count"] = 1
         comparison = report.compare_reports(baseline, candidate)
         self.assertEqual(
             comparison["case_compatibility"],
             {"comparable": True, "reason": None},
         )
+        metrics = {item["metric"]: item for item in comparison["metrics"]}
+        self.assertEqual(
+            metrics["job_convergence.pending_followed_immediately_by_observe_count"]["delta"],
+            2,
+        )
+        self.assertEqual(
+            metrics["job_convergence.passive_terminal_delivery_count"]["delta"],
+            1,
+        )
+
+
+
+    def test_job_convergence_loads_exact_unlinked_observe_from_audit_context(self):
+        for trace, link in [(1, True), (2, False), (3, True)]:
+            self.insert_event(str(trace), trace_id=str(trace), started=trace * 1000,
+                              handed=trace * 1000 + 100, transition="serial" if trace > 1 else "unavailable", link=link)
+        values = [JobConvergenceTests.row(1, kind="pending_handoff"),
+                  JobConvergenceTests.row(2, 1, "explicit_observe", terminal=2000),
+                  JobConvergenceTests.row(3, 2)]
+        with sqlite3.connect(self.audit_db) as connection:
+            for row in values:
+                connection.execute("UPDATE action_events SET summary_json = ? WHERE event_id = ?",
+                                   (json.dumps(row["summary"]), row["event_id"]))
+        result = self.summarize()["job_convergence"]
+        self.assertEqual(result["pending_followed_immediately_by_observe_count"], 1)
+        self.assertEqual(result["pending_followup_known_count"], 1)
+        self.assertEqual(result["pending_to_terminal_ms"]["observed_total"], 900)
+
+    def test_job_convergence_loads_exact_unlinked_successor_after_selected_tail(self):
+        for trace, link in [(1, True), (2, True), (3, False)]:
+            self.insert_event(str(trace), trace_id=str(trace), started=trace * 1000,
+                              handed=trace * 1000 + 100, transition="serial" if trace > 1 else "unavailable", link=link)
+        pending = JobConvergenceTests.row(1, kind="pending_handoff")
+        terminal = JobConvergenceTests.row(2, 1, "passive_terminal", failure=True, terminal=2000)
+        terminal["summary"]["model_ergonomics"]["job_convergence"]["events"][0]["validation_failure"] = True
+        observe = JobConvergenceTests.row(3, 2, "explicit_observe", terminal=2000)
+        with sqlite3.connect(self.audit_db) as connection:
+            for row in [pending, terminal, observe]:
+                connection.execute("UPDATE action_events SET summary_json = ? WHERE event_id = ?",
+                                   (json.dumps(row["summary"]), row["event_id"]))
+        result = self.summarize()["job_convergence"]
+        self.assertEqual(result["passive_terminal_before_explicit_observe_count"], 1)
+        self.assertEqual(result["terminal_failure_followed_by_observe_count"], 1)
+        self.assertEqual(result["terminal_validation_failure_followed_by_observe_count"], 1)
+
+
+class JobConvergenceTests(unittest.TestCase):
+    @staticmethod
+    def row(trace, previous=None, kind=None, relation="a" * 64, failure=None, terminal=None):
+        event = {"kind": kind, "relation": relation}
+        if failure is not None:
+            event["failure"] = failure
+        if terminal is not None:
+            event["terminal_observed_at_ms"] = terminal
+        facts = {
+            "pending_handoff_count": int(kind == "pending_handoff"),
+            "passive_terminal_delivery_count": int(kind == "passive_terminal"),
+            "passive_failure_delivery_count": int(failure is True),
+            "wait_for_job_terminal_count": 0,
+            "correlation_complete": True,
+            "events": [event] if kind else [],
+        }
+        return {
+            "event_id": str(trace), "server_trace_id": str(trace),
+            "client_window_key": "window", "principal_correlation_kind": "user",
+            "principal_correlation_id": "principal", "window_meaningful": True,
+            "window_continuity_eligible": True, "response_streaming": False,
+            "window_transition_kind": "serial" if previous else "unavailable",
+            "request_observed_at_ms": trace * 1000,
+            "response_handed_at_ms": trace * 1000 + 100,
+            "summary": {"previous_meaningful_call": str(previous) if previous else None,
+                        "model_ergonomics": {"schema_version": 10, "job_convergence": facts}},
+        }
+
+    def test_exact_immediate_observe_and_unrelated_relations(self):
+        pending = self.row(1, kind="pending_handoff")
+        observe = self.row(2, 1, "explicit_observe")
+        result = report._summarize_job_convergence([pending, observe], [])
+        self.assertEqual(result["pending_handoff_count"], 1)
+        self.assertEqual(result["pending_followed_immediately_by_observe_count"], 1)
+        unrelated = self.row(2, 1, "explicit_observe", relation="b" * 64)
+        self.assertEqual(report._summarize_job_convergence([pending, unrelated], [])["pending_followed_immediately_by_observe_count"], 0)
+        intervening_read = self.row(2, 1)
+        later = self.row(3, 2, "explicit_observe")
+        self.assertEqual(report._summarize_job_convergence([pending, intervening_read, later], [])["pending_followed_immediately_by_observe_count"], 0)
+
+    def test_passive_failure_then_fix_or_observe_and_authoritative_timing(self):
+        pending = self.row(1, kind="pending_handoff")
+        terminal = self.row(2, 1, "passive_terminal", failure=True, terminal=2000)
+        terminal["summary"]["model_ergonomics"]["job_convergence"]["events"][0]["validation_failure"] = True
+        edit = self.row(3, 2)
+        result = report._summarize_job_convergence([pending, terminal, edit], [])
+        self.assertEqual(result["passive_terminal_delivery_count"], 1)
+        self.assertEqual(result["passive_failure_delivery_count"], 1)
+        self.assertEqual(result["passive_terminal_before_explicit_observe_count"], 1)
+        self.assertEqual(result["terminal_failure_followed_by_observe_count"], 0)
+        self.assertEqual(result["pending_to_terminal_ms"]["observed_total"], 900)
+        observe = self.row(3, 2, "explicit_observe")
+        second_observe = self.row(4, 3, "explicit_observe")
+        result = report._summarize_job_convergence([pending, terminal, observe, second_observe], [])
+        self.assertEqual(result["terminal_failure_followed_by_observe_count"], 1)
+        self.assertEqual(result["terminal_validation_failure_followed_by_observe_count"], 1)
+        self.assertEqual(result["passive_validation_failure_delivery_count"], 1)
+        unrelated = self.row(3, 2, "explicit_observe", relation="b" * 64)
+        self.assertEqual(report._summarize_job_convergence([pending, terminal, unrelated], [])["terminal_failure_followed_by_observe_count"], 0)
+
+    def test_prior_observe_does_not_count_as_passive_before_observe(self):
+        rows = [self.row(1, kind="pending_handoff"), self.row(2, 1, "explicit_observe"), self.row(3, 2, "passive_terminal", failure=False, terminal=3000)]
+        result = report._summarize_job_convergence(rows, [])
+        self.assertEqual(result["passive_terminal_before_explicit_observe_count"], 0)
+        self.assertEqual(result["passive_failure_delivery_count"], 0)
+
+    def test_gaps_overlap_wrong_principal_window_and_absent_timestamps_are_unknown(self):
+        pending = self.row(1, kind="pending_handoff")
+        for change in [
+            {"window_transition_kind": "overlap"},
+            {"client_window_key": "other-window"},
+            {"principal_correlation_id": "other-principal"},
+            {"request_observed_at_ms": None},
+            {"response_streaming": True},
+        ]:
+            observe = self.row(2, 1, "explicit_observe")
+            observe.update(change)
+            self.assertEqual(report._summarize_job_convergence([pending, observe], [])["pending_followed_immediately_by_observe_count"], 0)
+        # Even if the last exported row was pending, an absent exact predecessor
+        # never becomes adjacency. This also covers a dropped audit write.
+        observe = self.row(3, 2, "explicit_observe")
+        self.assertEqual(report._summarize_job_convergence([pending, observe], [])["pending_followed_immediately_by_observe_count"], 0)
+        for timestamp in [None, 1000]:
+            terminal = self.row(2, 1, "passive_terminal", failure=False, terminal=timestamp)
+            result = report._summarize_job_convergence([pending, terminal], [])
+            self.assertEqual(result["pending_to_terminal_ms"]["samples"], 0)
+            self.assertEqual(result["pending_to_terminal_ms"]["missing"], 1)
+
+    def test_failed_observe_correlation_does_not_prove_absence_of_observation(self):
+        pending = self.row(1, kind="pending_handoff")
+        failed_observe = self.row(2, 1)
+        failed_observe["summary"]["model_ergonomics"]["job_convergence"]["correlation_complete"] = False
+        terminal = self.row(3, 2, "passive_terminal", terminal=3000)
+        result = report._summarize_job_convergence([pending, failed_observe, terminal], [])
+        self.assertEqual(result["passive_terminal_before_explicit_observe_count"], 0)
+        self.assertEqual(result["pending_followup_known_count"], 0)
+        self.assertEqual(result["unknown_relations"], 1)
+
+    def test_wait_count_and_bounded_identity_free_aggregate(self):
+        row = self.row(1)
+        row["summary"]["model_ergonomics"]["job_convergence"]["wait_for_job_terminal_count"] = 1
+        row["summary"]["source"] = "SECRET_SOURCE_COMMAND_STDOUT_STDERR"
+        result = report._summarize_job_convergence([row], [])
+        self.assertEqual(result["wait_for_job_terminal_count"], 1)
+        encoded = json.dumps(result)
+        for private in ["SECRET", "principal", "window", "a" * 64]:
+            self.assertNotIn(private, encoded)
+        with self.assertRaisesRegex(report.ReportError, "100000"):
+            report._summarize_job_convergence([row] * 100001, [])
 
 
 if __name__ == "__main__":

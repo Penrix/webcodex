@@ -35,7 +35,7 @@ async fn service_agent_task_until_finished(
 }
 
 #[test]
-fn coding_task_tools_are_registered_in_metadata_and_openapi() {
+fn coding_task_tools_are_registered_in_metadata() {
     let specs = registered_tool_specs();
     let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
     assert!(
@@ -227,50 +227,53 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         );
     }
 
-    let openapi = crate::openapi::build_openapi_spec();
-    let work = &openapi["paths"]["/api/actions/work_on_project"]["post"];
-    assert_eq!(work["operationId"], "work_on_project");
-    let work_properties = work["requestBody"]["content"]["application/json"]["schema"]
-        ["properties"]
-        .as_object()
-        .unwrap();
-    for field in ["project", "client_id", "path", "mode", "base_ref"] {
-        assert!(
-            work_properties.contains_key(field),
-            "work_on_project missing {field}"
-        );
-    }
-    for field in [
-        "temporary_project_name",
-        "deny_write_tools",
-        "deny_shell_tools",
-        "detail",
-        "resume_session_id",
-        "bind_current",
-        "new_session",
-    ] {
-        assert!(
-            !work_properties.contains_key(field),
-            "retired work_on_project field {field}"
-        );
-    }
+    #[cfg(feature = "legacy-gpt-actions")]
+    {
+        let openapi = crate::openapi::build_openapi_spec();
+        let work = &openapi["paths"]["/api/actions/work_on_project"]["post"];
+        assert_eq!(work["operationId"], "work_on_project");
+        let work_properties = work["requestBody"]["content"]["application/json"]["schema"]
+            ["properties"]
+            .as_object()
+            .unwrap();
+        for field in ["project", "client_id", "path", "mode", "base_ref"] {
+            assert!(
+                work_properties.contains_key(field),
+                "work_on_project missing {field}"
+            );
+        }
+        for field in [
+            "temporary_project_name",
+            "deny_write_tools",
+            "deny_shell_tools",
+            "detail",
+            "resume_session_id",
+            "bind_current",
+            "new_session",
+        ] {
+            assert!(
+                !work_properties.contains_key(field),
+                "retired work_on_project field {field}"
+            );
+        }
 
-    assert!(
-        openapi["paths"]
-            .get("/api/actions/finish_coding_task")
-            .is_none(),
-        "finish_coding_task is model-visible but intentionally gateway-only"
-    );
+        assert!(
+            openapi["paths"]
+                .get("/api/actions/finish_coding_task")
+                .is_none(),
+            "finish_coding_task is model-visible but intentionally gateway-only"
+        );
+        assert!(webcodex_tool_contracts::gpt_action_tool_supported(
+            "finish_coding_task"
+        ));
+        assert!(openapi["paths"]
+            .get("/api/actions/start_coding_task")
+            .is_none());
+    }
     assert_eq!(
         webcodex_tool_contracts::runtime_tool_adaptive_direct_rank("finish_coding_task"),
         None
     );
-    assert!(webcodex_tool_contracts::gpt_action_tool_supported(
-        "finish_coding_task"
-    ));
-    assert!(openapi["paths"]
-        .get("/api/actions/start_coding_task")
-        .is_none());
 }
 
 #[tokio::test]
@@ -364,15 +367,17 @@ async fn coding_workflow_full_diagnostic_has_no_binding_projection() {
         .unwrap();
     assert!(contains_string(inspect, "read_files"));
     assert!(contains_string(inspect, "search_project_texts"));
-    assert!(contains_string(inspect, "show_changes"));
+    assert!(contains_string(inspect, "review_changes"));
+    assert!(!contains_string(inspect, "show_changes"));
     assert!(!contains_string(inspect, "read_file"));
     assert!(!contains_string(inspect, "search_project_text"));
     let edit = result.output["recommended_flow"]["edit"]
         .as_array()
         .unwrap();
-    assert!(contains_string(edit, "apply_text_edits"));
-    assert!(contains_string(edit, "apply_unified_diff"));
-    assert!(contains_string(edit, "write_project_file"));
+    assert!(contains_string(edit, "edit_project_files"));
+    for specialist in ["apply_patch", "apply_unified_diff", "write_project_file"] {
+        assert!(!contains_string(edit, specialist), "{specialist}");
+    }
     assert!(!contains_string(edit, "replace_line_range"));
     assert!(!contains_string(edit, "insert_at_line"));
     assert!(!contains_string(edit, "delete_line_range"));
@@ -801,12 +806,12 @@ async fn work_on_project_non_git_startup_never_retroactively_acquires_baseline()
     let edit = runtime.sessions.record_tool_call_started(
         Some(&session_id),
         SessionTransport::Mcp,
-        "apply_text_edits",
+        "edit_project_files",
         &json!({
             "project": project,
             "changes": [{"kind": "create", "path": "README.md"}]
         }),
-        crate::tool_runtime::sessions::session_tool_contract("apply_text_edits"),
+        crate::tool_runtime::sessions::session_tool_contract("edit_project_files"),
     );
     runtime.sessions.record_tool_call_finished(
         edit,
@@ -1007,6 +1012,7 @@ async fn coding_workflow_tracked_modified_is_nonblocking_and_allows_continued_ed
             new_text: Some("    println!(\"user-wip-plus-agent\");".to_string()),
             anchor_text: None,
             occurrence: None,
+            expected_match_count: None,
             line_scope: None,
         }],
         None,
@@ -1036,6 +1042,7 @@ async fn coding_workflow_tracked_modified_is_nonblocking_and_allows_continued_ed
             new_text: Some("    println!(\"user-wip-plus-agent\");".to_string()),
             anchor_text: None,
             occurrence: None,
+            expected_match_count: None,
             line_scope: None,
         }],
         None,
@@ -1478,7 +1485,7 @@ async fn finish_coding_task_emits_one_parser_ready_changes_presentation_in_full_
     record_coding_task_tool_event(
         &runtime,
         &session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": project,
             "changes": [{"kind": "edit", "path": "README.md"}]
@@ -1488,6 +1495,7 @@ async fn finish_coding_task_emits_one_parser_ready_changes_presentation_in_full_
     );
     fs::write(tmp.path().join("README.md"), "final task state\n").unwrap();
 
+    let mut sealed_snapshot_id: Option<String> = None;
     for summary_only in [false, true] {
         let result = finish_coding_task_with_agent(
             &runtime,
@@ -1502,13 +1510,17 @@ async fn finish_coding_task_emits_one_parser_ready_changes_presentation_in_full_
         assert_eq!(
             result.output["presentation"]["suggested_call"],
             json!({
+                "follow_up_kind": "fallback_recovery",
                 "tool": "present_work_result",
                 "arguments": {
                     "project": project,
-                    "session_id": session_id,
                 }
             })
         );
+        webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(
+            &result.output["presentation"]["suggested_call"],
+        )
+        .expect("result presentation fallback must pass present_work_result registered inputSchema");
         assert!(result.output["suggested_next_actions"]
             .as_array()
             .unwrap()
@@ -1517,6 +1529,18 @@ async fn finish_coding_task_emits_one_parser_ready_changes_presentation_in_full_
                 .as_str()
                 .unwrap_or_default()
                 .contains("present_work_result")));
+        assert_eq!(result.output["task_outcome"]["blocking"], false);
+        let summary = runtime.sessions.summary(&session_id, None).unwrap();
+        let sealed = runtime
+            .sealed_work_result_changes(&project, &summary, Some(&auth))
+            .unwrap()
+            .expect("non-blocking finish must seal eligible final changes");
+        let snapshot_id = sealed["snapshot_id"].as_str().unwrap().to_string();
+        if let Some(expected) = sealed_snapshot_id.as_ref() {
+            assert_eq!(&snapshot_id, expected);
+        } else {
+            sealed_snapshot_id = Some(snapshot_id);
+        }
     }
 
     let restore = std::process::Command::new("git")
@@ -1536,6 +1560,71 @@ async fn finish_coding_task_emits_one_parser_ready_changes_presentation_in_full_
     .await;
     assert!(reverted.success, "{:?}", reverted.error);
     assert!(reverted.output.get("presentation").is_none());
+}
+
+#[tokio::test]
+async fn finish_coding_task_blocking_closeout_does_not_seal_final_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "base\n", "base");
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "coding-finish-blocked-changes",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+    let start = work_on_project_serviced(
+        &runtime,
+        "coding-finish-blocked-changes",
+        &project,
+        "blocked changes closeout",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
+    record_coding_task_tool_event(
+        &runtime,
+        &session_id,
+        "edit_project_files",
+        json!({
+            "project": project,
+            "changes": [{"kind": "edit", "path": "README.md"}]
+        }),
+        true,
+        json!({"state_changed": true}),
+    );
+    fs::write(tmp.path().join("README.md"), "blocked task state\n").unwrap();
+    record_coding_task_tool_event(
+        &runtime,
+        &session_id,
+        "cargo_fmt",
+        json!({"project": project, "check": true}),
+        false,
+        json!({"exit_code": 1, "failure_kind": "validation_failed"}),
+    );
+
+    let result = finish_coding_task_with_agent(
+        &runtime,
+        "coding-finish-blocked-changes",
+        project.clone(),
+        session_id.clone(),
+        auth.clone(),
+        true,
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["task_outcome"]["blocking"], true);
+    assert!(result.output.get("presentation").is_some());
+    let summary = runtime.sessions.summary(&session_id, None).unwrap();
+    assert!(runtime
+        .sealed_work_result_changes(&project, &summary, Some(&auth))
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1670,6 +1759,76 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
         !serialized.contains("\"show_changes\":"),
         "summary_only finish leaked raw show_changes payload: {serialized}"
     );
+}
+
+#[tokio::test]
+async fn finish_coding_task_summary_only_omits_diff_generation_even_when_requested() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "add readme");
+    let runtime = test_runtime();
+    let project = register_runner_project_at_path(
+        &runtime,
+        "coding-finish-compact-no-diff",
+        "demo",
+        tmp.path(),
+    )
+    .await;
+    let auth = auth_context(None, true);
+    let session = runtime
+        .sessions
+        .start_session(Some(project.clone()), Some("compact no diff".to_string()));
+    let session_id = session.session_id.clone();
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::FinishCodingTask {
+                        project,
+                        session_id,
+                        summary_only: true,
+                        include_diff: Some(true),
+                        include_workspace: Some(false),
+                        include_hygiene: Some(false),
+                        include_handoff: Some(false),
+                        include_validation_summary: Some(false),
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, "coding-finish-compact-no-diff").await;
+    assert_internal_posix_script_contains(&request, "git status --porcelain=v1 -b");
+    let script = &request
+        .script
+        .as_ref()
+        .expect("summary_only workspace observation script")
+        .script;
+    assert!(
+        !script.contains("diff_hunks_returned="),
+        "summary_only must not spend a Git observation budget on a diff body it cannot return: {script}"
+    );
+    let show_changes_stdout =
+        crate::tool_runtime::framed_clean_show_changes_test_stdout("add readme", false);
+    complete_patch_agent_request(
+        &runtime,
+        "coding-finish-compact-no-diff",
+        &request.request_id,
+        0,
+        &show_changes_stdout,
+        "",
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["summary_only"], true);
+    assert!(result.output.get("changes").is_none());
 }
 
 #[tokio::test]
@@ -1931,7 +2090,7 @@ async fn finish_coding_task_historical_unresolved_current_pass_does_not_request_
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": fixture.project.clone(),
             "changes": [{"kind": "edit", "path": "src/lib.rs"}]
@@ -2358,7 +2517,7 @@ async fn finish_coding_task_combined_early_fmt_and_test_failures_resolve_without
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": fixture.project.clone(),
             "changes": [{"kind": "edit", "path": "src/lib.rs"}]
@@ -2403,7 +2562,7 @@ async fn finish_coding_task_combined_early_fmt_and_test_failures_resolve_without
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": fixture.project.clone(),
             "changes": [{"kind": "edit", "path": "src/lib.rs"}]
@@ -2584,7 +2743,7 @@ async fn finish_coding_task_resolved_history_keeps_real_tool_failure_blocking() 
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": fixture.project.clone(), "changes": []}),
         false,
         json!({"failure_kind": "stale_precondition"}),
@@ -2642,7 +2801,7 @@ async fn failure_history_fail_closed_attempts_do_not_block_clean_finish() {
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": fixture.project.clone(), "changes": []}),
         false,
         json!({
@@ -2887,7 +3046,7 @@ async fn failure_history_outcome_unknown_remains_actionable() {
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": fixture.project.clone(), "changes": []}),
         false,
         json!({
@@ -2931,7 +3090,7 @@ async fn failure_history_missing_effect_proof_remains_actionable() {
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": fixture.project.clone(), "changes": []}),
         false,
         json!({"failure_kind": "stale_precondition"}),
@@ -2944,7 +3103,7 @@ async fn failure_history_missing_effect_proof_remains_actionable() {
     let failed = summary
         .events
         .iter()
-        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "apply_text_edits")
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "edit_project_files")
         .expect("failed guarded mutation event");
     assert!(
         failed.effect_evidence.is_none(),

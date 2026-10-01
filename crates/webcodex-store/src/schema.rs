@@ -71,6 +71,16 @@ impl Database {
         let mut conn = self.lock_connection(crate::StoreDomain::Schema);
         conn.execute_batch(
             "
+            CREATE TABLE IF NOT EXISTS wc_external_observations (
+                session_id TEXT NOT NULL,
+                project TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                exit_code INTEGER,
+                recorded_at INTEGER NOT NULL,
+                PRIMARY KEY(session_id, adapter_id, event_id)
+            );
             CREATE TABLE IF NOT EXISTS wc_job_receipts (
                 job_id TEXT PRIMARY KEY,
                 client_id TEXT NOT NULL,
@@ -140,6 +150,7 @@ impl Database {
                 used_at INTEGER,
                 user_token_name TEXT,
                 agent_token_name TEXT,
+                runner_capabilities INTEGER NOT NULL DEFAULT 0 CHECK(runner_capabilities IN (0, 1)),
                 FOREIGN KEY(user_id) REFERENCES users(id)
             );
             CREATE INDEX IF NOT EXISTS idx_pairing_codes_hash ON pairing_codes(code_hash);
@@ -382,6 +393,23 @@ impl Database {
             ",
         )?;
 
+        // Additive typed model-reference storage. The released Project-ref
+        // table and its indices remain unchanged.
+        Self::ensure_model_reference_schema(&mut conn)?;
+
+        // Preserve the authority of previously issued enrollment codes. Only a
+        // newly issued explicit admin grant adds ACP/SSH scopes; old codes stay 0.
+        {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !table_columns(&tx, "pairing_codes")?
+                .iter()
+                .any(|column| column == "runner_capabilities")
+            {
+                tx.execute_batch("ALTER TABLE pairing_codes ADD COLUMN runner_capabilities INTEGER NOT NULL DEFAULT 0 CHECK(runner_capabilities IN (0, 1));")?;
+            }
+            tx.commit()?;
+        }
+
         // ActionAudit predates Window correlation. Fresh databases already have
         // the current columns above; existing databases receive the same shape
         // through this additive, idempotent migration.
@@ -467,12 +495,54 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_action_events_window_started
                 ON action_events(client_window_key, window_started_at_ms DESC)
                 WHERE client_window_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_action_events_window_observed
+                ON action_events(client_window_key, COALESCE(request_observed_at_ms, window_started_at_ms) DESC, event_id DESC)
+                WHERE window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_action_events_window_completed
                 ON action_events(client_window_key, window_ended_at_ms DESC, event_id DESC)
                 WHERE window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_action_events_window_meaningful_completed
                 ON action_events(client_window_key, window_ended_at_ms DESC, event_id DESC)
                 WHERE window_meaningful = 1 AND window_started_at_ms IS NOT NULL AND window_ended_at_ms IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS window_operator_messages (
+                message_id TEXT PRIMARY KEY,
+                principal_kind TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                recipient_window_key TEXT NOT NULL,
+                context_session_id TEXT,
+                context_project TEXT,
+                kind TEXT NOT NULL,
+                priority TEXT NOT NULL,
+                message TEXT NOT NULL,
+                tags_json TEXT NOT NULL,
+                requires_ack INTEGER NOT NULL CHECK(requires_ack IN (0, 1)),
+                created_at_ms INTEGER NOT NULL,
+                first_projected_at_ms INTEGER,
+                last_projected_at_ms INTEGER,
+                projection_count INTEGER NOT NULL DEFAULT 0,
+                first_ack_observed_at_ms INTEGER,
+                delivery_key_hash TEXT NOT NULL,
+                delivery_payload_hash TEXT NOT NULL,
+                UNIQUE(principal_kind, principal_id, delivery_key_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_window_operator_messages_recipient
+                ON window_operator_messages(principal_kind, principal_id, recipient_window_key, created_at_ms);
+
+            CREATE TABLE IF NOT EXISTS window_model_replies (
+                message_id TEXT PRIMARY KEY,
+                principal_kind TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                window_key TEXT NOT NULL,
+                reply_to_message_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                delivery_key_hash TEXT NOT NULL,
+                delivery_payload_hash TEXT NOT NULL,
+                UNIQUE(principal_kind, principal_id, delivery_key_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_window_model_replies_window
+                ON window_model_replies(principal_kind, principal_id, window_key, created_at_ms);
 
             CREATE TABLE IF NOT EXISTS window_peer_messages (
                 message_id TEXT PRIMARY KEY,
@@ -493,7 +563,9 @@ impl Database {
                 first_projected_at_ms INTEGER,
                 last_projected_at_ms INTEGER,
                 projection_count INTEGER NOT NULL DEFAULT 0,
-                first_ack_observed_at_ms INTEGER
+                first_ack_observed_at_ms INTEGER,
+                delivery_key_hash TEXT,
+                delivery_payload_hash TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_window_peer_messages_recipient
                 ON window_peer_messages(
@@ -530,6 +602,28 @@ impl Database {
         }
         tx.execute_batch(CHILD_SCHEMA)
             .context("create ActionAudit Window correlation schema")?;
+        let mut peer_columns = table_columns(&tx, "window_peer_messages")?;
+        for (name, definition) in [
+            ("delivery_key_hash", "TEXT"),
+            ("delivery_payload_hash", "TEXT"),
+        ] {
+            if peer_columns.iter().any(|column| column == name) {
+                continue;
+            }
+            tx.execute_batch(&format!(
+                "ALTER TABLE window_peer_messages ADD COLUMN {name} {definition};"
+            ))
+            .with_context(|| format!("add Peer message replay column {name}"))?;
+            peer_columns.push(name.to_string());
+        }
+        tx.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_window_peer_messages_delivery
+                 ON window_peer_messages(
+                    principal_kind, principal_id, sender_window_key, delivery_key_hash
+                 )
+                 WHERE delivery_key_hash IS NOT NULL;",
+        )
+        .context("create Peer message delivery replay index")?;
         tx.commit()
             .context("commit ActionAudit Window schema migration")?;
         Ok(())
@@ -542,6 +636,9 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_action_events_operation_started
                  ON action_events(operation, started_at DESC)
                  WHERE operation IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_action_events_trace_diagnostic_time
+                 ON action_events(COALESCE(request_observed_at_ms, window_started_at_ms, started_at * 1000) DESC, event_id DESC)
+                 WHERE server_trace_id IS NOT NULL;
              CREATE VIEW IF NOT EXISTS code_mode_action_traces AS
              SELECT
                  event_id,

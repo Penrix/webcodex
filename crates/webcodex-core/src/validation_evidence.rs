@@ -21,6 +21,11 @@ pub const NO_STABLE_DIAGNOSTICS_REASON: &str = "no stable diagnostics found";
 pub const VALIDATION_OUTPUT_METADATA_ABSENT_REASON: &str =
     "no validation event contains safe bounded output metadata";
 
+// Passive failure detail is a subset of the canonical parser evidence. The
+// serialized diagnostics object has an independent hard byte ceiling.
+pub const PASSIVE_MAX_DIAGNOSTICS: usize = 3;
+pub const PASSIVE_MAX_FAILED_TESTS: usize = 3;
+pub const PASSIVE_MAX_FAILURE_BYTES: usize = 8 * 1024;
 pub const MAX_DIAGNOSTICS: usize = 20;
 pub const MAX_FAILED_TESTS: usize = 20;
 pub const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 240;
@@ -110,6 +115,53 @@ pub struct CargoTestSummary {
     pub failed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored: Option<u64>,
+}
+
+/// Parse Go vet's stable relative-file:line:column diagnostics. Compiler prose
+/// without a stable location is not invented into structured evidence.
+pub fn parse_go_vet_diagnostics(stderr: &str, truncated: bool) -> ValidationDiagnostics {
+    let mut items = Vec::new();
+    let mut invalid = 0;
+    for raw in stderr.lines() {
+        let line = sanitize_line(raw);
+        let Some((location, message)) = line.split_once(": ") else {
+            continue;
+        };
+        let Some(span) = parse_location(location) else {
+            invalid += 1;
+            continue;
+        };
+        let Some(message) = sanitize_bounded_value(message, MAX_DIAGNOSTIC_MESSAGE_CHARS)
+            .filter(|m| !looks_sensitive(m))
+        else {
+            invalid += 1;
+            continue;
+        };
+        items.push(CargoDiagnostic {
+            severity: "error",
+            code: None,
+            file: Some(span.file),
+            line: Some(span.line),
+            column: Some(span.column),
+            message: crate::validation_bridge::sanitize_bridge_text(&message),
+        });
+    }
+    items.sort_by(compare_diagnostics);
+    items.dedup();
+    let total = items.len();
+    items.truncate(MAX_DIAGNOSTICS);
+    if total == 0 {
+        diagnostics_unavailable(invalid)
+    } else {
+        diagnostics_from_rust(
+            ParsedDiagnostics {
+                items,
+                total,
+                invalid,
+            },
+            truncated,
+        )
+    }
 }
 
 pub fn parse_cargo_check_diagnostics(

@@ -1138,7 +1138,7 @@ mod tests {
             ("read_files", "Read"),
             ("search_project_texts", "Searched"),
             ("lsp_status", "Navigated"),
-            ("apply_text_edits", "Edited"),
+            ("edit_project_files", "Edited"),
             ("cargo_test", "Tested"),
             ("run_process", "Ran"),
             ("git_review_summary", "Reviewed"),
@@ -1235,7 +1235,7 @@ mod tests {
             ToolActivityPresentation::Transport
         );
         assert_eq!(
-            activity_presentation_for_tool("goal_plan_state"),
+            activity_presentation_for_tool("goal_plan_sync"),
             ToolActivityPresentation::Transport
         );
     }

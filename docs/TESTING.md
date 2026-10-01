@@ -24,11 +24,13 @@ waits, and the cost of each test lane.
 | Process lifecycle real-process | `ManagedChild` ownership, graceful/forced termination, descendants, EOF, liveness, and reaping. Most lifecycle tests in the integration target are ignored; pure type/spawn-error smoke remains ordinary. | Real local helper processes and OS liveness probes. | `cargo test --locked -p webcodex-process --test managed_child -- --ignored --test-threads=1` |
 | Persistent-shell timing | Timeout, concurrent busy-state, close-vs-exec, idle expiry, descendant teardown, and heavy adversarial PowerShell timing/status coverage. Fast state/error/exit smoke remains ordinary. | Real shell processes; serial execution only. | `cargo test --locked -p webcodex-persistent-shell -- --ignored --test-threads=1` |
 | Desktop Windows real-process | Windows Desktop stdin-EOF shutdown and bounded-command process-tree reclamation. These tests are ignored by the ordinary Desktop suite and share the `desktop_real_process_windows_` name prefix. | Real local child processes only; no external network. Run serially so PowerShell startup and process teardown do not compete with the ordinary Desktop libtest pool. | `cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml desktop_real_process_windows_ -- --ignored --test-threads=1` |
+| Session ledger scale/recovery | Construct actual retained Session snapshots, restore exact Active/Closed identities, measure full-ledger writes and bounded reads at 100/1,000/10,000 minimal Sessions. The small smoke and damaged-copy checks are ordinary unit tests. | Disposable temporary files; larger experiment explicitly ignored, serial, no production data or timing threshold. | `cargo test --locked -p webcodex-workflow-session --lib session_store_scale_and_recovery -- --ignored --test-threads=1 --nocapture` |
 | slow/manual ignored | Valuable coverage that is local but slow, serial, large-input, or global-state-sensitive. | Explicit operator opt-in; often `--ignored` and `--test-threads=1`. | Run the specific ignored test/filter documented by its subsystem. |
 | e2e/deployment smoke | Prove that binaries, local services, GPT Actions schema, MCP, artifact transfer, and an agent can work together. | Temporary local services and loopback ports; real deployment only when explicitly requested. | `bash scripts/e2e_zero_config_ws.sh`; `bash scripts/smoke_deployment.sh`; `bash scripts/smoke_artifact_transfer.sh` |
 | reconnect continuity | Runner disconnect/reconnect layer independence, stale-not-ready observations, reconciliation-aware recovering/lost transitions, server-restart durable Session plus explicit-session continuity, meaningful-activity scoping, and version-mismatch diagnostics. | In-process fixtures, no external network. | `cargo test -p webcodex --lib reconnect` |
 | trusted smoke | Disposable git fixture full chain (start → edit → failing shell validation → fix → pass → git review → finish) asserting zero approval interruptions under `trusted_agent` authority, resolved failure evidence, dirty-worktree advisory-only, and bounded payloads; prints baseline counters. | Temp git fixture, no external network. | `cargo test -p webcodex --lib trusted_smoke` |
 | real-process reconnect harness | Boot a real server plus reconciliation-capable runner, assert layered connection observations, crash the runner (layers degrade independently; running job enters `recovering`), restart with a new runner instance (old job is fenced to terminal `lost` with `runner_instance_replaced`, no server restart), then restart the server and verify runner auto-reconnect plus durable Session lookup and continuation by the original explicit `session_id`. It also prints post-deploy smoke facts (server version/commit, authority mode, version compatibility, runner shell dialect). | Local processes and loopback ports. | `bash scripts/e2e_reconnect_ws.sh` |
+| real-process Session/model continuity | Real MCP gateway, Server, WebSocket Runner and model API adapter: save decisions/progress, restart Server, discover and explicitly resume the same Session with a second same-user credential, deny foreign-owner/missing-scope calls, complete both Responses and chat-completions SSE Runs with recovered context, fence exact/changed initiation retries, and retain closed history. | Temporary users, credentials, Git repository, XDG/state roots and loopback model server; no paid model or production services. Build dogfood Server/Runner binaries first. | `python3 scripts/e2e_session_continuity_ws.py`; see [adapter validation](../integrations/model_gateway/README.md#validation). |
 | real-process hosted-connect harness | Build the real Server, Runner, and CLI; start a shared-key-enabled loopback Server; run `webcodex connect`; verify same-key project visibility and a read, cross-key isolation, detached Runner survival, repeated-connect PID reuse, hosted `runner status`, explicit stop, secret-safe output/log/state, and an untouched Git checkout. | Local processes, isolated XDG config/state roots, a temp Git project, bounded curl and outer timeout, trap cleanup; never production. | `bash scripts/e2e_hosted_connect.sh` |
 | real-process job reconciliation harness | Boot a real server plus a WebSocket runner that advertises `job_state_reconciliation`. Scenario A keeps a raw async Job running across a SERVER-only restart and asserts the SAME runner instance, original `job_id`, preserved ownership/project/session, non-regressing sequence/log cursors, `recovered_after_server_restart`, original-process stop, and one side-effect set. Scenario B lets a Job complete while the Server is offline and reconciles the terminal result without duplicate logs or execution. Scenario C forces `run_process` past its synchronous grace window, then proves the handed-off structured Job survives a Server restart and an old Server-epoch observation token refreshes immediately for the same `job_id`. Scenario D uses a delayed Cargo fixture to force a real `cargo_check` validation handoff past its sync window, then proves the same restart/token-refresh/stop contract with the validation command started exactly once. Ordinary Runner-owned Jobs keep the Runner process alive for these scenarios; `run_detached_process` restart survival is a separate supervisor-ownership contract covered by its focused Runner suites and production dogfood. | Local processes, temp dirs/ports/tokens, and a temp project; no production services or QUIC certs. Scenario D intentionally takes roughly the validation sync window plus restart time. | `bash scripts/e2e_job_reconciliation_ws.sh` |
 | real-process job recovery failure/non-reconciliation harness | Cover the failure and non-reconciliation paths the happy-path reconciliation harness omits, using `WEBCODEX_JOB_RECOVERY_GRACE_SECS=10` (clamped, above the 5s floor) so the deadline is bounded without waiting the 120s default. Scenario C: kill the runner only (server stays up), let the job enter `recovering`, and assert the non-request-triggered recovery-timeout sweep transitions it to `lost` with `runner_recovery_deadline_exceeded`, `ended_at` set once, one list record, stop-on-lost stable, and the command never re-executes. Scenario D: instance B replaces instance A (same client_id, new `agent_instance_id`); A's job becomes `lost` with `runner_instance_replaced`, B starts its own new job, A's late update is rejected, first `ended_at`/reason preserved. Scenario E: a generation-2 Runner registered with `WEBCODEX_RUNNER_DISABLE_JOB_STATE_RECONCILIATION=1` (no capability, no inventory) dispatches a job and, on disconnect, deterministically fences it to `lost` with `runner_disconnected_without_reconciliation` (never `recovering`); after a server restart its public lost receipt remains observable within retention, and a same-client new no-reconciliation instance cannot revive execution. Scenario F: a long job across three server restarts keeps the same `job_id`, runs the command once, keeps `last_update_seq`/log cursors non-regressing and markers non-duplicating, and reaches a terminal `stopped` that survives a third restart with `ended_at` unchanged by terminal inventory replay. | Local processes, temp dirs/ports/tokens, and a temp project; no production services or QUIC certs. | `bash scripts/e2e_job_recovery_failures_ws.sh` |
@@ -99,9 +101,9 @@ change is ready for review.
 The lanes above define test semantics; workflows decide when to run them.
 
 - `.github/workflows/ci.yml` is the ordinary repository gate. Its cheap `changes`
-  job classifies the exact PR base...head path set before native scheduling, while
-  the `contract` job remains mandatory for every configured pull request and every
-  push to `main`. The classifier is deterministic and local to Git: it does not use
+  job classifies the exact PR or merge-group base...head path set before native scheduling,
+  while the `contract` job remains mandatory for every configured pull request,
+  every merge-queue candidate, and every push to `main`. The classifier is deterministic and local to Git: it does not use
   commit messages or PR titles, and it emits frontend, per-platform, and package-lane
   requirements. For changed Rust/Cargo files it searches only bounded platform-marker
   lines from both the base and head file versions, so body-only changes inside an
@@ -111,16 +113,19 @@ The lanes above define test semantics; workflows decide when to run them.
   only an untrustworthy changed-path inventory falls back to the complete native
   matrix. The contract lane always owns workspace-boundary self-test/checks,
   formatting, the heuristic test-inventory self-test/report (without count thresholds),
-  and focused registry/OpenAPI/MCP schema and metadata parity. Main and Desktop
+  and focused registry/MCP schema and metadata parity. Main and Desktop
   frontend dependency installation/type/test/build steps run only when the classifier
   selects their respective frontend surface; full-native invocations select both.
 - The heavy Linux Rust matrix `test-linux-rust` and Linux tooling lane
-  `test-linux-tooling` run for every pull request as well as every push to `main`,
-  including owner-authored PRs. They start in parallel with `contract` rather than
+  `test-linux-tooling` run for every pull request, every merge-queue candidate, and
+  every push to `main`, including owner-authored PRs. They start in parallel with `contract` rather than
   waiting for unrelated frontend/static work. Native child lanes likewise wait only
   for the cheap `changes` classifier, while the stable macOS/Windows/native aggregates
-  retain the mandatory `contract` gate. Pushes to `main`, external-contributor PRs,
-  and owner PRs carrying `run-ci` force the complete deterministic native matrix.
+  retain the mandatory `contract` gate. Merge-group candidates use the exact
+  GitHub-provided synthetic base/head range and fetch the synthetic head by ref when
+  needed; an unavailable merge-group diff fails closed to the complete native matrix.
+  Pushes to `main`, external-contributor PRs, and owner PRs carrying `run-ci` also
+  force the complete deterministic native matrix.
   Real-process and timing-sensitive ignored tests are deliberately outside ordinary
   CI, including full-native overrides: run them explicitly when changing their
   lifecycle boundary or investigating platform behavior. Computer, platform-specific,
@@ -129,6 +134,10 @@ The lanes above define test semantics; workflows decide when to run them.
   `test-windows`, and `test-native` aggregates always resolve and verify each child
   lane is `success` when required or `skipped` when not required, avoiding a skipped
   required-check context that could leave branch protection pending.
+  The stable `test` and `test-native` contexts are also emitted for `merge_group`.
+  GitHub currently exposes Merge Queue only for eligible organization-owned repositories,
+  so this path remains dormant in this personal repository; it is retained as migration-ready
+  CI support if the repository later moves to an eligible organization.
 - MCP dated-revision evidence has its own bounded `mcp-conformance` lane. It pins
   and freshly builds the upstream referee, runs the `2026-07-28` and `2025-11-25`
   server requirements against a test-only loopback WebCodex endpoint, validates
@@ -137,6 +146,13 @@ The lanes above define test semantics; workflows decide when to run them.
   abnormal/infrastructure runs, stale or changed classifications, and unclassified
   new failures are merge-blocking. See [`MCP_CONFORMANCE.md`](MCP_CONFORMANCE.md)
   for baseline semantics.
+- GPT Actions are a default-off legacy compatibility surface. Ordinary PR,
+  merge-queue, main-push, and release-readiness CI do not enable
+  `legacy-gpt-actions` and therefore do not compile or test its OpenAPI/HTTP
+  adapter. `.github/workflows/legacy-gpt-actions.yml` runs the feature weekly
+  and on manual dispatch, including the frozen surface contract and the
+  feature-enabled Server tests. For local compatibility work use
+  `cargo test -p webcodex --lib --features legacy-gpt-actions`.
 - Linux Rust execution remains package-sharded: the server package `webcodex`, the
   Runner/LSP packages, and the remaining workspace crates run in parallel. The
   Runner/LSP shard compiles with `--features runner-real-process-tests` to prevent
@@ -305,3 +321,14 @@ Do not add large ordinary test blocks to production facade files when one of
 these `tests/` module trees already exists. Exact full-suite pass counts should
 come from a fresh `cargo test -p webcodex --lib` run; this document should not be
 treated as the source of truth for exact counts.
+
+## Runner observability contract
+
+Run `python scripts/tests/test_runner_observability_contract.py` for the exact-name
+projection guard used by CI. It covers observation producers and readers while
+leaving Runner registration wire keys and durable Agent APIs unchanged. Behavior
+coverage lives in the `metadata`, `runtime_http`, `runtime_console_http`,
+`admin_http`, `runner_capabilities`, and `startup_runner_tests` Server filters,
+and the CLI `ops` and `server::status` filters. Run
+`pwsh -NoProfile -File scripts/test_windows_runner_readiness.ps1` for Windows
+readiness parsing. These checks do not replace Linux socket-activation E2E.

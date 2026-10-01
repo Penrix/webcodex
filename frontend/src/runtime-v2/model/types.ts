@@ -89,9 +89,30 @@ export type SessionWindow = {
   last_linked_at_ms: number;
   last_seen_at_ms: number;
   last_meaningful_activity_at_ms?: number;
+  active_count?: number;
   relations: string[];
   relation_count: number;
   recorder_gap_count: number;
+};
+
+export type WorkspaceActivityPreview = {
+  created_at: number;
+  tool: string;
+  success: boolean;
+  client_id?: string;
+  session_id?: string;
+};
+
+export type SessionJobActivity = {
+  job_id: string;
+  kind: string;
+  status: string;
+  terminal: boolean;
+  created_at: number;
+  started_at?: number;
+  ended_at?: number;
+  activity_state?: string;
+  activity_phase?: string;
 };
 
 export type SessionDetail = SessionListItem & {
@@ -103,6 +124,12 @@ export type SessionDetail = SessionListItem & {
   window_activity_available: boolean;
   linked_windows: SessionWindow[];
   window_activity_after_last_session_record: WindowActivity[];
+  window_activity_after_last_session_record_truncated?: boolean;
+  workspace_activity_available?: boolean;
+  workspace_last_activity?: WorkspaceActivityPreview;
+  job_activity_available?: boolean;
+  jobs?: SessionJobActivity[];
+  jobs_truncated?: boolean;
 };
 
 export type RecentSession = SessionListItem & {
@@ -135,6 +162,12 @@ export type ProjectRow = {
   project_ref?: string;
   name?: string;
   path?: string;
+  registration_source?: string;
+  lineage?: {
+    kind: "managed_worktree_source";
+    source_project_id: string;
+    base_sha: string;
+  };
   connected: boolean;
   agent_status?: string;
   sessions?: SessionAggregate;
@@ -157,11 +190,14 @@ export type ProjectGit = {
 };
 
 export type RunnerSummary = {
+  computer_session_availability?: boolean;
+  protocol_compatibility?: "compatible" | "incompatible" | "unknown";
+  build_alignment?: "exact" | "different_version" | "different_commit" | "dirty" | "unknown";
   client_id: string;
   connected: boolean;
   status?: string;
   transport?: string;
-  agent_protocol_generation?: number;
+  runner_protocol_generation?: number;
   last_seen_age_secs?: number;
   version?: string;
   build_git_commit?: string;
@@ -178,6 +214,12 @@ export type RunnerSummary = {
 };
 
 export type RuntimeOverview = {
+  detail_level?: "primary" | "full";
+  effective_config?: {
+    auth: Record<string, boolean>;
+    mcp_host: { profile: string; host_budget_secs: number; initial_job_handoff_secs: number; max_sync_wait_secs: number; continuation_wait_secs: number };
+    tool_request_trace_mode: string;
+  };
   service?: string;
   version?: string;
   build_git_commit?: string;
@@ -189,6 +231,7 @@ export type RuntimeOverview = {
   source_mismatched_runners: number;
   mixed_builds_present: boolean;
   active_jobs: number;
+  active_windows: number;
   projects_available: boolean;
   visible_projects: number;
   projects_truncated: boolean;
@@ -213,8 +256,12 @@ export type WindowSummary = {
   last_project?: string;
   source: string;
   last_seen_at_ms: number;
+  first_seen_at_ms?: number;
   last_tool_call_at_ms?: number;
   last_meaningful_activity_at_ms?: number;
+  last_activity_name?: string;
+  last_activity_status?: string;
+  last_activity_meaningful?: boolean;
   active_count: number;
   linked_session_count: number;
   recorder_gap_count: number;
@@ -242,6 +289,8 @@ export type WindowActivity = {
   project?: string;
   status: string;
   meaningful: boolean;
+  async_job_id?: string;
+  observed_job_ids?: string[];
   recorder_gap_session_id?: string;
   server_trace_id?: string;
   workflow_sessions: WindowActivitySession[];
@@ -258,10 +307,23 @@ export type WindowLinkedSession = {
   lifecycle?: string;
 };
 
+export type WindowJob = {
+  job_id: string;
+  status: string;
+  active: boolean;
+  terminal: boolean;
+  started_at?: number;
+  ended_at?: number;
+  duration_ms?: number;
+  elapsed_secs?: number;
+};
+
 export type WindowDetail = {
   client_window_key: string;
+  detail_level?: "primary" | "full";
   source: string;
   last_seen_at_ms: number;
+  first_seen_at_ms?: number;
   last_tool_call_at_ms?: number;
   last_meaningful_activity_at_ms?: number;
   active_count: number;
@@ -279,6 +341,8 @@ export type WindowDetail = {
   activity: WindowActivity[];
   activity_returned: number;
   activity_truncated: boolean;
+  jobs?: WindowJob[];
+  jobs_truncated?: boolean;
   visibility: { scope: "global" | "principal" };
 };
 

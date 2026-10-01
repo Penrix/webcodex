@@ -275,7 +275,7 @@ fn non_git_show_changes_payload_with_observation(
         "git_error": "not a git repository; git-backed diff unavailable",
         "branch": null,
         "upstream_status": "unobserved",
-        "upstream_reason_code": "git_unavailable",
+        "upstream_reason_code": "non_git_project",
         "upstream": null,
         "ahead": null,
         "behind": null,
@@ -316,7 +316,7 @@ fn non_git_show_changes_payload_with_observation(
         "head_exit": null,
         "warnings": [],
         "suggested_next_actions": [
-            "git-backed status/diff unavailable; project is not a git repository",
+            "git-backed status/diff is not applicable; project is not a git repository",
         ],
         "session": null,
         "exit_code": observation.exit_code,
@@ -1464,7 +1464,12 @@ pub(crate) fn parse_show_changes_output_with_observation(
         }
     }
 
-    let suggested_next_actions = if status_observed {
+    let suggested_next_actions = if observation.non_git() {
+        vec![
+            "git-backed status/diff is not applicable; continue with non-git review evidence"
+                .to_string(),
+        ]
+    } else if status_observed {
         suggested_next_actions_for(
             clean.unwrap_or(false),
             untracked > 0,
@@ -1658,33 +1663,18 @@ fn untracked_preview_path_is_invalid(path: &str) -> bool {
 }
 
 fn untracked_preview_path_is_sensitive(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .any(|part| {
-            matches!(
-                part,
-                ".git"
-                    | "target"
-                    | "node_modules"
-                    | "project-registry"
-                    | "projects.d"
-                    | "runner.toml"
-                    | "agent.toml"
-                    | "webcodex.env"
-                    | ".env"
-                    | "secrets"
-                    | "tokens"
-                    | "id_rsa"
-                    | "id_ed25519"
-            ) || part.starts_with(".env")
-                || part.starts_with("runner.toml")
-                || part.starts_with("agent.toml")
-                || part.starts_with("webcodex.env")
-                || part.ends_with(".pem")
-                || part.ends_with(".key")
-        })
+    webcodex_core::sensitive_paths::is_secret_path(path)
+        || path
+            .replace('\\', "/")
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .map(str::to_ascii_lowercase)
+            .any(|part| {
+                matches!(
+                    part.as_str(),
+                    "target" | "node_modules" | "id_rsa" | "id_ed25519"
+                )
+            })
 }
 
 fn untracked_preview_from_bytes(
@@ -2074,11 +2064,17 @@ fn set_show_changes_verdict(output: &mut Value) {
         }
         _ => {}
     }
-    if !git_available || non_git_project {
+    if non_git_project {
+        push_unique_reason(&mut warning_reasons, "non_git_project");
+        push_unique_action(
+            &mut actions,
+            "git-backed status/diff is not applicable; continue with non-git review evidence",
+        );
+    } else if !git_available {
         push_unique_reason(&mut warning_reasons, "git_unavailable");
         push_unique_action(
             &mut actions,
-            "git-backed status/diff unavailable; continue with non-git review evidence",
+            "git-backed status/diff unavailable; inspect Git availability before relying on worktree review",
         );
     }
 
@@ -2143,9 +2139,7 @@ fn set_show_changes_verdict(output: &mut Value) {
         let page_truncated = diff_truncation_reasons
             .iter()
             .any(|reason| matches!(*reason, "diff_hunk_count_limit" | "diff_byte_budget"));
-        let hunk_line_truncated = diff_truncation_reasons
-            .iter()
-            .any(|reason| *reason == "diff_hunk_line_limit");
+        let hunk_line_truncated = diff_truncation_reasons.contains(&"diff_hunk_line_limit");
         // show_changes currently reports line truncation at the aggregate diff
         // level, not as authoritative per-hunk provenance. Keep whole-worktree
         // scope rather than guessing which returned path owns the omitted lines.
@@ -2159,7 +2153,7 @@ fn set_show_changes_verdict(output: &mut Value) {
             .get("project")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let canonical_recovery_call = SuggestedToolCall::new(
+        let canonical_recovery_call = SuggestedToolCall::mechanically_followable(
             "git_diff_hunks",
             json!({
                 "project": project,
@@ -2437,6 +2431,7 @@ impl ToolRuntime {
             .runner_registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id,
                     cwd: Some(proj.path.clone()),
                     command: "git status --porcelain".to_string(),
@@ -2489,9 +2484,9 @@ impl ToolRuntime {
         .await
     }
 
-    /// Presentation must not execute repository-configured filters or hooks.
-    /// Reuse the ordinary bounded producer/parser without recording a Session.
-    pub(in crate::tool_runtime) async fn show_changes_for_presentation(
+    /// Passive card refresh is metadata-only; file content is explicitly lazy.
+    /// Keep the shared safe configuration and do not record a Session.
+    pub(in crate::tool_runtime) async fn workspace_metadata_for_presentation(
         &self,
         project: String,
     ) -> ToolResult {
@@ -2534,7 +2529,11 @@ GIT_OPTIONAL_LOCKS=0; export GIT_OPTIONAL_LOCKS
 git() {{
   if [ "$1" = diff ]; then
     shift
-    command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false diff --no-ext-diff --no-textconv "$@"
+    diff_base=HEAD
+    if ! command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false rev-parse --verify HEAD >/dev/null 2>&1; then
+      diff_base=$(printf '' | command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false hash-object -t tree --stdin)
+    fi
+    command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false diff --no-ext-diff --no-textconv "$diff_base" "$@"
   else
     command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false "$@"
   fi

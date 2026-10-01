@@ -1,431 +1,295 @@
-# Penrix fork direction — Web Chat、本地执行与跨窗口连续性
+# Penrix fork direction — current boundary after upstream 0.4.4
 
-> 状态：fork-local design context / Working direction
+> Status: fork-local Working direction
 >
-> 记录时间：2026-09-20
+> Current review date: 2026-10-01
 >
-> 这不是上游 WebCodex 的新公共产品定义，也不覆盖现有 canonical contract。它保存 Penrix/webcodex 当前 fork 为什么存在、这几轮已经确认的事实、真正要解决的问题，以及后续实现不能轻易丢掉的判断。
+> Upstream source baseline reviewed here: `yyjeqhc/webcodex@d11cdd226abd1efdb0351d4b58d502acb8f41f6e` (0.4.4 release-preparation head).
 >
-> 如果本文对“现有 WebCodex 已经怎样工作”的描述与当前代码、AGENTS.md 或其指向的 canonical docs 冲突，以当前代码和权威文档为事实来源，本文应被修正。对 fork 的目标、验收条件和取舍，则以这里记录的当前明确判断为工作方向，直到新的实证推翻它。
+> Historical origin: the 2026-09-20 fork direction remains preserved on branch
+> `penrix/archive-pre-0.4.4-2026-10-01` and in commit
+> `f62dd0c0113aa039204152ad559b6300e79604a7`. This document supersedes that
+> historical Working where newer upstream Reality has already answered the old gap.
+
+This document records why `Penrix/webcodex` still exists after re-evaluating the
+fork against current upstream. It is deliberately narrow. Upstream WebCodex is the
+authoritative owner of its canonical runtime domains; this fork should add only
+Penrix-specific behavior that current upstream does not already own.
+
+## 1. Current mother problem
+
+The product goal is still:
+
+> Let a high-quality ChatGPT Web conversation use the user's real Windows
+> development environment, while making ongoing work durable enough that losing one
+> model turn or browser conversation does not mean losing the work itself.
+
+There are two distinct continuity problems:
+
+1. **work/runtime continuity** — files, Git state, Sessions, Goals, Jobs, validation,
+   execution receipts, handoff and recovery;
+2. **conversation cognition continuity** — user corrections, rejected directions,
+   Why, evolving Working judgments, current salience and reasoning that may never
+   have been written into repository/runtime state.
+
+Current upstream has advanced substantially on the first problem. The fork must not
+rebuild it.
+
+## 2. What upstream now owns
+
+As of the reviewed 0.4.4 source baseline, upstream already provides or is actively
+defining the canonical domains we need for durable coding work:
+
+- Workflow Session identity, handoff, explicit discovery and recovery;
+- durable Session refs and selector contracts;
+- saved decisions/recent progress in bounded handoff context;
+- Goal correlation, checkpoint/progress and Goal context on Session recovery;
+- durable Jobs, exact continuation/reconciliation, liveness heartbeats and
+  meaningful-change waits;
+- bounded interactive Job stdin through `run_process(interactive=true)` and
+  `job_write_input`;
+- Durable Agent / Conversation / Wake / AgentTask foundations;
+- external-participant continuity for local Codex, including bounded external
+  observations, handoff composition, selected-Session recovery and Windows adapter
+  support;
+- model-API delegation from saved Session context through the existing ACP run
+  lifecycle;
+- Windows Desktop / Server / Runner as an actively maintained target.
+
+The user-facing upstream continuity guide is
+[`docs/SESSION_CONTINUITY.md`](../SESSION_CONTINUITY.md). Relevant internal
+contracts remain the authoritative source for exact semantics:
+
+- [Workflow Session model](session-model.md)
+- [Durable Agent runtime](../architecture/durable-agent-runtime.md)
+- [Job reliability and Runner concurrency](job-reliability-and-concurrency.md)
+
+Fork code must compose with these domains instead of creating parallel Session,
+Goal, Job, Agent, task, retry or recovery truth.
+
+## 3. What changed from the 2026-09-20 Working
+
+The original fork direction correctly identified WebCodex as the local execution
+and durable-state substrate, but several items that were then open are no longer
+fork gaps.
+
+In particular, the fork should **not** independently build:
+
+- a second Session recovery system;
+- a second Goal/checkpoint system;
+- a second long-running Job lifecycle;
+- a special Codex handoff store;
+- a fork-owned generic model gateway merely because model delegation is useful;
+- Windows continuity plumbing already present upstream.
+
+Upstream issue
+[`#784`](https://github.com/yyjeqhc/webcodex/issues/784) now explicitly studies
+cross-ChatGPT-account/model context loss and references `codex-chatgpt-web` as a
+useful model-backend precedent. Upstream PR
+[`#800`](https://github.com/yyjeqhc/webcodex/pull/800) already added explicit
+Session discovery/recovery plus saved-context model delegation.
 
----
+Therefore the fork boundary has become thinner.
 
-## 1. 真正的母问题不是“有没有 MCP”
+## 4. Fork-owned gap A: ChatGPT Web Provider
+
+The main missing execution entry remains a provider for the user's already logged-in
+ChatGPT Web experience.
+
+Desired boundary:
+
+```text
+ChatGPT Web
+    |
+    v
+Penrix Web Provider
+    |
+    v
+WebCodex canonical runtime
+    |
+    v
+Server / Runner
+    |
+    v
+Windows
+```
 
-当前 fork 的第一目标不是做一个更强的 MCP Server，也不是把 WebCodex 已有能力重新实现一遍。
+The provider must be thin, replaceable and Host-specific. ChatGPT Web DOM/session
+behavior must not leak into core ToolRuntime, Goal, Session, Job or Runner
+semantics.
 
-真正的问题有两段。
+### 4.1 Reuse prior working evidence, not the old runtime
 
-第一段：高质量云端模型 / ChatGPT Web 很擅长理解、判断和规划，但它缺少稳定的本地身体。我们真正需要的是让它可靠地进入 Windows、本地仓库、Git、Shell、程序与桌面，而不是让用户长期做人肉中转站。
+`codex-chatgpt-web` / `dsh-chatgpt-web` already contain valuable evidence about:
 
-第二段更贵：即使模型已经有本地工具，一次长任务仍可能在理解项目、排除错误方向、修改部分现实以后，因为 conversation / context 用尽或窗口消失而中断。新窗口通常还能看到代码，却丢掉了大量真正昂贵的工作认知：
+- reusing an authenticated ChatGPT Web session;
+- submitting one prompt reliably;
+- detecting whether Send actually happened;
+- binding one returned reply to the correct request/turn;
+- waiting for completion without mistaking intermediate DOM state for success;
+- browser recovery and bounded timeout/retry behavior;
+- preserving effect uncertainty instead of blindly sending the same prompt twice.
 
-- 为什么现在这样改；
-- 哪些方向刚刚被证伪或明确否决；
-- 用户刚刚纠正了模型什么；
-- 当前 Working 是什么；
-- 当前最显著的问题和执行前沿在哪里；
-- 下一步为什么是这一刀而不是另一刀；
-- 哪些 effect 可能已经发生，不能盲目重试。
+Those projects are Provider behavior/code evidence. They are **not** the new
+canonical Files/Git/Shell/Job runtime.
 
-所以本 fork 的母问题更准确地说是：
+The first implementation should extract only the smallest Provider seam needed to
+enter current WebCodex.
 
-> 让高质量 Web 模型拥有可靠的本地执行能力，并让“正在进行的工作”不再等同于某一个浏览器窗口或某一次模型上下文。
+## 5. Fork-owned gap B: Conversation DVR
 
----
+Upstream durable work state does not equal a full ChatGPT conversation archive.
 
-## 2. 上游已经解决了很大一部分“身体”和“执行连续性”
+The fork may still need an append-only, provenance-first Conversation DVR for facts
+such as:
 
-这些不是 fork 新造的概念，应优先复用。
+- an explicit user correction that never changed a file;
+- a rejected technical/product direction and the reason it was rejected;
+- an evolving Working judgment;
+- current salience or an unfinished reasoning frontier;
+- the history of how a current rule replaced an older rule.
 
-### 2.1 MCP 是入口之一，不是 runtime 本体
+The DVR is raw evidence, not a replacement for current runtime truth.
 
-当前架构已经明确：MCP、GPT Actions / OpenAPI、REST、CLI、Console 最终进入同一个 canonical ToolRuntime，再由 Server / Runner 落到本地 Project。
+```text
+current files / Git / Job / validation -> canonical WebCodex runtime
+explicit durable work context           -> Session / Goal / Memory as appropriate
+raw conversation history                -> DVR
+retrieval index                         -> locator only
+```
 
-因此，本 fork 不应该把“当前 ChatGPT Host 或套餐是否开放自定义 MCP”当成架构级前提。外部 Host 能力会变化。只要我们自己的 Web Provider 能安全地进入 WebCodex 已有 HTTP/runtime authority path，就没有理由再复制一套 Files / Git / Shell / Job / validation / authority runtime。
+A retrieval result must not silently outrank later corrections or current runtime
+facts.
 
-### 2.2 Server / Runner 已经是合适的本地执行边界
+## 6. Fork-owned gap C: conversation-to-durable-state bridge
 
-上游已经拥有 Project 注册与 allowed roots、文件读写、Git、Shell / process、validation、Job、LSP / navigation、Computer Use、Browser、Native Tool Plugins、local MCP gateway 等能力。
+The valuable missing layer is not "store every sentence as Memory".
 
-所以 fork 不应默认继续自造一套“本地执行器”。
+We need experiments that determine which conversation facts must become explicit
+durable state so a new conversation can continue correctly.
 
-### 2.3 不同持久对象解决的是不同问题
+Candidates include:
 
-上游已经刻意把以下对象分开：
+- user-authoritative corrections;
+- rejected routes;
+- decision/Why notes;
+- current Working;
+- recovery-worthy checkpoint context.
 
-- Goal：高层、持久的最终意图、计划与进度。
-- Workflow Session：一次具体编码/执行工作的证据、验证、handoff 与恢复上下文。
-- Job：真正的长时间命令或验证执行。
-- Durable Agent：跨浏览器窗口、Host connection、model turn 仍然存在的行动/通信身份。
-- Agent Task / TaskAttempt：明确接受的异步工作与精确执行所有权。
-- CodingAgentRun：通过 ACP 委派给 Codex 等本地 coding agent 的独立执行对象。
+Do not pre-commit to embeddings, vector DBs or a generic memory framework. First
+measure what exact information is missing after current upstream Session/Goal
+recovery.
 
-不能因为它们都和“连续性”有关，就合并成一个新的 fork 概念。
+## 7. First acceptance sequence
 
-尤其要继续遵守：
+### Stage A — Web Provider to canonical runtime
 
-- 模型进程不是 Agent；
-- 浏览器窗口不是 Agent；
-- Goal 不能从当前 Project、Window、credential 或 Session 猜出来；
-- Workflow Session 不是 Conversation、Agent Task 或 Job；
-- Job terminal 不自动等于 Goal 完成；
-- Agent identity / Goal correlation 不自动获得 Project、文件系统或执行权限；
-- 一个消失的 model turn 不证明上一轮 effect 没发生。
+Prove one real Windows loop:
 
-### 2.4 上游已经有跨 turn / 跨窗口恢复骨架
+```text
+ChatGPT Web
+-> Provider
+-> WebCodex
+-> read
+-> edit
+-> run / validate
+-> observe the exact Job
+-> return the result to the same ChatGPT Web request
+```
 
-当前 Goal / Session 设计已经形成了清楚的恢复关系：
+No DSH dependency is required for this acceptance. No local Codex quota is required
+for the canonical path. Local Codex/ACP may remain an optional worker.
 
-    最新 durable Goal / checkpoint
-              +
-    明确关联的 Workflow Session
-              +
-    session_handoff_summary
-              +
-    当前 Job / Project 真实状态
-              ↓
-    新 model turn 重新推理并继续
+### Stage B — cross-conversation runtime recovery
 
-关键不是把旧窗口完整搬进新窗口，而是把继续工作真正需要的 durable state 从临时 model context 中剥离出来。
+Run a real multi-step task that creates durable Session/Goal/Job evidence, then kill
+the original ChatGPT conversation.
 
-这应该成为 fork 的起点，而不是再设计一套平行“连续性引擎”。
+A new conversation should be able to explicitly discover and resume the exact work,
+recover current Project/Git/Job truth and continue after a small user action such as
+"continue".
 
----
+The first acceptance does **not** require fully unattended automatic creation of a
+fresh ChatGPT model turn. Upstream has had real Host-auto-resume failures in
+dogfood; manual re-entry and correct durable recovery are a separate, earlier
+product milestone.
 
-## 3. Project Memory 已经存在，但它不是 ChatGPT Library，也不是聊天录像
+### Stage C — measure the cognition gap
 
-这几轮讨论中需要明确纠正一个早先判断：WebCodex 已经有 Project Memory。
+Only after Stage B, record what could not be reconstructed from current upstream
+state.
 
-它是与 Workflow Session 分开的持久知识面，有独立权限，也支持 memory.bootstrap。但当前 contract 同时明确了几个决定性的边界：
+Those observed failures define the minimum DVR projection/retrieval work.
 
-1. memory_search 当前是 bounded deterministic literal matching，不是向量语义搜索。
-2. Session event 不会自动创建或“总结成” Memory。
-3. Memory body、summary、search result、bootstrap projection 不会自动复制进 Session handoff。
-4. Project Memory 是显式 durable knowledge / guidance，不是原始 conversation archive。
-5. 当前 durable-agent 文档仍把 Agent-scoped Memory 留在未来边界。
+## 8. Windows reality
 
-因此：
+Windows is now a first-class upstream target, but current field evidence still
+matters.
 
-    Project Memory
-    ≠ Workflow Session recovery
-    ≠ Goal checkpoint
-    ≠ Conversation transcript
-    ≠ semantic retrieval index
+At review time:
 
-这是 fork 后续不能再混掉的边界。
+- official v0.4.3 Windows artifacts have an open Defender report
+  [#780](https://github.com/yyjeqhc/webcodex/issues/780), including a verified
+  byte-identical Runner quarantine report;
+- another reported Windows environment shows `0xC0000022 / STATUS_ACCESS_DENIED`
+  when launching bundled runtime executables;
+- upstream has prepared 0.4.4 source and asked for re-test on the fresh Windows
+  build.
 
----
+Consequences for this fork:
 
-## 4. 连续性至少有两种不同的“真相”
+- use current upstream 0.4.4 source as the engineering baseline;
+- do not claim Windows live acceptance merely from source/CI;
+- do not solve the field reports by disabling Defender or adding broad exclusions;
+- re-check the actual published/current Windows artifact before live acceptance.
 
-只保留 WebCodex runtime 状态还不够；只保存聊天文本也不够。
+## 9. Upstream/fork ownership rule
 
-### 4.1 项目现实 / 执行现实
+Before any material fork-core implementation, ask:
 
-例如：
+1. Does current upstream already own this concern?
+2. Has upstream implemented it since the last fork review?
+3. Can the Penrix need be expressed as Provider/adapter/plugin composition instead?
+4. Is there a demonstrated gap that cannot be represented by existing canonical
+   domains?
 
-- 当前文件内容；
-- Git diff；
-- 已完成的 validation；
-- Job 当前状态；
-- 哪个 effect 已知 completed、not_started 或 outcome_unknown；
-- Goal 当前 revision / step；
-- Workflow Session 当前证据。
+If upstream owns it, follow upstream.
 
-这些事实应继续由 WebCodex canonical runtime / Store / Runner 拥有。
+If the need is ChatGPT-Web-specific, keep it outside canonical core where practical.
 
-### 4.2 对话中形成的认知历史
+If a true core gap is demonstrated and is generally useful, prefer an upstreamable
+change rather than permanent fork divergence.
 
-例如：
+## 10. Sync policy
 
-- 用户明确否定了哪个方案；
-- 为什么某条路技术上可行但不符合真实目标；
-- 一个概念怎样从第一版被修正成当前 Working；
-- 当前哪一个问题最显著；
-- 哪些未完成推理还没有落到代码里；
-- 为什么“下一步”是这一刀而不是另一刀。
+The fork should stay close to upstream and keep fork-local surface small.
 
-这些事实可能还没有改变仓库现实，因此不能指望 Git diff、Job 或 Session 自动重建。
+Current fork-local durable assets are intentionally limited to:
 
-这就是 Conversation DVR / 原始对话证据仍然有独立价值的原因。
+- this direction document and its repository pointers;
+- `PENRIX-CODING.md` as the local coding/reality overlay;
+- future ChatGPT Web Provider / DVR adapter code that cannot live upstream unchanged.
 
----
+Historical fork reasoning is preserved by Git history/archival branch rather than by
+keeping stale architecture active in current docs.
 
-## 5. DVR 的地位：原始证据，不是另一个 Memory
+## 11. Current unknowns
 
-当前 Working 决定是：
+Still OPEN and requiring implementation evidence:
 
-> 完整原始 Conversation DVR 如果实现，应作为 append-only、provenance-first 的原始证据源。
+- the thinnest stable Provider boundary against current ChatGPT Web;
+- which exact code from prior Web bridges should be reused versus rewritten;
+- authentication/session-state ownership for the Provider;
+- how Provider request identity maps to WebCodex Window/Session without inventing
+  authority;
+- the minimum conversation facts missing after upstream 0.4.4 Session/Goal recovery;
+- whether DVR retrieval needs lexical, semantic, temporal/graph or hybrid indexing;
+- the correct Desktop/user workflow after the Provider exists;
+- whether upstream #784 will absorb part or all of the generic model-provider layer.
 
-它不应该被摘要取代，也不应该让某个模型生成的 Memory 反过来覆盖它。
+## 12. Current one-line direction
 
-关系应更接近：
-
-    完整 Conversation DVR
-        ├─ 可以产生或更新显式 Project Memory
-        ├─ 可以产生 handoff / recovery 辅助材料
-        └─ 可以建立 retrieval index
-                         ↓
-                    找到原始证据
-
-其中：
-
-- DVR 保存“过去实际说过、改过、否定过什么”；
-- Project Memory 保存“以后仍值得明确提醒模型的 durable knowledge”；
-- Workflow Session 保存“这次执行发生了什么”；
-- Goal 保存“当前高层意图与进度”；
-- retrieval index 只负责“去哪里看”。
-
-索引不能成为历史真相。
-
-如果检索命中一段旧判断，而后面的 conversation 已经把它否掉，系统必须能回到原始时间关系和后续修正，而不是把最相似的 chunk 当成当前真相。
-
-### 5.1 恢复还必须保留“谁覆盖谁”和当前显著性
-
-重新回听这几轮以后，一个不能只留在对话里的约束是：恢复不是把历史平均压缩成一段摘要。
-
-同一个问题可能先有 A，后来被用户明确纠正成 B，再后来 B 仍只是 Working。新窗口如果只搜到 A，即使语义相似度极高，也是在恢复错误的历史位置。
-
-所以后续 DVR / retrieval 至少要能表达或重建：
-
-- 时间先后：哪个判断更晚；
-- 修正关系：哪个判断明确否定、替代或收紧了哪个旧判断；
-- 来源权限：用户明确裁决、模型推断、Working、运行时事实不能被当成同一种证据；
-- 当前显著性：现在真正卡在哪里、哪一处还没闭合、下一步为什么从这里继续；
-- 未决状态：不知道的东西允许仍然不知道，不能为了恢复“完整”而自动补齐。
-
-这里不存在一个跨所有领域的简单总排名。文件、Git、Job 等执行事实应回到当前 authoritative runtime；用户目标、约束和明确纠正则不能被旧 Memory、旧摘要或相似 chunk 静默覆盖。
-
-一个实用原则是：
-
-> 原始证据保留历史；后来的明确修正建立 supersession / current-state 关系，而不是回头改写旧证据。
-
-因此，未来 retrieval 如果只返回“最像的片段”，还不够。它至少需要让恢复过程有机会检查该片段之后是否出现了相关纠正、否定或状态迁移。
-
----
-
-## 6. 因此“语义检索”不是第一步
-
-很容易先想到：全部聊天 → embedding → vector DB → 新窗口语义搜索。
-
-现在这条路线只能算候选 Working，不是默认答案。
-
-原因不是向量搜索没用，而是：在事实来源、时间关系、修正关系、当前状态和恢复验收尚未定义清楚时，单纯提高相似度召回不会自动得到正确连续性。
-
-应该先证明：
-
-    旧 conversation 死亡
-        ↓
-    新 conversation
-        ↓
-    只靠 durable work state / explicit recovery
-        ↓
-    能不能真正继续同一个任务
-
-这个实验完成以后，再看它具体缺了哪些“只存在于对话认知里”的信息。那些真实缺口才决定 DVR / retrieval 应该保存和检索什么。
-
----
-
-## 7. ChatGPT Web Provider 应该很薄，而且可以被替换
-
-本 fork 仍然需要一个上游 WebCodex 没解决的特殊入口：如何进入用户已经登录、正在使用的 ChatGPT Web 会话。
-
-这一层不能和整个本地 runtime 绑死。更合理的边界是：
-
-    ChatGPT Web / 其他 Web Host
-                ↓
-           Web Provider
-          （薄、脆、可替换）
-                ↓
-          Penrix WebCodex
-        ├─ canonical ToolRuntime
-        ├─ Goal / Session / Job
-        ├─ Durable Agent
-        ├─ ACP CodingAgentRun
-        └─ Runner / Windows
-
-因此以前的 codex-chatgpt-web 更适合作为 ChatGPT Web Provider 行为与经验来源，而不是另一套继续平行生长的完整 runtime。
-
-当前不应粗暴合仓。先提炼 Provider 边界，再决定代码迁移。
-
----
-
-## 8. WebCodex Browser 不能替代 Web Provider
-
-当前 Browser/CDP runtime 明确使用 WebCodex 自己创建的临时 profile，不附着用户正常 Chrome / Edge profile，也不继承用户已经登录的 ChatGPT session；Phase 1 也不提供真实 profile attachment、扩展、password manager 等。
-
-因此：
-
-    WebCodex Browser
-    ≠ 用户当前已登录的 ChatGPT Web Tab
-
-Browser 对普通网页自动化有价值，但不能被当成“已经不需要 ChatGPT Web Provider”的理由。
-
----
-
-## 9. ACP 的正确位置：把工具噪声从高价值 Web 对话里移出去
-
-上游已经有独立 CodingAgentRun，并真实 dogfood 过 Codex ACP。
-
-本 fork 更看重的使用方式是：
-
-    ChatGPT Web / 高质量模型
-    负责理解用户、判断目标、决策、选择下一步、检查结果
-                ↓ 委派
-    本地 Codex / ACP agent
-    负责大量代码搜索、修改、命令、测试、多轮工具交互
-                ↓
-    只返回结构化结果 / diff / evidence
-
-这不能扩大 model context window。
-
-但它能把大量本来不应该污染主 conversation 的工具轨迹移出去，从而延长高价值上下文的有效寿命。
-
----
-
-## 10. 第一阶段真正的验收：杀掉旧窗口以后还能继续真实任务
-
-在实现语义检索、复杂 DVR UI 或大规模 fork 改造之前，先做一个最小而残酷的实验。
-
-### 10.1 准备真实多步任务
-
-任务至少应产生：
-
-- 一个明确 Goal；
-- 一个关联的 Workflow Session；
-- 至少一次真实文件修改；
-- 至少一次验证或 Job；
-- 一个明确被否掉的方案；
-- 一个用户/模型形成的关键 Working；
-- 一个 recovery-worthy checkpoint；
-- 一个尚未完成的下一步。
-
-### 10.2 强制杀掉原 conversation
-
-不能让新窗口直接得到完整旧 transcript，也不能偷偷依赖旧窗口仍然活着。
-
-### 10.3 新 conversation 恢复
-
-新模型只允许通过 fork 当前设计的正式恢复面重新进入：
-
-- exact Goal；
-- checkpoint / plan；
-- exact Session handoff；
-- 当前 Project / Git / Job truth；
-- 以后加入的显式 Memory / DVR retrieval（如果实验阶段已经存在）。
-
-### 10.4 通过标准
-
-新窗口应该能在很少的恢复动作后回答并继续：
-
-1. 我们最终要完成什么？
-2. 为什么当前方案是这样，而不是最明显的替代方案？
-3. 已经真实改了什么？
-4. 哪些方向已经被否掉，为什么？
-5. 当前 Project / Job / validation 到什么状态？
-6. 当前执行前沿在哪里？
-7. 下一步具体是什么？
-8. 然后真正继续修改并完成任务。
-
-### 10.5 不算通过
-
-- 只是生成一段看起来像样的摘要；
-- 重新从头阅读整个仓库才逐渐猜回状态；
-- 再次进入刚刚已否决的路线；
-- 必须把完整旧 transcript 整段重新注入才能继续；
-- 把消失的上一轮 effect 当成“肯定没发生”而盲目重试；
-- 只能在 CLI 演示成功，但不能走向用户真正日常使用的 Web / Desktop 工作方式。
-
-这个实验比“有没有一个 Memory 功能”更能证明连续性是否真的成立。
-
----
-
-## 11. 当前事实关系
-
-不要再造一个抽象总节点把一切叫“Memory”。
-
-更准确的关系是：
-
-- Durable Goal：最终意图与高层进度。
-- Project truth：files / Git 等当前现实。
-- Workflow Session：执行证据、验证、handoff、恢复。
-- Job / CodingAgentRun：具体执行。
-- Durable Agent / Conversation：谁在行动、谁在通信、跨窗口身份。
-- Project Memory：显式 durable knowledge / guidance。
-- Conversation DVR：完整原始对话与认知演变证据。
-- Retrieval index：找到相关证据的位置，不拥有事实。
-
-这些对象可以互相引用，但不要因为“恢复时都要用到”就取消各自边界。
-
----
-
-## 12. fork 的实施顺序
-
-### A. 先证明 Web Provider → canonical runtime
-
-不要先重写 Runner。
-
-先确认自己的 Web Provider 能否稳定、安全地走 WebCodex 已有 REST/runtime authority path，完成一个完整本地闭环：
-
-    read
-    → edit
-    → run / validate
-    → observe exact Job
-    → show changes
-    → finish / handoff
-
-### B. 再证明跨 conversation 的 runtime continuity
-
-先用已有 Goal / Session / Job / Durable Agent 能力跑第 10 节实验。
-
-### C. 再用真实失败决定 DVR 缺口
-
-记录新窗口恢复失败时究竟缺什么：用户裁决、已否决路线、Why、当前 Working、长期项目认知，还是其实只是 Session / Goal 没正确 checkpoint。
-
-不要提前用一个“长期记忆系统”解释所有缺口。
-
-### D. 最后才选择 retrieval 方案
-
-语义向量、全文字面、时间邻近、conversation graph、混合搜索都只是候选手段。
-
-应使用真实恢复 query 做对照测试，而不是因为“向量数据库通常这么做”就先固定架构。
-
----
-
-## 13. fork / upstream 边界
-
-为了未来继续跟上上游：
-
-1. 优先复用上游 canonical domain。已经能由 Goal / Session / Agent / Job / Memory / ACP 表达的事实，不再造平行实体。
-2. 特殊需求尽量放在 adapter / provider / plugin / fork-local docs，不因 ChatGPT Web 的脆弱细节污染 ToolRuntime 核心。
-3. 核心改动必须有真实缺口。先用上游现有能力跑实验；只有当实验能证明某个事实无处表达时，才扩 core。
-4. 不为了兼容旧项目而保留两套 runtime。旧项目中真正有价格的是 ChatGPT Web Provider 经验，不是它重复实现的通用本地能力。
-5. 上游事实持续变化时先更新认知。本 fork 是 2026-09-20 从当时 main 分出的；上游仍高速演进。以后同步前应先检查是否已经原生解决我们准备自建的能力。
-
----
-
-## 14. 当前 Working / 未知
-
-下面这些还没有被实证，不应写成“已经解决”：
-
-- ChatGPT Web Provider 到当前 REST/runtime 的最佳认证与 transport 形状；
-- Web Provider 在 ChatGPT 页面变动后的稳定抽象边界；
-- 哪些对话认知必须自动进入 durable state，哪些只应该留在 DVR；
-- DVR 的最小原始数据模型；
-- 怎样做到足够准确的长期语义检索，以及是否需要 embeddings；
-- 新窗口恢复时最小必要上下文是多少；
-- Desktop 最终怎样把这套能力变成普通用户可持续使用的工作流；
-- ChatGPT Host 能力变化以后，哪些原生入口可以替代自建 Provider。
-
-这些应该通过实验收紧，而不是为了“体系完整”提前补齐。
-
----
-
-## 15. 当前一句话方向
-
-> 不要重新造一个本地 Codex。把 WebCodex 当成模型与 Windows 之间已经成熟的执行 / 持久状态底座；fork 真正新增的价值，是把现有 ChatGPT Web 入口接进来，并证明工作认知能够跨 conversation 继续，而不是跟某个窗口一起死亡。
-
-后续任何大改动，都应该先回答：
-
-> 它是在推进这个问题，还是只是在 WebCodex 里增加一个本来就不缺的新功能？
+> Follow upstream for runtime continuity. Keep the Penrix fork thin: connect the
+> already-logged-in ChatGPT Web experience to canonical WebCodex, then add only the
+> raw conversation evidence/recovery bridge that real cross-conversation tests prove
+> upstream cannot reconstruct.

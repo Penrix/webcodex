@@ -2,26 +2,31 @@
 
 [English](DEPLOYMENT.md) | [简体中文](DEPLOYMENT.zh-CN.md)
 
-本文档只面向**生产与高级自托管**：长期 Server、多机器/多用户、systemd/Docker、反向代理和 operator 管理的网络配置。普通 Windows / macOS 工作站**不要从这里开始**；最推荐的路径是 [WebCodex Desktop + 官方 OpenAI Secure Tunnel](desktop-install.zh-CN.md)。CLI 或已有 Server 再看[完整使用指南](PERSONAL_SETUP.zh-CN.md)；如果只想几分钟临时体验一个仓库，再看[快速试用](QUICK_START.zh-CN.md)。
+本文档只面向**生产与高级自托管**：长期 Server、多机器/多用户、systemd/Docker、反向代理和 operator 管理的网络配置。个人和多机配置请先看[统一安装指南](unified-installation.zh-CN.md)及其发布/验收状态。已发布 Desktop 包仍可按[旧版安装指南](desktop-install.zh-CN.md)使用；高级 CLI 流程保留在[完整使用指南](PERSONAL_SETUP.zh-CN.md)；如果只想几分钟临时体验一个仓库，再看[快速试用](QUICK_START.zh-CN.md)。
+
+## 统一安装状态
+
+个人或多机安装请先看[统一安装指南](unified-installation.zh-CN.md)。其中面向 Windows NSIS、macOS 安装包和 Debian 12 / Ubuntu 22.04+ `.deb` 的 x64、arm64 安装目标已在构建流程中定义；六类安装文件尚未完成原生构建与安装验收，也未作为统一安装包发布。三种平台的真实机器安装、重启持久性、GUI 行为和升级尚未全部验收，详见[部署验收清单](unified-deployment-validation.md)。
+
+下文的 npm/runtime 压缩包、Docker 和平台专属操作流程作为高级兼容与历史运维参考保留，不改变统一安装流程。
 
 ## 组件
 
 - `webcodex` —— 统一 CLI：项目工作流、Server/Runner 生命周期、接入与运维。
-- `webcodex-server` —— Server 进程：暴露 REST、GPT Actions OpenAPI、MCP 与
-  Runner endpoint。
+- `webcodex-server` —— Server 进程：暴露 REST、MCP 与 Runner endpoint；legacy GPT Actions OpenAPI 只在 feature-enabled build 中提供。
 - `webcodex-runner` —— 运行在持有仓库机器上的长驻 worker。
 
 执行配置属于实际工作的 Runner。旧 Server 的 `CODEX_*` 设置不再用于选择编码代理的可执行文件、审批模式、超时或参数白名单；编码代理应通过 Runner 的 `[acp]` / `[[acp.agents]]` 配置，参见 [ACP 编码代理指南](agent/acp-coding-agent-run.md)。Server 需要可写的数据目录，不需要单独的旧 `uploads` 目录。
 
 ## 构建与安装
 
-官方分发路径是 npm 薄安装器/包装器：
+已有的 runtime/CLI 发布产物仍可通过 npm 薄安装器/包装器获取：
 
 ```bash
 npm install -g @yyjeqhc/webcodex
 ```
 
-支持 Linux x64、Linux arm64、macOS x64、macOS arm64、Windows x64 与 Windows arm64。Windows 支持 CLI + Runner、显式前台 Server，以及显式本机 `webcodex share --tunnel cloudflare|openai|none`。Windows x64 支持 managed Cloudflare 获取；固定版本 upstream 没有官方 Windows ARM64 artifact，因此 ARM64 使用 Cloudflare 时需要受信任的显式/`PATH` binary。managed OpenAI `tunnel-client` 支持 Windows x64/arm64。WebCodex 仍不支持 Windows Server/Runner service 托管生命周期；Windows 上应显式以前台方式运行。npm 包装器要求 Node.js 18 或更新。Linux x64 native artifact 以 glibc 2.17 或更新为兼容基线。
+支持 Linux x64、Linux arm64、macOS x64、macOS arm64、Windows x64 与 Windows arm64。Windows 支持 CLI + Runner、显式前台 Server，以及显式本机 `webcodex share --tunnel cloudflare|openai|none`。Windows x64 支持 managed Cloudflare 获取；固定版本 upstream 没有官方 Windows ARM64 artifact，因此 ARM64 使用 Cloudflare 时需要受信任的显式/`PATH` binary。managed OpenAI `tunnel-client` 支持 Windows x64/arm64。旧 `server install` / `runner install` 命令不托管 Windows 服务，仍可使用下文前台流程。新的 `environment` 流程实现了 SCM 服务与显式账户要求；参见[统一安装指南](unified-installation.zh-CN.md#服务与凭据)及待完成的原生验收。npm 包装器要求 Node.js 18 或更新。Linux x64 native artifact 以 glibc 2.17 或更新为兼容基线。
 
 从源码构建：
 
@@ -91,8 +96,7 @@ shared-key 自动化场景优先使用 `--key-file <path>`，不要与 `--key` �
 4. 在 server 上创建短期 pairing code，并在持有仓库的机器上运行
    `webcodex login <server-url> --code <code>`。
 5. 在该仓库机器上安装 `webcodex-runner` 服务。
-6. 运行 `webcodex ops status --strict`；之后才导入 GPT Actions schema 或添加
-   MCP connector。
+6. 运行 `webcodex ops status --strict`；之后再添加 MCP connector。只有已有 Custom GPT 仍依赖 legacy Actions adapter 时，才使用 `legacy-gpt-actions` build 并单独导入 schema。
 
 ### Server 设置
 
@@ -148,6 +152,26 @@ WebSocket continuity，也不宣称 literal zero interruption。
 正在运行的 legacy direct-bind `webcodex.service`，第一次迁移属于单独的一次 migration
 boundary：installer 会 fail closed，避免与旧进程争抢地址。先停止 legacy Server，再用
 `--overwrite` 重新安装；这次首次迁移本身不保证无 gap。
+
+### MCP Host timing profile
+
+MCP 调用等待属于 Server 侧的 Host 适配，与 Runner execution timeout 分开配置。普通 MCP Host 使用默认的 `direct` profile，通常无需额外配置：
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=direct
+```
+
+如果外部 Host 自带 native Code Mode/orchestration，并且整个 composition 的 wall-clock budget 约为 55 秒，可配置：
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=host_code_mode
+# 可选：host_code_mode 本身默认就是 55 秒。
+WEBCODEX_MCP_HOST_BUDGET_SECS=55
+```
+
+`WEBCODEX_MCP_HOST_BUDGET_SECS` 表示 Host 侧单次 MCP call / composition 的预算，不是 command runtime。工具的 `timeout_secs` 仍表示真实 execution lifetime，可以远大于 Host budget。WebCodex 不会根据 `clientInfo`、User-Agent 或 Host 产品名自动推断 profile。
+
+`host_code_mode` 表示外部 MCP Host 提供的 orchestration，与 WebCodex experimental internal Code Mode 及其自身 nested-execution 防护不是同一个概念。`runtime_status.effective_config.mcp_host` 报告的是非敏感的**部署默认值**。同服混用时，在每个客户端连接上配置 `X-WebCodex-MCP-Profile`，并可用 `X-WebCodex-MCP-Budget-Secs` 缩短等待预算；不是模型工具参数。详见 [MCP 客户端策略](MCP.zh-CN.md#同一-server-的客户端策略)。省略 header 才使用部署默认值，不按品牌自动识别。
 
 ### Tool invocation trace
 
@@ -269,8 +293,7 @@ bootstrap 现在是可恢复事务，而不是一次性脚本。它会在创建 
 随后通过私有 `.webcodex-bootstrap.receipt` 依次记录 `AssetsPrepared`、
 `SecretCommitted`、`ContainerStarted`、`ServerHealthy`、`PairingReady`。receipt 只保存
 hash 与阶段，不保存 administrator token。`.env` 通过 0600 临时文件写入、sync 后原子 rename。
-只有 Compose healthcheck 与 `/openapi.json` 都验证通过后才打印成功，并在这个 readiness
-barrier 之后创建第一枚短期 pairing code。
+只有 Compose healthcheck 与 `/healthz` readiness 都验证通过后才打印成功，并在这个 readiness barrier 之后创建第一枚短期 pairing code。
 
 安装被中断，或 startup/health check 失败时，不要删除 `.env`；在同一目录继续使用同一份
 bootstrap：
@@ -316,7 +339,7 @@ package 时默认将其设为 private；维护者
 | `transport` | 配置 `[quic]` 时优先用 `auto`。 |
 | `project_registry_dir` | 项目注册文件目录。 |
 | `[policy]` | 本地执行边界（`allowed_roots` 等）。 |
-| `[skills].roots` | 可选的 Runner 本机绝对 live Skill roots；WebCodex 不修改其中内容，受支持脚本可经 `run_skill_resource` 执行，也不会复制进 managed Skill Store。 |
+| `[skills].roots` | **自 v0.4.2 起可用。** 可选的 Runner 本机绝对 live Skill roots；WebCodex 不修改其中内容，受支持脚本可经 `run_skill_resource` 执行，也不会复制进 managed Skill Store。 |
 | `[instructions].files` | 可选 Runner 本机绝对 instruction 文件；应用于该 Runner 上每个 Project。无隐式默认路径；路径列表可 hot reload，文件内容本身 live。 |
 | `[shell]` | 可选 shell profile 定义与有界 persistent-shell 限制。 |
 | `[ssh.resources.<name>]` | 可选命名 SSH 目标，用于 Session 绑定的 `run_shell` / `run_job`。 |
@@ -359,14 +382,20 @@ Plugin discovery 重启 Runner。
 
 ## OAuth2
 
-Server 没有公网 origin 时 OAuth2 仍默认关闭。使用 `webcodex server init --public-url https://your-domain.example` 时，初始化会写入 public URL、以该 URL 作为 issuer 启用 OAuth，并为普通 hosted connect 启用 shared-key OAuth bridge。手工维护 env 时等价配置为：
+Server 没有公网 origin 时 OAuth2 仍默认关闭。使用 `webcodex server init --public-url https://your-domain.example` 时，初始化会写入 public URL，并以该 URL 作为 issuer 启用 OAuth。跨该 public boundary 的 direct shared-key auth 与 shared-key OAuth bridge 默认仍关闭；如需有意启用，必须额外传入 `--allow-remote-shared-key`。
+
+手工维护 env 且有意启用 remote shared-key auth 与 shared-key OAuth bridge 时，配置为：
 
 ```text
 WEBCODEX_PUBLIC_URL=https://your-domain.example
 WEBCODEX_OAUTH2_ENABLED=true
 WEBCODEX_OAUTH2_ISSUER=https://your-domain.example
+WEBCODEX_SHARED_KEY_ENABLED=true
+WEBCODEX_SHARED_KEY_REMOTE_ENABLED=true
 WEBCODEX_OAUTH2_SHARED_KEY_BRIDGE=true
 ```
+
+如果配置了 direct shared-key auth，同时启用的 QUIC Runner listener 绑定到非 loopback 地址，也必须使用同一个 remote opt-in；QUIC 默认监听地址为 `0.0.0.0:8443`。
 
 普通仓库机器不需要 managed login，直接使用 MCP 客户端要求的精确 callback：
 
@@ -399,9 +428,9 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` 限制 OAuth client 最多可以请求哪些权限。WebCodex 新增 permission 时不会静默扩大已有 client。要修改现有 client，请把期望保留的完整、非空 allow-list 提交到 `POST /api/oauth/clients/update_scopes`。真实变化会让旧 OAuth grant 失效并要求重新授权；提交相同 canonical list 是 no-op。安全模型见[认证](AUTH_MODEL.zh-CN.md#oauth2)。
 
-ChatGPT MCP host-file import 采用两级 trust。正常 active authenticated OAuth client 只能从 `files.oaiusercontent.com` 或其子域导入；这些 URL 仍要求 HTTPS、public DNS resolution + address pinning、443 端口、无 userinfo、禁止 redirect，并继续受 bounded download 与 Project write policy 约束。只有当某个 client 还需要从任意 public HTTPS host 导入时，才把其精确 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`，获得同样 SSRF 防护下的 Tier 1 扩展信任。重新创建 client 会生成新 id，但普通 OpenAI-host attachment import 不再因此失效；更新该设置只用于恢复更宽的 Tier 1 trust。Client display name 与 redirect URI 永远不能授予 Tier 1 trust。
+ChatGPT MCP host-file import 采用两级 trust。正常 active authenticated OAuth client 只能从 OpenAI attachment host 导入：`files.oaiusercontent.com` 及其子域，以及严格匹配的 Sediment Azure Blob 账户 `oaisdmntpr<region>.blob.core.windows.net`；这些 URL 仍要求 HTTPS、public DNS resolution + address pinning、443 端口、无 userinfo、禁止 redirect，并继续受 bounded download 与 Project write policy 约束。只有当某个 client 还需要从任意 public HTTPS host 导入时，才把其精确 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`，获得同样 SSRF 防护下的 Tier 1 扩展信任。重新创建 client 会生成新 id，但普通 OpenAI-host attachment import 不再因此失效；更新该设置只用于恢复更宽的 Tier 1 trust。Client display name 与 redirect URI 永远不能授予 Tier 1 trust。
 
-对于绑定到 loopback、并通过 OpenAI Secure Tunnel 以本机注入 user API token 访问的 operator-controlled Server，还有一个独立的 local-only 例外。设置 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` 后，可在该路径上信任 ChatGPT host-file rewrite。非 loopback bind 或非 user API credential 会忽略该 flag；network-accessible Server 应保持未设置。
+对于绑定到 loopback、并通过 OpenAI Secure Tunnel 访问的 operator-controlled Server，还有一个独立的 local-only 例外。设置 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` 后，仅当请求由允许的本地 credential 认证时才信任 ChatGPT host-file rewrite：普通 user API token，或 Desktop regular Tunnel 使用的已配置 Server bootstrap credential。该 Tunnel 从本机 `WEBCODEX_TOKEN` 配置派生 credential 并私下完成注入；不要复制或暴露它。非 loopback bind 和其它 credential class 都会忽略该 flag；network-accessible Server 应保持未设置。
 
 用 `POST /api/oauth/clients/list` 与 `POST /api/oauth/clients/revoke` 列出与
 撤销 client。OAuth 使用 authorization-code 流程；动态 client 注册、OIDC 与
@@ -410,23 +439,20 @@ refresh-token scope，不授予额外 WebCodex 权限。
 
 ## GPT Actions 与 MCP
 
-- **MCP：** 用 user API token（`wc_pat_*`）连接
-  `https://your-domain.example/mcp`；启用 OAuth 时使用 OAuth 流程。MCP 仍是
-  ChatGPT 的主要接入方式。
-- **GPT Actions：** 把 `https://your-domain.example/openapi.json` 以 HTTP Bearer
-  认证导入 Custom GPT。普通 runtime Server 会投影同一个 canonical Adaptive
-  Runtime model surface：当前 Adaptive Direct 工具直接成为 snake_case Action
-  operation，受支持的 long-tail 工具统一通过 `call_runtime_tool`；MCP-only 协议
-  presentation 不会伪装成 Action 能力。
+- **MCP：** 用 user API token（`wc_pat_*`）连接 `https://your-domain.example/mcp`；启用 OAuth 时使用 OAuth 流程。MCP 是正常维护的 ChatGPT 接入方式。
+- **GPT Actions：** 仅为已有 Custom GPT 保留。默认 binary 不挂载 `/openapi.json` 或 `/api/actions/*`；只有使用 `legacy-gpt-actions` 构建时才可导入 `https://your-domain.example/openapi.json`。其 direct/gateway surface 是冻结兼容快照，不再随着 Adaptive Runtime、Host、Plugin 或 Code Mode 新工具变化。
 
-如果是从旧 generic Action facade 升级，请重新导入 `/openapi.json` 获取新的
-canonical operation names。旧 REST route 可以为了兼容继续存在，但不会进入新的
-model-facing schema。
+如果是从旧 generic Action facade 升级，并且仍明确保留这项 legacy feature，请重新导入 `/openapi.json` 获取冻结后的 canonical operation names。
 
-MCP 与 GPT Actions 最终进入同一个 ToolRuntime authority path；GPT Actions 不会建立第二套 scope、Project authority、permission、Runner capability 或 retry policy。Project-scoped `share` / `run` 部署同样暴露普通 Adaptive Runtime，由 ProjectGrant visibility 把访问限制在对应 Project。
+MCP 与启用后的 GPT Actions 最终仍进入同一个 ToolRuntime authority path；legacy adapter 不建立第二套 scope、Project authority、permission、Runner capability 或 retry policy。Project-scoped `share` / `run` 只有在 binary 本身启用 `legacy-gpt-actions` 时才额外暴露该兼容 surface。
 
 详见 [GPT Actions](GPT_ACTIONS.zh-CN.md)、[MCP](MCP.zh-CN.md) 与
 [AI 接入指南](AI_ONBOARDING.zh-CN.md)。
+
+如果 ChatGPT 返回 conversation-level developer-MCP `FORBIDDEN`，不要直接把它当作
+Server 或 Runner 已离线的证据。先使用下面的 operator checks 独立验证部署，再按照
+[故障排查](TROUBLESHOOTING.zh-CN.md) 中的 Host 分层决策树判断；不要在 Runner 本来
+健康时仅因为该 Host error 就旋转 credential、重新注册 project 或反复重启 Runner。
 
 ## 运维
 

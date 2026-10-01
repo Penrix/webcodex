@@ -121,7 +121,7 @@ The run was inspected from the other window before foregrounding the carrier tab
 
 These results split the product surface into two intentional patterns:
 
-- result/report cards such as Work Result are sparse and explicitly admitted, render the authoritative `present_work_result` snapshot once, and stay static until the user presses Refresh; they do not need background timers merely because the Host can run them;
+- result/report cards such as Work Result remain sparse and explicitly admitted, but the mounted Work Result now performs bounded visible/hidden App-only refreshes so a single card can follow live Session progress without model-visible polling;
 - controller cards such as Durable Agent continuation may deliberately remain live carriers when automatic continuation is a product requirement, but removing a production visibility gate is a separate policy choice and must retain exact Endpoint/generation, lease/fence, `delivery_unknown`, and consume protections.
 
 The capability result therefore supports long-lived Agent carriers without turning every MCP App into a polling surface. Presentation density, refresh cost, and autonomous scheduling remain separate design decisions.
@@ -159,13 +159,15 @@ A production workflow presentation should therefore prefer:
 
 Do not copy the temporary timer/map implementation into production. Reuse the authoritative Workflow Session, Job lifecycle/observation, ActionAudit/window correlation, and durable Agent continuation primitives that already own persistence, authority, and recovery semantics.
 
-The coding result surface follows the same sparsity rule, but production Host probing tightened the admission model further: an unbound descriptor does not create an App later merely because its ToolResult contains `ui.resourceUri` or `openai/outputTemplate`. Ordinary tools therefore have no Work App descriptor binding at all, including `show_changes`, Job observation, validation execution/summary, committed-range review, and coding closeout. A model explicitly calls `present_work_result(project, session_id)` only when one persistent user-visible summary is useful; that binds `ui://webcodex/work-result/v1` once and returns the initial authoritative snapshot. The mounted View then remains static: only an explicit user Refresh performs one ModelHidden/app-only `work_result_state(project, session_id)` exact read. Each refresh re-authorizes the exact Session and Project, reads bounded current worktree status/numstat plus existing Session validation/review evidence, requests no diff hunks, runs no validation/review, and deliberately does not append refresh events to the observed Session ledger. There is no Work Result background timer, visibility-triggered read, or retry loop. The old Changes/Result resources and bounded result projections remain hidden-readable compatibility paths for cached descriptors; compatibility does not imply current descriptor-level admission.
+The coding result surface follows the same sparse-admission rule: an unbound descriptor does not create an App later merely because an ordinary ToolResult contains presentation metadata. Ordinary tools therefore have no Work App descriptor binding, including `show_changes`, Job observation, validation execution/summary, committed-range review, and coding closeout. For substantial coding the model explicitly calls `present_work_result(project, session_id)` at most once after the Session becomes materially stateful; that binds `ui://webcodex/work-result/v2`. The mounted View performs bounded ModelHidden/app-only `work_result_state(project, session_id)` reads at a faster cadence while visible and a slower cadence while hidden, with idle backoff and eventual pause. Each read re-authorizes the exact Session and Project, reads bounded current worktree status/numstat plus existing Session validation/review evidence, requests no diff hunks, runs no validation/review, and does not append refresh events to the observed Session ledger. This presentation polling is deliberately separate from model continuation or scheduling.
 
-Work Result also owns frozen final changes. Initial presentation alone freezes the complete final workspace tree against the Session Git baseline, when a first-class repository Edit was observed and the trees differ. Bounded metadata lives at `work_result.final_changes`; its snapshot id is card-local. The explicit `work_result_state` response contains only live workspace/validation/review and never allocates, replaces, or extends the frozen snapshot. `changes_file_diff(project, session_id, snapshot_id, path)` remains a ModelHidden/app-only primitive, re-authorizing the Project and Session independently and fencing caller, snapshot, and advertised path before reading the two frozen trees. Expired process-local snapshots fail closed, not over to live Git diff. A clean committed worktree can still have final changes relative to the Session baseline; no-op, shell-only, and validation/review-only closeouts do not gain automatic card suggestions.
+The Activity view places active background executions under current activity and folds terminal executions into recent background results, with outcome counts visible before expansion. These executions belong to the exact task Session; the separate call history belongs to the Window. A retained terminal Job never overrides current Window activity or implies that the coding task is complete. Queued, reconnecting, and stopping executions retain their own state labels. Truncated snapshots disclose that additional active or finished executions may be omitted.
 
-Compatibility is resource-read only: `ui://webcodex/changes/v3` shipped with the Final Changes descriptor, and the Host experiments above establish that descriptors/resources can outlive connector refresh. It is now hidden from resource discovery and serves the canonical Work Result template. Old `changes` payloads are not translated or trusted as Work Result state; the View rejects them. No legacy presentation tool, descriptor binding, standalone Changes HTML, or new persisted presentation state remains. Earlier Changes/Result static compatibility paths keep their existing behavior.
+Work Result also owns sealed final changes, but live presentation and final sealing are separate phases. Before a non-blocking current-attempt `finish_coding_task`, presentation/state reads expose only live progress domains. When closeout returns `task_outcome.blocking=false`, `finish_coding_task` itself may seal one immutable snapshot of the complete final workspace tree against the Session Git baseline, provided first-class repository Edit provenance exists and the trees differ. The snapshot is keyed to the exact current task-instruction attempt and stored only in the bounded process-local presentation cache; App-only `work_result_state` never creates or replaces it, it only exposes the retained snapshot. Repeated refreshes therefore reuse one snapshot identity instead of following later workspace drift. `changes_file_diff(project, session_id, snapshot_id, path)` remains ModelHidden/app-only, independently re-authorizes Project and Session, and fences caller/snapshot/advertised path before reading the two sealed trees. Snapshot expiry never falls back to a live diff. A clean committed worktree can still have final changes relative to the Session baseline; no-op, shell-only, validation/review-only, and blocking closeouts remain ineligible.
 
-The production Durable Goal G2 implementation applies the same presentation findings to a server-owned Goal: one explicit `present_goal_plan(goal_id)` binds `ui://webcodex/goal-plan/v2`, while the existing View uses the ModelHidden/app-only `goal_plan_state(goal_id)` exact read to converge on SQLite Goal revision. G3 does **not** change that contract: Goal still has no Wake, `ui/message`, model resume, dispatch fence, consume token, background model scheduler, Agent owner/controller relation, or automatic Goal/work execution transition.
+Compatibility is resource-read only: `ui://webcodex/work-result/v1` and `ui://webcodex/changes/v3` may remain cached in Hosts and therefore stay readable with the safe current template, while only the canonical `ui://webcodex/work-result/v2` descriptor admits a new card. Old `changes` payloads are not translated or trusted as Work Result state; the View rejects them. No legacy presentation tool, descriptor binding, standalone Changes HTML, or new persisted presentation state remains. Earlier Changes/Result compatibility paths keep their existing behavior.
+
+The production Durable Goal G2 implementation applies the same presentation findings to a server-owned Goal: one explicit `present_goal_plan(goal_id)` binds `ui://webcodex/goal-plan/v2`, while the existing View uses the ModelHidden/app-only `goal_plan_sync(goal_id)` exact read to converge on SQLite Goal revision. G3 does **not** change that contract: Goal still has no Wake, `ui/message`, model resume, dispatch fence, consume token, background model scheduler, Agent owner/controller relation, or automatic Goal/work execution transition.
 
 ## Production G3 mapping
 
@@ -225,7 +227,7 @@ Visible status distinguishes script activity, Host initialization, exact identit
 selection, and live binding/polling, with separate initialization, binding, and
 identity errors. Diagnostics do not display binding ids, claim fences, or consume
 tokens. `tools/list` and `resources/list` advertise only the canonical
-`ui://webcodex/agent-continuation/v16` and `ui://webcodex/goal-plan/v3` resources. Goal Plan now uses only its current resource (wire version 2), with no old Goal-resource aliases.
+`ui://webcodex/agent-continuation/v17` and `ui://webcodex/goal-plan/v6` resources. Goal Plan now uses only its current resource (wire version 3), with no old Goal-resource aliases. The G5 projection keeps production carrier readiness, exact Goal-stall Wake lifecycle, Host delivery outcome, and exact-consume fresh-turn proof as separate bounded facts; it exposes no Wake/Attempt/Endpoint identifiers or continuation proofs.
 Agent continuation v1-v15 are hidden read aliases serving the same current template. Reading an alias does not revive an expired Endpoint or bypass exact generation/authorization fencing; the same current template must still complete explicit Server-authorized one-hop replacement transitions. The v11 fingerprint-proven restart fallback, v12 strict restart projection, v13 canonical Host-window refresh fence, v14 expired-Endpoint replacement, and v15 bounded successor replay remain intact; v16 changes only visibility eligibility for automatic dispatch.
 
 ## Goal-correlated terminal attention carrier
@@ -237,8 +239,8 @@ These sources deliberately do **not** reuse A4b's active-Attempt correctness con
 ## G4 — Goal workflow stall detector
 
 The next concrete dogfood need is implemented as `goal_workflow_stalled`, the
-second narrow attention kind. Goal Plan shows bounded mechanical progress and
-submits a selector-only App recheck; the Server requires an active owned Goal,
+second narrow attention kind. Goal Plan shows bounded mechanical progress and uses one App-only `goal_plan_sync`;
+the Server requires an active owned Goal,
 explicit exact controller, authorized correlated current Session, fresh exact-Goal
 card observation, complete evidence and no active meaningful request. It reuses the
 existing Window activity ledger/registry and Agent attention/Wake transactions.
@@ -246,6 +248,18 @@ Same-epoch polling cannot mint repeated turns. The separate Agent Continuation
 card remains the only `ui/message` carrier; accepted dispatch is not resume, and
 uncertain delivery is not an automatic retry. The same Agent may be both callable
 Worker and Goal controller. No repository `AGENTS.md` is required for this workflow.
+
+The first production dogfood of the single-RPC Goal Plan design exposed a resource
+identity failure rather than a stall-detector failure. The Server had deployed the
+new `goal_plan_sync` wire, but the Goal Plan URI remained v4. During the armed
+five-minute window the Server received **234** stale `goal_plan_state` calls from
+the Host, all rejected as `direct_route_denied`, and **zero** `goal_plan_sync`
+calls; no Goal-stall Wake was created. This proves an already-open Host View may continue running its old same-URI
+Goal Plan template across a Server deploy until that App is refreshed/recreated.
+The run did not test a newly opened View. The canonical Goal Plan resource is still
+advanced to v5 for the incompatible wire change, v4 is not served as an alias, and
+the descriptor/resource tests lock that resource identity together with the v5 App
+self-version.
 
 The [G4 dogfood guide](goal-workflow-continuity-dogfood.md) distinguishes deterministic
 regression coverage from manual verification in a real, separately authorized Host.

@@ -107,17 +107,18 @@ fn write_fake_pyright(bin_dir: &std::path::Path, spec: &FakePyrightSpec) -> Path
     }
 }
 
-fn with_path<T>(bin_dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
+fn with_path<T>(bin_dir: &std::path::Path, f: impl FnOnce(Option<std::path::PathBuf>) -> T) -> T {
     with_path_mode(bin_dir, true, f)
 }
 
-/// Point validation at this test's explicit pyright fixture without mutating
-/// process-wide PATH. Other Runner tests execute shells and SSH clients in
-/// parallel, so replacing PATH here makes otherwise unrelated tests race with
-/// the validation fixture. `available = false` points at a guaranteed-missing
-/// path to exercise the tool-unavailable branch without exposing real tools.
-fn with_path_mode<T>(bin_dir: &std::path::Path, available: bool, f: impl FnOnce() -> T) -> T {
-    let _env_lock = crate::tests::test_env_lock();
+/// Pass an explicit fixture executable into the same adapter implementation.
+/// No PATH or override variable is changed. `available = false` supplies None;
+/// environment lookup and executable validation have their own focused tests.
+fn with_path_mode<T>(
+    bin_dir: &std::path::Path,
+    available: bool,
+    f: impl FnOnce(Option<std::path::PathBuf>) -> T,
+) -> T {
     let program = if available {
         #[cfg(unix)]
         {
@@ -135,8 +136,7 @@ fn with_path_mode<T>(bin_dir: &std::path::Path, available: bool, f: impl FnOnce(
     } else {
         bin_dir.join("webcodex-missing-pyright")
     };
-    let _env = crate::tests::EnvGuard::new().set("WEBCODEX_PYRIGHT", &program);
-    f()
+    f(available.then_some(program))
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn end_to_end_fake_pyright_success_and_diagnostics() {
     let abs = fs::canonicalize(&file).unwrap();
     let abs_json = abs.to_string_lossy().replace('\\', "\\\\");
 
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     let stdout = format!(
         r#"{{
   "version": "1.1.382",
@@ -233,8 +233,9 @@ fn end_to_end_fake_pyright_success_and_diagnostics() {
     );
     write_fake_pyright(bin.path(), &FakePyrightSpec::new(stdout, 1));
 
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(root, &typecheck_request("demo"), 120, program)
+            .unwrap()
     });
 
     assert!(response.command_started);
@@ -271,7 +272,7 @@ fn end_to_end_exit_zero_no_diagnostics_is_success() {
     let project = tempfile::tempdir().unwrap();
     let root = project.path();
     fs::write(root.join("ok.py"), "x = 1\n").unwrap();
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     let stdout = r#"{
   "version": "1.1.382",
   "generalDiagnostics": [],
@@ -285,8 +286,9 @@ fn end_to_end_exit_zero_no_diagnostics_is_success() {
 }
 "#;
     write_fake_pyright(bin.path(), &FakePyrightSpec::new(stdout, 0));
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(root, &typecheck_request("demo"), 120, program)
+            .unwrap()
     });
     assert!(response.success);
     assert!(response.command_started);
@@ -302,8 +304,14 @@ fn fake_pyright_missing_reports_tool_unavailable() {
     let project = tempfile::tempdir().unwrap();
     let empty_bin = tempfile::tempdir().unwrap();
     // Point directly at a guaranteed-missing pyright; process PATH stays untouched.
-    let response = with_path_mode(empty_bin.path(), false, || {
-        execute_validation_at_root(project.path(), &typecheck_request("demo"), 120).unwrap()
+    let response = with_path_mode(empty_bin.path(), false, |program| {
+        execute_validation_at_root_with_program(
+            project.path(),
+            &typecheck_request("demo"),
+            120,
+            program,
+        )
+        .unwrap()
     });
     assert!(!response.command_started);
     assert!(!response.tool_available);
@@ -316,13 +324,13 @@ fn fake_pyright_missing_reports_tool_unavailable() {
 #[test]
 fn invalid_cwd_reports_available_tool_without_starting_command() {
     let project = tempfile::tempdir().unwrap();
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     write_fake_pyright(bin.path(), &FakePyrightSpec::new("", 0));
     let mut request = typecheck_request("demo");
     request.cwd = Some("missing-directory".to_string());
 
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(project.path(), &request, 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(project.path(), &request, 120, program).unwrap()
     });
     assert!(!response.success);
     assert!(!response.command_started);
@@ -336,7 +344,7 @@ fn invalid_cwd_reports_available_tool_without_starting_command() {
 #[test]
 fn spawn_failure_does_not_report_command_started() {
     let project = tempfile::tempdir().unwrap();
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     // A file that resolves as a program but cannot be started. Executable text
     // without a shebang is not portable here: macOS Command::spawn may run it
     // through the platform shell. A shebang naming a definitely missing
@@ -367,8 +375,14 @@ fn spawn_failure_does_not_report_command_started() {
             .unwrap()
     };
 
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(project.path(), &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(
+            project.path(),
+            &typecheck_request("demo"),
+            120,
+            program,
+        )
+        .unwrap()
     });
     assert!(!response.success);
     assert!(!response.command_started);
@@ -385,14 +399,14 @@ fn spawn_failure_does_not_report_command_started() {
 #[test]
 fn timeout_reports_started_and_available_tool() {
     let project = tempfile::tempdir().unwrap();
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     // Long enough to outlive the 1s request timeout on either platform.
     write_fake_pyright(bin.path(), &FakePyrightSpec::new("", 0).with_delay(120_000));
     let mut request = typecheck_request("demo");
     request.timeout_secs = 1;
 
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(project.path(), &request, 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(project.path(), &request, 120, program).unwrap()
     });
     assert!(!response.success);
     assert!(response.command_started);
@@ -407,14 +421,15 @@ fn timeout_reports_started_and_available_tool() {
 fn oversized_stdout_is_not_parsed() {
     let project = tempfile::tempdir().unwrap();
     let root = project.path();
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     let over = MAX_VALIDATION_STDOUT_BYTES + 8192;
     // Payload past the hard capture cap; emitted byte-for-byte by the
     // platform fixture (no shell loop needed).
     let payload = "a".repeat(over);
     write_fake_pyright(bin.path(), &FakePyrightSpec::new(payload, 0));
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(root, &typecheck_request("demo"), 30).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(root, &typecheck_request("demo"), 30, program)
+            .unwrap()
     });
     assert!(response.command_started, "{response:?}");
     assert!(
@@ -432,7 +447,7 @@ fn oversized_stdout_is_not_parsed() {
 #[test]
 fn oversized_stderr_is_capped_while_stdout_json_remains_parseable() {
     let project = tempfile::tempdir().unwrap();
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     let over = MAX_VALIDATION_STDERR_CAPTURE_BYTES + 8192;
     let spec = FakePyrightSpec::new(
         r#"{
@@ -448,8 +463,14 @@ fn oversized_stderr_is_capped_while_stdout_json_remains_parseable() {
     ));
     write_fake_pyright(bin.path(), &spec);
 
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(project.path(), &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(
+            project.path(),
+            &typecheck_request("demo"),
+            120,
+            program,
+        )
+        .unwrap()
     });
 
     assert!(response.success, "{response:?}");
@@ -468,10 +489,11 @@ fn oversized_stderr_is_capped_while_stdout_json_remains_parseable() {
 fn malformed_json_is_structured_failure() {
     let project = tempfile::tempdir().unwrap();
     let root = project.path();
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     write_fake_pyright(bin.path(), &FakePyrightSpec::new("not-json\n", 1));
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(root, &typecheck_request("demo"), 120, program)
+            .unwrap()
     });
     assert!(response.command_started);
     assert_eq!(
@@ -497,7 +519,7 @@ fn bridge_response_free_text_is_sanitized_before_serialization() {
         "D:/work/project/app.py",
         r"\\server\share\secret.py",
     ];
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     let stdout = format!(
         r#"{{
   "generalDiagnostics": [{{
@@ -516,8 +538,9 @@ fn bridge_response_free_text_is_sanitized_before_serialization() {
     let spec = FakePyrightSpec::new(stdout, 0).with_stderr(stderr);
     write_fake_pyright(bin.path(), &spec);
 
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(root, &typecheck_request("demo"), 120, program)
+            .unwrap()
     });
     let stderr = response.stderr_summary.as_deref().unwrap();
     assert!(stderr.contains("stderr"));
@@ -540,14 +563,20 @@ fn bridge_response_free_text_is_sanitized_before_serialization() {
 #[test]
 fn malformed_json_containing_absolute_path_does_not_echo_it() {
     let project = tempfile::tempdir().unwrap();
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     let injected = "/root/git/private-drop/private.py";
     write_fake_pyright(
         bin.path(),
         &FakePyrightSpec::new(format!("{{\"generalDiagnostics\":[\"{injected}"), 1),
     );
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(project.path(), &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(
+            project.path(),
+            &typecheck_request("demo"),
+            120,
+            program,
+        )
+        .unwrap()
     });
     assert_eq!(
         response.failure_kind.as_deref(),
@@ -650,13 +679,14 @@ fn pyright_exit_code_and_diagnostics_status_matrix() {
                 "informationCount": 0
             }
         });
-        let bin = tempfile::tempdir().unwrap();
+        let bin = crate::tests::executable_tempdir();
         write_fake_pyright(
             bin.path(),
             &FakePyrightSpec::new(json.to_string(), case.exit_code),
         );
-        let response = with_path(bin.path(), || {
-            execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
+        let response = with_path(bin.path(), |program| {
+            execute_validation_at_root_with_program(root, &typecheck_request("demo"), 120, program)
+                .unwrap()
         });
         assert_eq!(
             response.success, case.success,
@@ -696,11 +726,12 @@ fn missing_summary_counts_errors_before_diagnostic_truncation() {
         "message": "error outside returned diagnostic window"
     }));
     let json = serde_json::json!({ "generalDiagnostics": diagnostics });
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     write_fake_pyright(bin.path(), &FakePyrightSpec::new(json.to_string(), 0));
 
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(root, &typecheck_request("demo"), 120, program)
+            .unwrap()
     });
     assert!(!response.success, "{response:?}");
     assert_eq!(
@@ -726,7 +757,7 @@ fn unicode_paths_and_messages_are_preserved_relative() {
     fs::write(&file, "x = 1\n").unwrap();
     let abs = fs::canonicalize(&file).unwrap();
     let abs_json = abs.to_string_lossy().replace('\\', "\\\\");
-    let bin = tempfile::tempdir().unwrap();
+    let bin = crate::tests::executable_tempdir();
     let stdout = format!(
         r#"{{
   "generalDiagnostics": [
@@ -745,8 +776,9 @@ fn unicode_paths_and_messages_are_preserved_relative() {
 }}"#
     );
     write_fake_pyright(bin.path(), &FakePyrightSpec::new(stdout, 0));
-    let response = with_path(bin.path(), || {
-        execute_validation_at_root(root, &typecheck_request("demo"), 120).unwrap()
+    let response = with_path(bin.path(), |program| {
+        execute_validation_at_root_with_program(root, &typecheck_request("demo"), 120, program)
+            .unwrap()
     });
     assert!(response.success); // information only → no errors
     let diag = &response.diagnostics.as_ref().unwrap().diagnostics[0];

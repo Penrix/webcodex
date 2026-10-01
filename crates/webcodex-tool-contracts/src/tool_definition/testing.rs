@@ -31,7 +31,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE.validation_identity(super::ToolValidationIdentityKind::CargoFmt),
         ),
-        "Use check=false (default) for intentional final formatting after relevant Rust source stabilizes: precheck first, mutate only for a proven rustfmt diff, and use changed/state_changed instead of reproducing rustfmt diffs with edit tools. Do not use cargo_fmt as a per-edit ritual. Use check=true for read-only formatting validation when final formatting proof is needed; only that mode may hand off the same execution as a Job. Omitted sync_wait_secs uses the Runtime early-handoff default in check mode; ensure-format accepts but ignores it and always stays synchronous. Validation intent is intrinsic to this validator and Runtime-derived; do not pass generic execution purpose.",
+        "Use check=false (default) for intentional final formatting after relevant Rust source stabilizes: precheck first, mutate only for a proven rustfmt diff, and use changed/state_changed instead of reproducing rustfmt diffs with edit tools. Do not use cargo_fmt as a per-edit ritual. Use check=true for read-only formatting validation; only check mode may hand off the same execution as a Job. If check mode returns execution_state=pending, keep its continuation as fallback, continue independent work, and let ordinary same-Window/Project/Session results surface sparse terminal attention; do not poll. Observe only for details/recovery. If covered Rust source changes, check=true evidence is stale. For final formatting proof, freeze covered source or rerun after any required source edit. Server timing policy controls same-execution Job handoff grace.",
     )
     .with_execution(super::ToolExecutionContract::new(
         super::ToolExecutionForm::StructuredValidation,
@@ -61,9 +61,14 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 false,
                 super::ToolSessionEvidencePolicy::NONE.validation_identity(super::ToolValidationIdentityKind::CargoCheck),
-            ).with_composition_policy(super::ToolCompositionPolicy::Sequential),
-            "Structured cargo check (default --all-targets) for common supported validation with parsed diagnostics, validation identity, bounded projection, and same execution Job handoff. Intent is Runtime-derived; scoped flags only. sync_wait_secs controls synchronous handoff grace; omission uses the Runtime early-handoff default and never changes total timeout or retry semantics.",
-        ).with_gpt_action_description("Run structured cargo check with parsed diagnostics and bounded output. Longer validation may continue as the same Job; sync_wait_secs changes only synchronous handoff grace, never total timeout or retry semantics.")
+            )
+            .with_composition_policy(super::ToolCompositionPolicy::Sequential)
+            .with_host_orchestration_hint(
+                super::ToolHostOrchestrationHint::sequential()
+                    .with_native_batch_field("packages"),
+            ),
+            "Structured cargo check (default --all-targets) for common supported validation with parsed diagnostics, validation identity, and same execution Job handoff. Use package for one workspace package or packages for a known set; packages runs one Cargo invocation with repeated -p after deterministic sort/dedup. If pending, keep its continuation and continue independent work; same-scope results may surface terminal attention. Observe only for logs/details/recovery; do not poll. Development validation can overlap independent work, but edits to covered source make it stale. For final evidence freeze covered source; if it changes, rerun the appropriate check. Server timing policy controls same-execution Job handoff grace and never changes timeout or retry semantics. Complete synchronous success omits zero counts and empty parser bookkeeping; positive warnings and diagnostics remain. source_state never certifies current workspace source.",
+        ).with_gpt_action_description("Run cargo check; packages=[...] checks a known set in one process. If pending, keep continuation and continue independent work; later same-scope results may carry terminal validation. Do not poll; observe only for details/recovery. Covered-source edits stale the run; freeze source or rerun.")
         .with_execution(super::ToolExecutionContract::new(
             super::ToolExecutionForm::StructuredValidation,
             super::ToolExecutionLifetime::Runner,
@@ -71,6 +76,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolExecutionContinuation::ObserveJobs,
         ))),
         90,
+        super::ToolDirectReason::CoreWorkflow,
     ),
     adaptive_runtime_direct(
         captures_validation_output(model_spec(
@@ -94,9 +100,11 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 false,
                 super::ToolSessionEvidencePolicy::NONE.validation_identity(super::ToolValidationIdentityKind::CargoTest),
-            ).with_composition_policy(super::ToolCompositionPolicy::Sequential),
-            "Structured cargo test for common supported validation with bounded output, executed-test evidence, min_tests/require_tests, validation identity, and same execution Job handoff. Intent is Runtime-derived. lib=true selects Cargo --lib; false/omitted keeps ordinary targets. filter is one Rust substring for `cargo test FILTER`, not Cargo/libtest flags such as `--exact` or `--nocapture`; zero-test results are not validation proof and return recovery guidance. Normal execution requires non-zero executed-test evidence; require_tests=false opts out when min_tests is absent, while require_tests=true/min_tests enforce a proven minimum. no_run=true is compile-only and needs no executed-test proof. sync_wait_secs controls Job-handoff grace; omission uses the Runtime early-handoff default.",
-        ).with_gpt_action_description("Run structured cargo tests with bounded output. A successful proof requires executed-test evidence unless explicitly opted out; use min_tests/require_tests when count matters. Long validation continues as the same Job.")
+            )
+            .with_composition_policy(super::ToolCompositionPolicy::Sequential)
+            .with_host_orchestration_hint(super::ToolHostOrchestrationHint::sequential()),
+            "Structured cargo test for common supported validation with bounded output, executed-test evidence, min_tests/require_tests, validation identity, and same execution Job handoff. lib=true selects Cargo --lib; filter is one Rust substring, not flags such as --exact or --nocapture. Exit 0 alone is not test proof: default requires positive counts; require_tests=false accepts zero only without min_tests; require_tests=true/min_tests enforce a proven minimum. no_run=true is compile-only. Sparse synchronous proof retains tests_run_count and explicit minimum_tests, require_tests=false for accepted zero, or no_run=true for compile-only. Rich success may lack test proof. source_state never certifies current workspace source. If pending, keep its continuation and continue independent work; same-scope results may surface terminal attention. Observe only for logs/details/recovery; do not poll. Edits to covered source stale evidence. For final evidence freeze covered source; if it changes, rerun the appropriate test.",
+        ).with_gpt_action_description("Run cargo tests with bounded executed-test evidence. If pending, keep continuation and continue independent work; later same-scope results may carry terminal validation. Do not poll; observe only for details/recovery. Covered-source edits stale the run; freeze source for final evidence or rerun.")
         .with_execution(super::ToolExecutionContract::new(
             super::ToolExecutionForm::StructuredValidation,
             super::ToolExecutionLifetime::Runner,
@@ -104,7 +112,37 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolExecutionContinuation::ObserveJobs,
         ))),
         100,
+        super::ToolDirectReason::CoreWorkflow,
     ),
+    captures_validation_output(model_spec(
+            def(
+                "project_validate",
+                super::ToolAuditPolicy::TYPED_CANONICAL
+                    .execution(super::ToolAuditExecutionPolicy::TEST_ASSERTIONS),
+                ModelVisible,
+                TOOL_CATEGORY_VALIDATION,
+                Some(OwnerOnly),
+                TOOL_PROVIDER_RUNNER,
+                super::ToolSemanticContract {
+                    effect: super::ToolEffect::Execute,
+                    risk: JobRun,
+                    approval: super::ToolApprovalPolicy::Standard,
+                    idempotency: super::ToolIdempotency::NonIdempotent,
+                },
+                Some(JOB_RUN),
+                true,
+                NoPath,
+                false,
+                false,
+                super::ToolSessionEvidencePolicy::NONE.validation_identity(super::ToolValidationIdentityKind::Project),
+            ),
+            "Preferred portable project validation with Runner-owned recipe/argv. action=format_check/check/test; auto or matching Rust/Go adapter, Node/Python unavailable. Rust maps to cargo fmt -- --check, cargo check --all-targets, or cargo test; Go to go vet or go test -json. scope.packages (1..8) narrows check/test; scoped formatting is unsupported. For action=test, test.filter is a Rust substring or Go -run regexp, never flags; test.require_tests defaults true and test.min_tests sets a proven minimum. false accepts proven zero only without a minimum; unknown counts are not zero. Scope/test options need additive Runner support. No arbitrary executable, argv, shell or source-format mutation. Long work returns the same Job; observe it, never retry pending. Source changes stale evidence; source_state does not certify current source. Advanced options remain on cargo_* / go_test.",    )
+    .with_execution(super::ToolExecutionContract::new(
+        super::ToolExecutionForm::StructuredValidation,
+        super::ToolExecutionLifetime::Runner,
+        super::ToolExecutionStart::SyncFirst,
+        super::ToolExecutionContinuation::ObserveJobs,
+    ))),
     captures_validation_output(model_spec(
             def(
                 "go_test",
@@ -127,7 +165,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE.validation_identity(super::ToolValidationIdentityKind::GoTest),
             ),
-            "Structured option for common supported go test -json (default ./...) when bounded package scopes, Go JSON test-count evidence, validation identity, or same execution Job handoff are useful. Validation intent is intrinsic to this validator and Runtime-derived; do not pass generic execution purpose. Requires Runner Go JSON validation support; optional sync_wait_secs controls only synchronous grace before the same execution is returned as a Job, omission uses the Runtime early-handoff default, and it never changes total timeout or retry semantics.",
+            "Structured option for common supported go test -json (default ./...) when bounded package scopes, Go JSON test-count evidence, validation identity, or same-execution pending handoff are useful. If execution_state=pending, keep its continuation as fallback and continue independent work; ordinary same-Window/Project/Session results may surface sparse terminal validation truth. Observe only when logs/details/recovery are needed. Validation intent is intrinsic to this validator and Runtime-derived; do not pass generic execution purpose. Requires Runner Go JSON validation support; Server timing policy controls only synchronous grace before the same execution is returned pending and never changes total timeout or retry semantics. Sparse synchronous success retains tests_run_count only when complete evidence proves all counted tests passed; skipped or incomplete evidence stays rich. source_state independently describes source coverage.",
     )
     .with_execution(super::ToolExecutionContract::new(
         super::ToolExecutionForm::StructuredValidation,

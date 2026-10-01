@@ -3,8 +3,10 @@ use super::*;
 #[test]
 fn tool_specs_describe_default_coding_loop_preferences() {
     let specs = registered_tool_specs();
+    let specialists = exact_manifest_specialist_tool_specs();
 
     let desc = |name: &str| spec_named(&specs, name).description.to_lowercase();
+    let specialist_desc = |name: &str| spec_named(&specialists, name).description.to_lowercase();
 
     let work_on_project_desc = desc("work_on_project");
     for phrase in [
@@ -19,7 +21,12 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "exact resume",
         "active accessible session",
         "never guesses prior session",
-        "context_request",
+        "_wc.context",
+        "agents.md/claude.md",
+        "do not immediately reread",
+        "reuse successful workspace",
+        "available semantic navigation",
+        "sufficient startup skills/plugins",
         "project.instructions",
         "webcodex.workflow",
         "guidance_profile",
@@ -37,6 +44,8 @@ fn tool_specs_describe_default_coding_loop_preferences() {
             "work_on_project description should mention {phrase}: {work_on_project_desc}"
         );
     }
+
+    assert!(!work_on_project_desc.contains("context_request"));
 
     let read_files_desc = desc("read_files");
     for phrase in [
@@ -243,58 +252,42 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let show_changes_desc = desc("show_changes");
     for phrase in [
-        "canonical bounded workspace-wide review",
-        "worktree overview",
-        "compact session signals",
-        "structured closeout evidence",
-        "tiny targeted git observations need not call it first",
-        "diff_review_handoff",
-        "git_diff_hunks",
+        "specialist workspace projection",
+        "explicit discovery",
+        "presentation",
+        "session signals",
+        "closeout internals",
+        "ordinary code review uses review_changes",
     ] {
         assert!(
             show_changes_desc.contains(phrase),
             "show_changes description should mention {phrase}: {show_changes_desc}"
         );
     }
-
     let git_diff_hunks = spec_named(&specs, "git_diff_hunks");
     assert!(!show_changes_desc.contains("default inspect/review tool before final response"));
 
     let git_review_summary_desc = desc("git_review_summary");
     for phrase in [
-        "broad or unknown ranges",
-        "file/change map",
-        "targeted git_diff_hunks/read_files",
-        "small bounded understood committed diffs may use native git directly",
-        "never mutates",
+        "specialist exact committed-range review map",
+        "explicit discovery",
+        "ordinary review uses review_changes",
+        "read-only",
     ] {
         assert!(
             git_review_summary_desc.contains(phrase),
             "git_review_summary description should mention {phrase}: {git_review_summary_desc}"
         );
     }
-
     let git_diff_hunks_desc = git_diff_hunks.description.to_lowercase();
     for phrase in [
-        "targeted/paged",
-        "scope/fence-bound opaque continuation",
-        "safe bounded traversal",
-        "max_page_bytes",
-        "raw producer page",
-        "shared safe producer maximum",
-        "512 kib",
-        "final model-facing",
-        "parser-ready next_call",
-        "recovery.later_hunks.next_call",
-        "next logical diff record",
-        "never an intra-hunk cursor",
-        "recovery.current_hunk.next_call",
-        "bounded refinement",
-        "exact hunk-fragment token",
-        "next complete diff line",
-        "line-budget and page-byte-budget truncation",
-        "positive complete-line progress",
-        "safe forward progress is not proven",
+        "specialist exact diff paging core",
+        "explicit discovery",
+        "review_changes internals",
+        "source fences",
+        "bounded page/hunk continuation",
+        "path/range projection",
+        "safe recovery",
     ] {
         assert!(
             git_diff_hunks_desc.contains(phrase),
@@ -338,7 +331,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     }
 
     // Patch input remains available without becoming the default recovery path.
-    let apply_patch_desc = desc("apply_patch");
+    let apply_patch_desc = specialist_desc("apply_patch");
     for phrase in [
         "naturally patch-shaped",
         "genuinely the clearest reliable representation",
@@ -362,22 +355,18 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     }
     assert!(!apply_patch_desc.contains("prefer apply_patch"));
 
-    let apply_text_edits_desc = desc("apply_text_edits");
+    let apply_text_edits_desc = desc("edit_project_files");
     for phrase in [
-        "transactional structured option",
-        "small/local exact edits",
-        "globally unique",
-        "may omit expected_read_revision",
-        "occurrence or line_scope",
-        "requires expected_read_revision",
-        "revisions fence whole-file snapshots",
-        "model input never needs a digest",
+        "primary project editor",
+        "read_files",
+        "expected_read_revision",
+        "exact edits fail closed on ambiguity",
+        "replace_range",
+        "same original snapshot",
         "preflighted transactionally",
-        "conflicts fail closed",
-        "rechecks source before mutation",
-        "one parser-ready read_files recovery call",
-        "inspect the resulting diff",
-        "validate the final source",
+        "runner rechecks source",
+        "stale state returns read_files recovery",
+        "outcome_unknown",
     ] {
         assert!(
             apply_text_edits_desc.contains(phrase),
@@ -388,7 +377,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     assert!(!apply_text_edits_desc.contains("expected_sha256"));
     assert!(!apply_text_edits_desc.contains("prefer apply_patch"));
 
-    let unified_diff_desc = desc("apply_unified_diff");
+    let unified_diff_desc = specialist_desc("apply_unified_diff");
     for phrase in [
         "external raw unified-diff mutation path",
         "input is already a standard unified diff",
@@ -403,7 +392,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
-    let write_file_desc = desc("write_project_file");
+    let write_file_desc = specialist_desc("write_project_file");
     for phrase in [
         "create a new file",
         "intentional whole-file replacement",
@@ -498,28 +487,21 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_shell_desc = desc("run_shell");
     for phrase in [
-        "bounded shell command or short related chain",
-        "shell semantics",
-        "predetermined related observations may share one call",
-        "adaptive/result-dependent follow-ups stay sequential",
+        "bounded shell grammar or a short related command chain",
         "prefer run_process for literal argv",
-        "deterministic python heredoc",
-        "one coherent transformation",
-        "project/path/permission policy",
-        "avoid unauthorized network",
-        "inspect diff",
-        "validate final source",
-        "run_script handles program-like languages",
-        "failure/permission/validation boundaries",
-        "commit, push, deploy, restart",
-        "same-process state",
-        "one named ssh resource",
-        "runner-owned",
+        "run_script for program-like scripts",
+        "predetermined related observations may share one command",
+        "result-dependent follow-ups stay sequential",
+        "project-source mutation should normally use canonical structured editors",
+        "runner-owned execution",
         "timeout_secs is total lifetime",
-        "sync_wait_secs is job-handoff grace",
-        "later observe wait is one observation",
-        "duration does not select the primitive",
-        "run_detached_process",
+        "server timing policy controls job-handoff grace",
+        "execution_state=pending",
+        "continue independent work",
+        "sparse terminal job attention",
+        "observe_jobs only for logs/details/recovery",
+        "bounded wait_for_job_readiness when terminal outcome blocks progress",
+        "duration alone does not select a detached primitive",
     ] {
         assert!(
             run_shell_desc.contains(phrase),
@@ -528,20 +510,28 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     }
 
     let run_process_desc = desc("run_process");
+    // Cover the selection and lifecycle choices, not the retired full prose.
+    // Interactive mode shares the tool but has a deliberately explicit contract.
     for phrase in [
-        "one-shot executable with structured argv",
-        "preferred route for one native executable with literal argv",
+        "native executable with structured literal argv",
+        "run_shell for shell grammar",
         "windows batch shims",
-        "bounded runner-owned quoting contract",
-        "run_shell only when shell semantics or a short tightly related command chain",
-        "do not open a persistent shell merely to run several commands",
-        "same-process cwd/env/exports/functions/umask state",
-        "one named ssh resource",
-        "ssh_resource onboarding",
-        "one-shot/no-persistence ssh",
-        "runner-owned",
-        "outlive the runner",
+        "runner-owned quoting",
+        "persistent shell is only for retained same-process",
+        "same execution",
+        "owned by runner",
+        "continue independent work",
+        "sparse terminal job attention",
+        "observe_jobs only for logs/details/recovery",
+        "bounded wait_for_job_readiness when terminal outcome blocks progress",
         "run_detached_process",
+        "survive runner restart/upgrade/stop/replacement",
+        "never for duration alone",
+        "interactive=true",
+        "job_write_input",
+        "bytes/eof",
+        "no pty",
+        "structured validation evidence",
     ] {
         assert!(
             run_process_desc.contains(phrase),
@@ -549,30 +539,23 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
+    // Interpreter/runtime details stay locked by run_script input-schema tests;
+    // this model-facing description test keeps selection and lifecycle decisions dense.
     let run_script_desc = desc("run_script");
     for phrase in [
-        "sh, bash, powershell, javascript, or typescript",
-        "node.js-backed",
-        ".mjs",
-        "native erasable type stripping",
-        ".mts",
-        "node.js 22.6+",
-        "does not type-check",
-        "enum",
-        "runner owns runtime selection/flags",
-        "does not install npm dependencies",
-        "relative esm imports resolve from the runner-owned temporary module",
-        "bun",
-        "deno",
-        "tsx",
-        "run tsc",
+        "sh, bash, powershell, python, javascript, or typescript",
         "run_process for native argv",
-        "run_script for program-like scripts",
-        "run_shell when shell grammar is required",
-        "same execution / same job",
-        "never restarted",
-        "outlive the runner",
-        "run_detached_process",
+        "computation/inspection/generation/non-source transforms",
+        "run_shell for shell grammar",
+        "project-source mutation should normally use canonical structured editors",
+        "same execution and remains runner-owned",
+        "execution_state=pending",
+        "continue independent work",
+        "sparse terminal job attention",
+        "observe_jobs only for logs/details/recovery",
+        "bounded wait_for_job_readiness when terminal outcome blocks progress",
+        "script bodies never become shell command text",
+        "survive runner restart/upgrade/stop/replacement",
     ] {
         assert!(
             run_script_desc.contains(phrase),
@@ -727,17 +710,17 @@ fn removed_legacy_edit_tools_are_not_known_tools() {
 fn model_preference_upper_bounds_are_clamped_by_runtime_not_rejected_by_schema() {
     let specs = registered_tool_specs();
     let cases: &[(&str, &[&str])] = &[
-        ("run_process", &["timeout_secs", "sync_wait_secs"]),
+        ("run_process", &["timeout_secs"]),
         ("run_detached_process", &["timeout_secs"]),
-        ("run_script", &["timeout_secs", "sync_wait_secs"]),
+        ("run_script", &["timeout_secs"]),
         ("run_shell", &["timeout_secs"]),
         ("session_shell_exec", &["timeout_secs"]),
         ("observe_jobs", &["tail_lines", "wait_secs"]),
         ("list_jobs", &["limit"]),
-        ("cargo_fmt", &["timeout_secs", "sync_wait_secs"]),
-        ("cargo_check", &["timeout_secs", "sync_wait_secs"]),
-        ("cargo_test", &["timeout_secs", "sync_wait_secs"]),
-        ("go_test", &["timeout_secs", "sync_wait_secs"]),
+        ("cargo_fmt", &["timeout_secs"]),
+        ("cargo_check", &["timeout_secs"]),
+        ("cargo_test", &["timeout_secs"]),
+        ("go_test", &["timeout_secs"]),
         ("session_discussion_summary", &["limit"]),
         ("workspace_hygiene_check", &["max_findings"]),
         ("list_projects", &["limit"]),
@@ -800,22 +783,22 @@ fn call_hierarchy_schema_keeps_traversal_strict_and_result_budget_clamped() {
 }
 
 #[test]
-fn edit_tool_surface_keeps_mutation_options_visible_and_schemas_stable() {
+fn edit_tool_surface_keeps_one_primary_editor_and_exact_specialists_stable() {
     let specs = registered_tool_specs();
+    let specialist_specs = exact_manifest_specialist_tool_specs();
     let names: std::collections::BTreeSet<&str> =
         specs.iter().map(|spec| spec.name.as_str()).collect();
 
-    for required in [
-        "apply_text_edits",
-        "apply_patch",
-        "apply_unified_diff",
-        "write_project_file",
-    ] {
+    assert!(names.contains("edit_project_files"));
+    for hidden in EXACT_MANIFEST_SPECIALIST_TOOL_NAMES {
+        assert!(!names.contains(hidden), "{hidden} must stay model-hidden");
+    }
+    for required in EXACT_MANIFEST_SPECIALIST_TOOL_NAMES {
         assert!(
-            names.contains(required),
-            "edit surface must keep {required} model-visible"
+            specialist_specs.iter().any(|spec| spec.name == *required),
+            "exact-manifest surface must keep {required}"
         );
-        let spec = spec_named(&specs, required);
+        let spec = spec_named(&specialist_specs, required);
         assert!(
             spec.input_schema.is_object(),
             "{required} must keep an object input schema"
@@ -827,22 +810,22 @@ fn edit_tool_surface_keeps_mutation_options_visible_and_schemas_stable() {
     }
 
     // Parameter surface smoke checks (names only; not full-schema snapshots).
-    let text_edits = &spec_named(&specs, "apply_text_edits").input_schema["properties"];
+    let text_edits = &spec_named(&specs, "edit_project_files").input_schema["properties"];
     for field in ["project", "changes", "dry_run"] {
         assert!(
             text_edits.get(field).is_some(),
             "apply_text_edits must keep field {field}"
         );
     }
-    let text_edit_output =
-        &spec_named(&specs, "apply_text_edits").output_schema["properties"]["output"]["properties"];
+    let text_edit_output = &spec_named(&specs, "edit_project_files").output_schema["properties"]
+        ["output"]["properties"];
     let text_edit_file_properties = text_edit_output["files"]["items"]["properties"]
         .as_object()
         .expect("apply_text_edits file summary properties");
     assert!(text_edit_file_properties.contains_key("read_revision"));
     assert!(!text_edit_file_properties.contains_key("old_sha256"));
     assert!(!text_edit_file_properties.contains_key("new_sha256"));
-    let codex_patch = &spec_named(&specs, "apply_patch").input_schema["properties"];
+    let codex_patch = &spec_named(&specialist_specs, "apply_patch").input_schema["properties"];
     for field in ["project", "patch", "dry_run", "matching_mode"] {
         assert!(
             codex_patch.get(field).is_some(),
@@ -867,7 +850,7 @@ fn edit_tool_surface_keeps_mutation_options_visible_and_schemas_stable() {
         codex_patch.get("strict_matching").is_none(),
         "legacy strict_matching must not remain model-facing"
     );
-    let patch_spec = spec_named(&specs, "apply_patch");
+    let patch_spec = spec_named(&specialist_specs, "apply_patch");
     assert!(patch_spec.description.contains("naturally patch-shaped"));
     assert!(patch_spec
         .description
@@ -963,7 +946,8 @@ fn edit_tool_surface_keeps_mutation_options_visible_and_schemas_stable() {
     assert!(patch_spec.description.contains("Transactional"));
     assert!(patch_spec.description.contains("matching_mode_rejected"));
     assert!(patch_spec.description.contains("weakening the guard"));
-    let unified_diff = &spec_named(&specs, "apply_unified_diff").input_schema["properties"];
+    let unified_diff =
+        &spec_named(&specialist_specs, "apply_unified_diff").input_schema["properties"];
     for field in ["project", "diff", "deny_sensitive_paths"] {
         assert!(
             unified_diff.get(field).is_some(),
@@ -971,7 +955,8 @@ fn edit_tool_surface_keeps_mutation_options_visible_and_schemas_stable() {
         );
     }
     assert!(unified_diff.get("patch").is_none());
-    let write_file = &spec_named(&specs, "write_project_file").input_schema["properties"];
+    let write_file =
+        &spec_named(&specialist_specs, "write_project_file").input_schema["properties"];
     for field in ["project", "path", "content"] {
         assert!(
             write_file.get(field).is_some(),
@@ -1016,12 +1001,26 @@ fn session_tool_specs_describe_explicit_targeting() {
         .as_str()
         .expect("work_on_project session_id description")
         .to_lowercase();
-    for phrase in ["does not prove", "fresh model context", "context_request"] {
+    for phrase in [
+        "does not prove",
+        "fresh model context",
+        "_wc.context",
+        "_wc.record",
+    ] {
         assert!(
             session_id_description.contains(phrase),
             "work_on_project session_id description should mention {phrase}: {session_id_description}"
         );
     }
+    let work_schema_text = serde_json::to_string(&work.input_schema).unwrap();
+    for legacy in ["context_request", "recording_session_id"] {
+        assert!(
+            !work_schema_text.contains(legacy),
+            "work_on_project model-facing schema prose leaked legacy wrapper {legacy}: {work_schema_text}"
+        );
+    }
+    assert!(work.description.contains("_wc.context"));
+    assert!(!work.description.contains("context_request"));
     let update_desc = update.description.to_lowercase();
     for phrase in [
         "authorized project",
@@ -1080,7 +1079,7 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
     );
     assert_eq!(
         wake["enum"],
-        serde_json::json!(["change", "terminal", "all_terminal"])
+        serde_json::json!(["change", "meaningful_change", "terminal", "all_terminal"])
     );
     assert_eq!(wake["default"], "change");
     assert!(!spec.input_schema["required"]
@@ -1091,6 +1090,7 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
         "No token",
         "no wait_secs",
         "wake_on=change",
+        "wake_on=meaningful_change",
         "wake_on=terminal",
         "useful progress is blocked on terminal outcome",
         "independent work remains",
@@ -1099,30 +1099,18 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
     ] {
         assert!(spec.description.contains(phrase), "missing {phrase}");
     }
-    let recommended_wait = format!(
-        "wait_secs={}",
-        webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
-    );
-    assert!(
-        spec.description.contains(&recommended_wait),
-        "missing {recommended_wait}"
-    );
     let wait_description = spec.input_schema["properties"]["wait_secs"]["description"]
         .as_str()
         .unwrap();
     assert!(wait_description.contains("above 100 seconds"));
     assert!(wait_description.contains("clamped to 100"));
-    let recommended_wait_description = format!(
-        "recommend {} seconds",
-        webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
-    );
-    assert!(wait_description.contains(&recommended_wait_description));
+    assert!(wait_description.contains("MCP transport may clamp"));
     assert!(wait_description.contains("further useful progress depends on terminal outcome"));
     assert!(wait_description.contains("independent work continues"));
     let wake_description = wake["description"].as_str().unwrap();
     assert!(wake_description.contains("any terminal result unblocks progress"));
     assert!(wake_description.contains("predetermined set"));
-    for policy in ["change", "terminal", "all_terminal"] {
+    for policy in ["change", "meaningful_change", "terminal", "all_terminal"] {
         test_support::validate_schema_instance(
             &json!({"items": [{"job_id": "job"}], "wake_on": policy}),
             &spec.input_schema,

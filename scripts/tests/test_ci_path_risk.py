@@ -39,6 +39,20 @@ class PathRiskFixtureTests(unittest.TestCase):
         self.assertEqual(result["needs_windows"], "false")
         self.assertEqual(result["needs_macos"], "false")
 
+    def test_shared_frontend_source_and_dependencies_also_check_desktop(self) -> None:
+        for path in (
+            "frontend/src/ui/ProjectPicker.tsx",
+            "frontend/src/ui/foundation.css",
+            "frontend/package.json",
+            "frontend/package-lock.json",
+        ):
+            with self.subTest(path=path):
+                result = classify(path)
+                self.assertEqual(result["needs_frontend"], "true")
+                self.assertEqual(result["needs_desktop_frontend"], "true")
+                self.assertEqual(result["needs_windows"], "false")
+                self.assertEqual(result["needs_macos"], "false")
+
     def test_desktop_frontend_isolated_from_main_frontend_and_native(self) -> None:
         result = classify("apps/desktop/src/main.tsx")
         self.assertEqual(result["needs_frontend"], "false")
@@ -53,6 +67,16 @@ class PathRiskFixtureTests(unittest.TestCase):
         self.assertEqual(result["needs_macos_desktop"], "true")
         self.assertEqual(result["needs_desktop_package"], "true")
         self.assertEqual(result["needs_desktop_frontend"], "false")
+
+    def test_codex_python_adapter_requires_windows_core_only(self) -> None:
+        result = classify("integrations/codex/platform_security.py")
+        self.assertEqual(result["needs_windows_core"], "true")
+        self.assertEqual(result["needs_windows_runner"], "false")
+        self.assertEqual(result["needs_windows_package"], "false")
+        self.assertEqual(result["needs_windows_desktop"], "false")
+        self.assertEqual(result["needs_macos"], "false")
+        self.assertEqual(result["needs_full_native"], "false")
+        self.assertIn("codex-adapter", result["categories"])
 
     def test_process_requires_windows_core_and_macos_without_desktop_package(self) -> None:
         result = classify("crates/webcodex-process/src/lib.rs")
@@ -103,6 +127,9 @@ class PathRiskFixtureTests(unittest.TestCase):
             "plugins/campus-application/src/plugin.ts",
             "plugins/campus-application/tests/application-flow.test.mjs",
             "plugins/campus-application/package-lock.json",
+            "plugins/agent-browser/src/plugin.ts",
+            "plugins/agent-browser/tests/core.test.mjs",
+            "plugins/agent-browser/package-lock.json",
         ):
             with self.subTest(path=path):
                 result = classify(path)
@@ -187,6 +214,9 @@ class PathRiskFixtureTests(unittest.TestCase):
         for path in (
             ".github/workflows/release-build.yml",
             "scripts/macos_sign_local_runner.sh",
+            "scripts/macos_ci_developer_id_setup.sh",
+            "scripts/macos_sign_runner.sh",
+            "scripts/verify_macos_desktop_identity.sh",
         ):
             with self.subTest(path=path):
                 result = classify(path)
@@ -263,6 +293,52 @@ class InvocationOverrideFixtureTests(unittest.TestCase):
         )
         self.assertIsNone(forced)
 
+    def test_merge_group_uses_path_classifier(self) -> None:
+        forced = risk.forced_risk_for_invocation(
+            "merge_group", external_contributor=False, run_ci=False
+        )
+        self.assertIsNone(forced)
+
+    def test_merge_group_cli_accepts_exact_range(self) -> None:
+        expected = risk.Risk()
+        with mock.patch.object(risk, "classify_git_range", return_value=expected) as classify_range:
+            exit_code = risk.main(
+                [
+                    "--event-name",
+                    "merge_group",
+                    "--external-contributor",
+                    "false",
+                    "--run-ci",
+                    "false",
+                    "--base",
+                    "0" * 40,
+                    "--head",
+                    "1" * 40,
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        classify_range.assert_called_once_with("0" * 40, "1" * 40)
+
+    def test_merge_group_diff_failure_falls_back_to_full_native(self) -> None:
+        with mock.patch.object(
+            risk, "classify_git_range", side_effect=risk.GitDiffError("synthetic ref missing")
+        ):
+            exit_code = risk.main(
+                [
+                    "--event-name",
+                    "merge_group",
+                    "--external-contributor",
+                    "false",
+                    "--run-ci",
+                    "false",
+                    "--base",
+                    "0" * 40,
+                    "--head",
+                    "1" * 40,
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+
     def test_external_contributor_preserves_full_native_policy(self) -> None:
         forced = risk.forced_risk_for_invocation(
             "pull_request", external_contributor=True, run_ci=False
@@ -277,6 +353,18 @@ class InvocationOverrideFixtureTests(unittest.TestCase):
                 "pull_request", external_contributor=False, run_ci=False
             )
         )
+
+
+class MergeGroupWorkflowContractTests(unittest.TestCase):
+    def test_ci_workflow_exposes_merge_queue_required_contexts(self) -> None:
+        workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("  merge_group:\n    types: [checks_requested]", workflow)
+        self.assertIn("github.event.merge_group.base_sha", workflow)
+        self.assertIn("github.event.merge_group.head_sha", workflow)
+        self.assertIn("MERGE_GROUP_HEAD_REF", workflow)
+        self.assertIn('if [ "$EVENT_NAME" = merge_group ]', workflow)
+        self.assertIn("  test:\n", workflow)
+        self.assertIn("  test-native:\n", workflow)
 
 
 class GitRangeIntegrationTests(unittest.TestCase):

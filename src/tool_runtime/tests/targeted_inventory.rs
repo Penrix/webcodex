@@ -50,6 +50,7 @@ async fn register_target_agent(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build,
             job_concurrency_limit: Some(4),
@@ -91,6 +92,7 @@ async fn register_target_agent_for_auth(
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: Some(4),
@@ -144,6 +146,7 @@ async fn register_managed_target_agent(
     runtime
         .runner_registry
         .register(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: Some(4),
@@ -222,6 +225,7 @@ async fn list_projects_batch_job_counts_join_exact_projects_and_skip_empty_selec
             .runner_registry
             .start_job_with_metadata(
                 crate::runner_protocol::ShellJobOpRequest {
+                    login: false,
                     op: "start".into(),
                     client_id: Some("batch".into()),
                     cwd: None,
@@ -608,7 +612,7 @@ async fn managed_users_discover_only_their_own_runner_project_metadata() {
         .dispatch_with_auth(runtime_status_call(None, true), Some(&alice))
         .await;
     assert!(alice_status.success, "{:?}", alice_status.error);
-    assert_eq!(alice_status.output["agents"]["count"], 2);
+    assert_eq!(alice_status.output["runners"]["count"], 2);
     assert!(!alice_status.output.to_string().contains("bob-runner"));
     let hidden_status = runtime
         .dispatch_with_auth(runtime_status_call(Some("bob-runner"), true), Some(&alice))
@@ -636,7 +640,7 @@ async fn managed_users_discover_only_their_own_runner_project_metadata() {
         .await;
     assert!(bob_agents.success, "{:?}", bob_agents.error);
     assert_eq!(bob_agents.output["count"], 1);
-    assert_eq!(bob_agents.output["agents"][0]["client_id"], "bob-runner");
+    assert_eq!(bob_agents.output["runners"][0]["client_id"], "bob-runner");
 
     let admin_agents = runtime
         .dispatch_with_auth(
@@ -665,7 +669,14 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
             registered_project("webcodex", "/root/git/webcodex"),
             registered_project("other", "/tmp/other"),
         ],
-        None,
+        Some(RunnerBuildInfo {
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            git_commit: Some("catalog-build".to_string()),
+            git_dirty: Some(false),
+            built_at: Some("300".to_string()),
+            target: Some("x86_64-pc-windows-msvc".to_string()),
+            architecture: Some("x86_64".to_string()),
+        }),
     )
     .await;
     register_target_agent(
@@ -681,7 +692,7 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
         .await;
     assert!(legacy.success);
     assert_eq!(legacy.output["count"], 3);
-    assert!(legacy.output["agents"][0].get("projects").is_some());
+    assert!(legacy.output["runners"][0].get("projects").is_some());
 
     let focused = runtime
         .dispatch(list_runners_call(Some("special"), None, Some(false), true))
@@ -689,9 +700,12 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
     assert!(focused.success, "{:?}", focused.error);
     assert_eq!(focused.output["count"], 1);
     assert!(focused.output.get("clients").is_none());
-    let agent = &focused.output["agents"][0];
+    let agent = &focused.output["runners"][0];
     assert_eq!(agent["client_id"], "special");
     assert_eq!(agent["projects_count"], 2);
+    assert_eq!(agent["build"]["built_at"], "300");
+    assert_eq!(agent["build"]["target"], "x86_64-pc-windows-msvc");
+    assert_eq!(agent["build"]["architecture"], "x86_64");
     for omitted in [
         "projects",
         "capabilities",
@@ -714,14 +728,14 @@ async fn list_runners_supports_exact_batch_and_compact_projection() {
         ))
         .await;
     assert!(batch.success);
-    let ids = batch.output["agents"]
+    let ids = batch.output["runners"]
         .as_array()
         .unwrap()
         .iter()
         .map(|agent| agent["client_id"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["mini", "special"]);
-    assert!(batch.output["agents"]
+    assert!(batch.output["runners"]
         .as_array()
         .unwrap()
         .iter()
@@ -766,11 +780,17 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         git_commit: Some("A".to_string()),
         git_dirty: Some(false),
+        built_at: Some("100".to_string()),
+        target: Some("x86_64-unknown-linux-gnu".to_string()),
+        architecture: Some("x86_64".to_string()),
     };
     let mini_build = RunnerBuildInfo {
         version: Some("0.0.1".to_string()),
         git_commit: Some("B".to_string()),
         git_dirty: Some(false),
+        built_at: Some("200".to_string()),
+        target: Some("aarch64-apple-darwin".to_string()),
+        architecture: Some("aarch64".to_string()),
     };
     register_target_agent(
         &runtime,
@@ -805,13 +825,19 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
         .find(|runner| runner["client_id"] == "mini")
         .unwrap();
     assert_eq!(synthetic_special["source_alignment"]["status"], "aligned");
+    assert_eq!(synthetic_special["build_built_at"], "100");
+    assert_eq!(
+        synthetic_special["build_target"],
+        "x86_64-unknown-linux-gnu"
+    );
+    assert_eq!(synthetic_special["build_architecture"], "x86_64");
     assert_eq!(synthetic_mini["source_alignment"]["status"], "different");
 
     let global = runtime.dispatch(runtime_status_call(None, false)).await;
     assert!(global.success);
     assert_eq!(
         global.output["version_compatibility"]["status"],
-        "version_mismatch"
+        "compatible"
     );
     let global_special = global.output["version_compatibility"]["runners"]
         .as_array()
@@ -819,23 +845,27 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
         .iter()
         .find(|runner| runner["client_id"] == "special")
         .unwrap();
+    let global_mini = global.output["version_compatibility"]["runners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|runner| runner["client_id"] == "mini")
+        .unwrap();
 
     let special = runtime
         .dispatch(runtime_status_call(Some("special"), true))
         .await;
     assert!(special.success, "{:?}", special.error);
     assert_eq!(special.output["focus"]["client_id"], "special");
+    assert!(special.output["focus"].get("build").is_none());
+    assert!(special.output.get("fleet_summary").is_none());
     assert_eq!(
-        special.output["version_compatibility"]["status"],
+        special.output["focus"]["protocol_compatibility"],
         "compatible"
     );
     assert_eq!(
         special.output["focus"]["source_alignment"],
-        global_special["source_alignment"]
-    );
-    assert_eq!(
-        special.output["fleet_summary"]["mismatched_agents_count"],
-        1
+        global_special["source_alignment"]["status"]
     );
     let serialized = special.output.to_string();
     assert!(!serialized.contains("inst-mini"));
@@ -846,10 +876,12 @@ async fn runtime_status_focus_is_not_polluted_by_unrelated_runner_mismatch() {
         .await;
     assert!(mini.success);
     assert_eq!(mini.output["focus"]["client_id"], "mini");
+    assert_eq!(mini.output["focus"]["protocol_compatibility"], "compatible");
     assert_eq!(
-        mini.output["version_compatibility"]["status"],
-        "version_mismatch"
+        mini.output["focus"]["build_alignment"],
+        global_mini["build_alignment"]
     );
+    assert_eq!(mini.output["focus"]["protocol_compatibility"], "compatible");
 
     let unknown = runtime
         .dispatch(runtime_status_call(Some("missing"), true))
@@ -879,7 +911,23 @@ async fn runtime_status_focus_preserves_selected_stale_runner_truth() {
     assert!(focused.success, "{:?}", focused.error);
     assert_eq!(focused.output["focus"]["connected"], false);
     assert_eq!(focused.output["focus"]["status"], "stale");
-    assert_eq!(focused.output["agents"]["count"], 1);
+    assert_eq!(focused.output["runners"]["count"], 1);
+    let sparse = runtime
+        .dispatch(runtime_status_call(Some("special"), true))
+        .await;
+    assert!(sparse.success);
+    assert_eq!(sparse.output["focus"]["connected"], false);
+    assert_eq!(sparse.output["focus"]["status"], "stale");
+    assert_eq!(
+        sparse.output["connection"]["server_transport"],
+        "disconnected"
+    );
+    assert_eq!(sparse.output["connection"]["project_registry"], "stale");
+    assert!(serde_json::to_vec(&sparse.output).unwrap().len() <= 1_050);
+    let fleet = runtime.dispatch(runtime_status_call(None, true)).await;
+    assert_eq!(fleet.output["runners"]["stale_count"], 1);
+    assert_eq!(fleet.output["runners"]["online_count"], 0);
+    assert!(serde_json::to_vec(&fleet.output).unwrap().len() <= 900);
 }
 
 #[test]

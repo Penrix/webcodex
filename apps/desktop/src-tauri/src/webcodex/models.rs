@@ -34,6 +34,7 @@ pub struct LoginOutput {
     pub server_url: String,
     pub runner_config: String,
     pub user_token_file: String,
+    pub device: String,
     #[serde(default)]
     pub registered_projects: Vec<RegisteredProjectOutput>,
 }
@@ -41,9 +42,18 @@ pub struct LoginOutput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerStatusOutput {
     pub http_reachable: bool,
+    #[serde(default)]
+    pub server_pid: Option<u32>,
     pub probe_url: String,
     #[serde(default)]
     pub revision_check: Option<String>,
+    #[serde(default)]
+    pub desktop_runtime_contract:
+        Option<webcodex_core::desktop_runtime_contract::DesktopRuntimeContract>,
+    #[serde(default)]
+    pub protocol_compatibility: Option<String>,
+    #[serde(default)]
+    pub server_build: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -146,11 +156,13 @@ mod tests {
                 "server_url":"https://example.test",
                 "runner_config":"C:\\state\\runner.toml",
                 "user_token_file":"C:\\state\\user-token",
+                "device":"desktop-runner",
                 "future_metadata":{"generation":3}
             }"#,
         )
         .unwrap();
         assert!(login.registered_projects.is_empty());
+        assert_eq!(login.device, "desktop-runner");
 
         let runner: RunnerStatusOutput = serde_json::from_str(
             r#"{
@@ -188,6 +200,15 @@ mod tests {
 
     #[test]
     fn json_contracts_fail_closed_when_required_identity_is_missing() {
+        let missing_device = serde_json::from_str::<LoginOutput>(
+            r#"{
+                "server_url":"https://example.test",
+                "runner_config":"C:\\state\\runner.toml",
+                "user_token_file":"C:\\state\\user-token"
+            }"#,
+        );
+        assert!(missing_device.is_err());
+
         let invalid = serde_json::from_str::<RunnerStatusOutput>(
             r#"{
                 "config":{

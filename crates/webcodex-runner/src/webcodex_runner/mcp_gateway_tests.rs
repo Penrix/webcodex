@@ -28,7 +28,7 @@ fn fake_binary() -> Arc<FakeBinary> {
     if let Some(binary) = cached.upgrade() {
         return binary;
     }
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::tests::executable_tempdir();
     let output = temp.path().join(format!(
         "webcodex-mcp-bridge-fake{}",
         env::consts::EXE_SUFFIX
@@ -101,6 +101,9 @@ impl Fixture {
         let marker = temp.path().join("marker.log");
         let fake = fake_binary();
         let mut args = vec![scenario.to_string(), marker.to_string_lossy().to_string()];
+        if scenario == "oversized_message" {
+            args.push((MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES + 1).to_string());
+        }
         if let Some(cwd) = cwd.as_ref() {
             args.push(cwd.clone());
         }
@@ -450,10 +453,12 @@ fn image_only_result_succeeds_with_standard_wire_fields() {
 
 #[test]
 fn image_result_crosses_expanded_provider_wire_bound_and_reuses_connection() {
-    assert_eq!(MCP_GATEWAY_MAX_IMAGE_BYTES, 1024 * 1024);
-    assert_eq!(MCP_GATEWAY_MAX_IMAGE_BASE64_BYTES, 1_398_104);
+    assert_eq!(MCP_GATEWAY_MAX_IMAGE_BYTES, 4 * 1024 * 1024);
+    assert_eq!(MCP_GATEWAY_MAX_IMAGE_BASE64_BYTES, 5_592_408);
     assert!(MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES > MCP_GATEWAY_MAX_MESSAGE_BYTES);
-    assert!(MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES < 2 * 1024 * 1024);
+    assert!(
+        MCP_GATEWAY_MAX_PROVIDER_MESSAGE_BYTES < crate::runner_protocol::RUNNER_ENVELOPE_MAX_BYTES
+    );
 
     let fixture = Fixture::new("max_image_result", 3);
     let provider = fixture.provider();
@@ -593,76 +598,77 @@ fn tools_call_sends_only_gateway_owned_name_and_arguments() {
 
 #[test]
 fn provider_execution_context_is_explicit_cleared_and_private() {
-    let _guard = crate::tests::test_env_lock();
-    let _env = crate::tests::EnvGuard::new()
+    crate::tests::IsolatedEnv::new()
         .set("GITHUB_TOKEN", "github-provider-secret-value")
         .set("WEBCODEX_MCP_MAPPED_SOURCE", "mapped-provider-secret-value")
-        .set("WEBCODEX_MCP_UNLISTED", "must-not-reach-provider");
-    let cwd = tempfile::tempdir().unwrap();
-    let fixture = Fixture::with_execution_context(
-        "execution_context",
-        TEST_PARALLEL_TIMEOUT_FLOOR_SECS,
-        None,
-        Some(cwd.path().to_string_lossy().into_owned()),
-        BTreeMap::from([
-            ("GITHUB_TOKEN".to_string(), "GITHUB_TOKEN".to_string()),
-            (
-                "WEBCODEX_MCP_MAPPED_CHILD".to_string(),
-                "WEBCODEX_MCP_MAPPED_SOURCE".to_string(),
-            ),
-        ]),
-    );
-    let provider = fixture.provider();
-    let inventory = serde_json::to_string(&fixture.manager.provider_inventory()).unwrap();
-    assert!(!inventory.contains("github-provider-secret-value"));
-    assert!(!inventory.contains("mapped-provider-secret-value"));
+        .set("WEBCODEX_MCP_UNLISTED", "must-not-reach-provider")
+        .run("inherited", || {
+            let cwd = tempfile::tempdir().unwrap();
+            let fixture = Fixture::with_execution_context(
+                "execution_context",
+                TEST_PARALLEL_TIMEOUT_FLOOR_SECS,
+                None,
+                Some(cwd.path().to_string_lossy().into_owned()),
+                BTreeMap::from([
+                    ("GITHUB_TOKEN".to_string(), "GITHUB_TOKEN".to_string()),
+                    (
+                        "WEBCODEX_MCP_MAPPED_CHILD".to_string(),
+                        "WEBCODEX_MCP_MAPPED_SOURCE".to_string(),
+                    ),
+                ]),
+            );
+            let provider = fixture.provider();
+            let inventory = serde_json::to_string(&fixture.manager.provider_inventory()).unwrap();
+            assert!(!inventory.contains("github-provider-secret-value"));
+            assert!(!inventory.contains("mapped-provider-secret-value"));
 
-    let response = fixture.list(&provider);
-    assert!(response.error.is_none(), "{:?}", response.error);
-    for marker in [
-        "github-env-ok",
-        "mapped-env-ok",
-        "unlisted-env-cleared",
-        "path-cleared",
-        "cwd-ok",
-    ] {
-        assert_eq!(fixture.marker_count(marker), 1, "missing marker {marker}");
-    }
-    #[cfg(windows)]
-    assert_eq!(
-        fixture.marker_count("systemroot-bootstrap-ok"),
-        1,
-        "Windows MCP providers need the minimal SYSTEMROOT bootstrap after env_clear()"
-    );
-    let encoded = serde_json::to_string(&response).unwrap();
-    assert!(!encoded.contains("github-provider-secret-value"));
-    assert!(!encoded.contains("mapped-provider-secret-value"));
-    assert!(!encoded.contains("must-not-reach-provider"));
+            let response = fixture.list(&provider);
+            assert!(response.error.is_none(), "{:?}", response.error);
+            for marker in [
+                "github-env-ok",
+                "mapped-env-ok",
+                "unlisted-env-cleared",
+                "path-cleared",
+                "cwd-ok",
+            ] {
+                assert_eq!(fixture.marker_count(marker), 1, "missing marker {marker}");
+            }
+            #[cfg(windows)]
+            assert_eq!(
+                fixture.marker_count("systemroot-bootstrap-ok"),
+                1,
+                "Windows MCP providers need the minimal SYSTEMROOT bootstrap after env_clear()"
+            );
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains("github-provider-secret-value"));
+            assert!(!encoded.contains("mapped-provider-secret-value"));
+            assert!(!encoded.contains("must-not-reach-provider"));
+        });
 }
-
 #[test]
 fn missing_mapped_source_fails_before_provider_spawn() {
-    let _guard = crate::tests::test_env_lock();
-    let _env = crate::tests::EnvGuard::new().remove("WEBCODEX_MCP_TEST_MISSING_SOURCE");
-    let fixture = Fixture::with_execution_context(
-        "normal",
-        2,
-        None,
-        None,
-        BTreeMap::from([(
-            "PROVIDER_CREDENTIAL".to_string(),
-            "WEBCODEX_MCP_TEST_MISSING_SOURCE".to_string(),
-        )]),
-    );
-    let response = fixture.list(&fixture.provider());
-    assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
-    assert_eq!(
-        response.error.as_ref().unwrap().code,
-        "provider_env_missing"
-    );
-    assert_eq!(fixture.marker_count("start"), 0);
+    crate::tests::IsolatedEnv::new()
+        .remove("WEBCODEX_MCP_TEST_MISSING_SOURCE")
+        .run("inherited", || {
+            let fixture = Fixture::with_execution_context(
+                "normal",
+                2,
+                None,
+                None,
+                BTreeMap::from([(
+                    "PROVIDER_CREDENTIAL".to_string(),
+                    "WEBCODEX_MCP_TEST_MISSING_SOURCE".to_string(),
+                )]),
+            );
+            let response = fixture.list(&fixture.provider());
+            assert_eq!(response.dispatch_state, McpGatewayDispatchState::NotStarted);
+            assert_eq!(
+                response.error.as_ref().unwrap().code,
+                "provider_env_missing"
+            );
+            assert_eq!(fixture.marker_count("start"), 0);
+        });
 }
-
 #[test]
 fn sensitive_runner_env_mapping_is_blocked_before_provider_spawn() {
     let fixture = Fixture::with_execution_context(

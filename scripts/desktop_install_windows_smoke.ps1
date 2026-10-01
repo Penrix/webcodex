@@ -6,11 +6,17 @@ param(
     [Parameter(Mandatory = $true)][string]$Version,
     [Parameter(Mandatory = $true)][string]$SourceSha,
     [Parameter(Mandatory = $true)][Int64]$BuiltAt,
-    [Parameter(Mandatory = $true)][ValidateSet("win32-x64", "win32-arm64")][string]$Platform
+    [Parameter(Mandatory = $true)][ValidateSet("win32-x64", "win32-arm64")][string]$Platform,
+    [bool]$GitDirty = $false,
+    [string]$InstallDir
 )
 
 $ErrorActionPreference = "Stop"
-$Installer = [System.IO.Path]::GetFullPath($Installer)
+
+function Resolve-InputPath([string]$Path) {
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+$Installer = Resolve-InputPath $Installer
 if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
     throw "Desktop installer does not exist: $Installer"
 }
@@ -19,6 +25,13 @@ if ($SourceSha -notmatch '^[0-9A-Fa-f]{40}$') {
 }
 if ($BuiltAt -le 0) {
     throw "BuiltAt must be a positive Unix timestamp"
+}
+$requestedInstallDir = $null
+if ($InstallDir) {
+    $requestedInstallDir = (Resolve-InputPath $InstallDir).TrimEnd('\')
+    if (Test-Path -LiteralPath $requestedInstallDir) {
+        throw "refusing custom-directory smoke because the requested install directory already exists: $requestedInstallDir"
+    }
 }
 
 function Get-WebCodexUninstallEntry {
@@ -116,6 +129,25 @@ function Wait-Until([scriptblock]$Condition, [int]$Seconds, [string]$Failure) {
     throw $Failure
 }
 
+function Remove-FileEventually([string]$Path, [int]$Seconds, [string]$Failure) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    do {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+        try {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        } catch {
+            if ([DateTime]::UtcNow -ge $deadline) {
+                throw "$Failure Last error: $($_.Exception.Message)"
+            }
+            Start-Sleep -Milliseconds 250
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw $Failure
+}
+
 if (Get-WebCodexUninstallEntry) {
     throw "refusing Desktop installer smoke because WebCodex Desktop is already installed for this user"
 }
@@ -124,7 +156,14 @@ $installedDir = $null
 $uninstaller = $null
 $installed = $false
 try {
-    $installProcess = Start-Process -FilePath $Installer -ArgumentList "/S" -Wait -PassThru
+    # NSIS requires /D= to be the final argument. Its value intentionally consumes
+    # the remainder of the command line, so a path containing spaces is passed
+    # literally without shell-style quoting or escaping.
+    $installArguments = @("/S")
+    if ($requestedInstallDir) {
+        $installArguments += "/D=$requestedInstallDir"
+    }
+    $installProcess = Start-Process -FilePath $Installer -ArgumentList $installArguments -Wait -PassThru
     if ($installProcess.ExitCode -ne 0) {
         throw "Desktop silent install failed with exit code $($installProcess.ExitCode)"
     }
@@ -140,6 +179,12 @@ try {
         Resolve-RegistryPath ([string]$entry.InstallLocation) "InstallLocation"
     } else {
         Split-Path -Parent ([System.IO.Path]::GetFullPath($uninstaller))
+    }
+    if ($requestedInstallDir) {
+        $actualInstallDir = $installedDir.TrimEnd('\')
+        if (-not [string]::Equals($actualInstallDir, $requestedInstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "custom Desktop InstallLocation mismatch: expected '$requestedInstallDir', got '$installedDir'"
+        }
     }
 
     $desktopExe = Join-Path $installedDir "WebCodex.exe"
@@ -157,13 +202,14 @@ try {
     }
 
     $shortSource = $SourceSha.Substring(0, 12).ToLowerInvariant()
+    $dirtyText = if ($GitDirty) { "true" } else { "false" }
     foreach ($name in @("webcodex", "webcodex-server", "webcodex-runner")) {
         $binary = Join-Path $runtimeDir "$name.exe"
         if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
             throw "installed bundled binary is missing: $binary"
         }
         $line = Get-VersionLine $binary $name
-        $expected = "$name $Version (commit $shortSource, dirty=false, built_at=$BuiltAt)"
+        $expected = "$name $Version (commit $shortSource, dirty=$dirtyText, built_at=$BuiltAt)"
         if ($line -ne $expected) {
             throw "unexpected installed $name.exe identity: '$line' (expected '$expected')"
         }
@@ -183,8 +229,9 @@ try {
             }
             # NSIS normally copies the uninstaller to a temporary directory and exits the
             # original process. `_?=$INSTDIR` keeps the real uninstall in this process so
-            # `-Wait` is authoritative; the harness then removes only the now-unlocked
-            # uninstaller that this NSIS wait mode intentionally cannot self-delete.
+            # `-Wait` is authoritative for process exit. Windows can still release the
+            # executable image handle slightly later, so the final uninstaller unlink is
+            # retried for a bounded interval below.
             $uninstallProcess = Start-Process -FilePath $uninstaller -ArgumentList "/S _?=$installedDir" -Wait -PassThru
             if ($uninstallProcess.ExitCode -ne 0) {
                 throw "Desktop silent uninstall failed with exit code $($uninstallProcess.ExitCode)"
@@ -207,7 +254,7 @@ try {
                     throw "Desktop installer-owned files remained after silent uninstall: $($remaining.Name -join ', ')"
                 }
                 if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
-                    Remove-Item -LiteralPath $uninstaller -Force
+                    Remove-FileEventually $uninstaller 30 "Desktop uninstaller remained locked after silent uninstall: $uninstaller"
                 }
                 Remove-Item -LiteralPath $installedDir -Force
             }

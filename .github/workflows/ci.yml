@@ -2,12 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'release/**'
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  merge_group:
+    types: [checks_requested]
 
-# Keep only the newest run for a PR. Main pushes use the commit SHA as the
-# group key, while both PR and main runs use path-aware daily CI classification.
+permissions:
+  contents: read
+
+# PR runs coalesce by PR number. Merge-group candidates plus main/release pushes use
+# the exact candidate SHA as the group key so each integration candidate keeps its evidence.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
@@ -17,9 +24,10 @@ env:
 
 jobs:
   changes:
-    # Classify only trusted event metadata plus base...head Git data. For PRs the
-    # classifier is loaded from the trusted base commit, so a PR cannot weaken its
-    # own native gates. If the trusted base predates the classifier, fail safe to
+    # Classify only trusted event metadata plus base...head Git data. For PRs and
+    # merge-group candidates the classifier is loaded from the trusted base commit,
+    # so candidate changes cannot weaken their own native gates. If the trusted base
+    # predates the classifier, fail safe to
     # the full daily native matrix instead of executing classifier code from the PR head.
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -45,9 +53,9 @@ jobs:
       reason: ${{ steps.classify.outputs.reason }}
     steps:
       - name: Checkout trusted classifier source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Classify native CI risk
@@ -56,9 +64,10 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EXTERNAL_CONTRIBUTOR: ${{ github.event_name == 'pull_request' && github.event.pull_request.user.login != github.repository_owner }}
           RUN_CI: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'run-ci') }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref || '' }}
         run: |
           set -euo pipefail
           classifier="scripts/ci_path_risk.py"
@@ -99,6 +108,20 @@ jobs:
             fi
           fi
 
+          if [ "$EVENT_NAME" = merge_group ] && \
+             ! git cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null; then
+            if [ -z "$MERGE_GROUP_HEAD_REF" ]; then
+              echo "merge-group head ref is missing" >&2
+              exit 1
+            fi
+            git fetch --no-tags origin "$MERGE_GROUP_HEAD_REF"
+            fetched_head="$(git rev-parse FETCH_HEAD)"
+            if [ "$fetched_head" != "$HEAD_SHA" ]; then
+              echo "fetched merge-group head does not match event head SHA" >&2
+              exit 1
+            fi
+          fi
+
           python3 "$classifier" \
             --event-name "$EVENT_NAME" \
             --external-contributor "$EXTERNAL_CONTRIBUTOR" \
@@ -115,14 +138,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-ci
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: needs.changes.outputs.needs_frontend == 'true' || needs.changes.outputs.needs_desktop_frontend == 'true' || needs.changes.outputs.needs_plugin_sdk == 'true'
         with:
           node-version: 22
@@ -135,8 +158,9 @@ jobs:
             plugins/repo-info/package-lock.json
             plugins/repo-context/package-lock.json
             plugins/campus-application/package-lock.json
+            plugins/agent-browser/package-lock.json
       - name: Install frontend dependencies
-        if: needs.changes.outputs.needs_frontend == 'true'
+        if: needs.changes.outputs.needs_frontend == 'true' || needs.changes.outputs.needs_desktop_frontend == 'true'
         run: npm ci --prefix frontend
       - name: Check frontend contracts
         if: needs.changes.outputs.needs_frontend == 'true'
@@ -161,6 +185,7 @@ jobs:
           npm ci --prefix plugins/repo-info
           npm ci --prefix plugins/repo-context
           npm ci --prefix plugins/campus-application
+          npm ci --prefix plugins/agent-browser
       - name: Check Plugin SDK contracts and first-party dogfood
         if: needs.changes.outputs.needs_plugin_sdk == 'true'
         run: |
@@ -176,10 +201,14 @@ jobs:
           npm --prefix plugins/repo-context test
           npm --prefix plugins/campus-application run typecheck
           npm --prefix plugins/campus-application test
+          npm --prefix plugins/agent-browser run typecheck
+          npm --prefix plugins/agent-browser test
       - name: Verify workspace boundaries
         run: |
           bash scripts/workspace_boundary_check.sh --self-test
           bash scripts/workspace_boundary_check.sh
+      - name: Check build identity and incremental boundary
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_build_identity
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Ensure test inventory dependency
@@ -191,13 +220,17 @@ jobs:
       - name: Check test inventory contract
         run: |
           bash scripts/test_inventory.sh --self-test
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_ci_rust_test
           bash scripts/test_inventory.sh
+      - name: Check macOS signing setup and release evidence contracts
+        # Fake signing commands and synthetic artifacts only; no Apple credentials.
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts.tests.test_macos_signing_setup scripts.tests.test_macos_release_evidence
       - name: Check schema and metadata contracts
         run: |
-          cargo test --locked -p webcodex --lib openapi
+          python3 scripts/tests/test_runner_observability_contract.py
           cargo test --locked -p webcodex --lib mcp_tools_list
-          cargo test --locked -p webcodex --lib tool_definition_surface_counts_and_action_projection_stay_canonical
-          cargo test --locked -p webcodex --lib external_provider_discovery_cannot_change_public_tool_or_openapi_surface
+          cargo test --locked -p webcodex --lib tool_definition_surface_counts_stay_canonical
+          cargo test --locked -p webcodex --lib external_provider_discovery_cannot_change_public_tool_surface
 
   mcp-conformance:
     # Dated MCP wire evidence is independent from ordinary unit/integration tests.
@@ -209,12 +242,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-ci
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Check conformance report gate
@@ -223,7 +256,7 @@ jobs:
         run: bash scripts/mcp_conformance.sh
       - name: Upload MCP conformance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mcp-conformance-${{ github.sha }}
           path: target/mcp-conformance/reports
@@ -251,13 +284,23 @@ jobs:
               --exclude webcodex-runner
               --exclude webcodex-lsp
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-ci
       - name: Run ${{ matrix.shard }} Rust tests
-        run: cargo test --locked ${{ matrix.packages }}
+        env:
+          CI_RUST_SHARD: ${{ matrix.shard }}
+        run: python3 scripts/ci_rust_test.py --report target/ci-test-reports/${{ matrix.shard }}.json -- cargo test --locked ${{ matrix.packages }}
+      - name: Upload bounded Rust test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rust-tests-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/ci-test-reports/*.json
+          if-no-files-found: warn
+          retention-days: 7
 
   test-linux-tooling:
     # Release/tooling checks are mandatory on every PR, but do not need contract
@@ -265,15 +308,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-ci
       # The retained npm release-smoke tooling below invokes node/npm directly.
       # Frontend dependency installation and frontend-specific npm caching remain
       # contract-lane responsibilities and are intentionally not repeated here.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Check MCP App DOM and message-order contracts
@@ -284,6 +327,10 @@ jobs:
             sudo apt-get update
             sudo apt-get install --no-install-recommends -y ripgrep
           fi
+      - name: Test optional Codex observation adapter
+        run: python3 -m unittest discover -s integrations/codex -p 'test_*.py' -v
+      - name: Test configured model API ACP adapter
+        run: python3 -m unittest discover -s integrations/model_gateway/tests -p 'test_*.py' -v
       - name: Check complete workspace production/test targets
         if: github.event_name == 'pull_request' && (github.event.pull_request.user.login != github.repository_owner || contains(github.event.pull_request.labels.*.name, 'run-ci'))
         run: cargo check --locked --workspace --all-targets
@@ -322,8 +369,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Resolve exact Server image build identity
         shell: bash
         run: |
@@ -338,7 +385,7 @@ jobs:
           git diff --check
           test -z "$(git status --porcelain --untracked-files=all)"
       - name: Build amd64 Server image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -407,9 +454,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: macos-core-ci-${{ matrix.platform }}
       - name: Verify native macOS host
@@ -441,18 +488,20 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: macos-desktop-ci-${{ matrix.platform }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
       - name: Verify native macOS host
         env:
           EXPECTED_HOST_ARCH: ${{ matrix.host_arch }}
@@ -461,6 +510,8 @@ jobs:
           test "$(uname -m)" = "$EXPECTED_HOST_ARCH"
           rust_host="$(rustc -vV | sed -n 's/^host: //p')"
           test "$rust_host" = "$EXPECTED_RUST_HOST"
+      - name: Install shared frontend dependencies
+        run: npm ci --prefix frontend
       - name: Install Desktop dependencies
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend
@@ -491,6 +542,7 @@ jobs:
             test "$actual" = "$expected"
             test "$(/usr/bin/lipo -archs "$binary")" = "$EXPECTED_FILE_ARCH"
           done
+          bash scripts/macos_sign_runner.sh target/dogfood/webcodex-runner -
           {
             echo "source=$source_sha"
             echo "short=$short_source"
@@ -592,9 +644,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows-core-ci
       - name: Configure PowerShell 7 persistent-shell tests
@@ -608,6 +663,19 @@ jobs:
         run: cargo check --locked --workspace
       - name: Run Windows library and CLI tests
         run: cargo test --locked -p webcodex-runner-config -p webcodex-process -p webcodex-cli
+      - name: Run Windows unified upgrade transactions including native v0.4.3 fixture
+        run: |
+          cargo test --locked -p webcodex-environment --lib upgrade::
+      - name: Test Windows unified installer routing and Desktop build freshness
+        run: python -m unittest scripts.tests.test_prepare_windows_unified_installer scripts.tests.test_desktop_runtime_manifest scripts.tests.test_desktop_frontend_build
+      - name: Test optional Codex observation adapter on Windows
+        run: python -m unittest discover -s integrations/codex -p 'test_*.py' -v
+      - name: Run Windows search fallback tests
+        run: |
+          cargo test --locked -p webcodex --lib search_project_text_grep
+          if ($LASTEXITCODE -ne 0) { throw "Windows grep fallback tests failed" }
+          cargo test --locked -p webcodex --lib search_requires_ripgrep_based_on_effective_features_not_field_presence
+          if ($LASTEXITCODE -ne 0) { throw "Windows search capability test failed" }
 
   test-windows-runner:
     needs: changes
@@ -615,12 +683,17 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows-runner-ci
       - name: Run Windows Runner and Computer tests
+        # This lane starts real PowerShell/MCP child processes. Keep the Rust
+        # harness bounded so hosted-runner scheduling does not consume their
+        # production startup/request deadlines.
+        env:
+          RUST_TEST_THREADS: "2"
         run: cargo test --locked -p webcodex-runner -p webcodex-lsp -p webcodex-computer --features runner-real-process-tests
 
   test-windows-package:
@@ -629,12 +702,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows-package-ci
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Test npm installer and release manifest natively
@@ -654,18 +727,22 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: windows-desktop-ci
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: apps/desktop/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            apps/desktop/package-lock.json
+      - name: Install shared frontend dependencies
+        run: npm ci --prefix frontend
       - name: Install Desktop dependencies
         run: npm ci --prefix apps/desktop
       - name: Check Desktop frontend
@@ -745,6 +822,15 @@ jobs:
             -SourceSha "${{ steps.runtime.outputs.source }}" `
             -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
             -Platform win32-x64
+
+          $customInstallDir = Join-Path $env:RUNNER_TEMP "WebCodex Custom Install"
+          & .\scripts\desktop_install_windows_smoke.ps1 `
+            -Installer $env:DESKTOP_CI_INSTALLER `
+            -Version "${{ steps.runtime.outputs.version }}" `
+            -SourceSha "${{ steps.runtime.outputs.source }}" `
+            -BuiltAt ([Int64]"${{ steps.runtime.outputs.built_at }}") `
+            -Platform win32-x64 `
+            -InstallDir $customInstallDir
 
   test-windows:
     needs: [contract, changes, test-windows-core, test-windows-runner, test-windows-package, test-windows-desktop]

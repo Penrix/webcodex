@@ -203,19 +203,81 @@ fn zip_extraction_reads_only_the_exact_tunnel_client_member() {
     assert!(!temp.path().join("tunnel-client.exe").exists());
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn version_verification_requires_the_pinned_client_line() {
-    use std::os::unix::fs::PermissionsExt;
-
+#[test]
+fn stale_managed_install_cleanup_is_age_and_name_fenced() {
     let temp = tempfile::tempdir().unwrap();
-    let good = temp.path().join("good");
-    fs::write(&good, "#!/bin/sh\necho '0.0.12+test (git sha: abc)'\n").unwrap();
-    fs::set_permissions(&good, fs::Permissions::from_mode(0o700)).unwrap();
-    verify_tunnel_client_version(&good).await.unwrap();
+    let owned = temp
+        .path()
+        .join(".install-0123456789abcdef0123456789abcdef");
+    let malformed = temp.path().join(".install-not-webcodex-owned");
+    let owned_file = temp
+        .path()
+        .join(".install-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    fs::create_dir(&owned).unwrap();
+    fs::create_dir(&malformed).unwrap();
+    fs::write(&owned_file, b"not a staging directory").unwrap();
 
-    let wrong = temp.path().join("wrong");
-    fs::write(&wrong, "#!/bin/sh\necho '0.0.13'\n").unwrap();
-    fs::set_permissions(&wrong, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(verify_tunnel_client_version(&wrong).await.is_err());
+    cleanup_stale_install_dirs_before(temp.path(), SystemTime::UNIX_EPOCH);
+    assert!(owned.is_dir());
+    assert!(malformed.is_dir());
+    assert!(owned_file.is_file());
+
+    cleanup_stale_install_dirs_before(temp.path(), SystemTime::now() + Duration::from_secs(60));
+    assert!(!owned.exists());
+    assert!(malformed.is_dir());
+    assert!(owned_file.is_file());
+}
+
+#[test]
+fn managed_download_failure_has_a_distinct_safe_error_code() {
+    let error = download_error("connection failed");
+    assert_eq!(error.code, "tunnel_client_download_failed");
+    assert!(!error.message.contains("CONTROL_PLANE"));
+    assert!(!error.message.contains("Authorization"));
+}
+
+#[test]
+fn managed_install_failures_are_distinct_from_network_download_failures() {
+    assert_eq!(
+        managed_tool_path_error().code,
+        "tunnel_client_install_failed"
+    );
+    assert_eq!(
+        extraction_error("archive invalid").code,
+        "tunnel_client_install_failed"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    let artifact = temp.path().join("artifact.zip");
+    fs::write(&artifact, b"not the pinned artifact").unwrap();
+    let error = verify_sha256(
+        &artifact,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "downloaded tunnel-client archive",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "tunnel_client_verification_failed");
+}
+
+#[test]
+fn version_verification_requires_the_pinned_client_line() {
+    assert!(tunnel_client_version_output_is_pinned(
+        true,
+        b"0.0.12+test (git sha: abc)\n",
+        b"",
+    ));
+    assert!(tunnel_client_version_output_is_pinned(
+        true,
+        b"",
+        b"0.0.12+test (git sha: abc)\n",
+    ));
+    assert!(!tunnel_client_version_output_is_pinned(
+        true,
+        b"0.0.13\n",
+        b"",
+    ));
+    assert!(!tunnel_client_version_output_is_pinned(
+        false,
+        b"0.0.12+test (git sha: abc)\n",
+        b"",
+    ));
 }

@@ -1,13 +1,12 @@
 use super::*;
+#[path = "http_transport/metadata_trace.rs"]
+mod metadata_trace;
 
 fn with_mcp_recording_session(mut arguments: Value, session_id: &str) -> Value {
     arguments
         .as_object_mut()
         .expect("tool arguments must be an object")
-        .insert(
-            crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD.to_string(),
-            Value::from(session_id),
-        );
+        .insert("_wc".to_string(), json!({"record": session_id}));
     arguments
 }
 
@@ -66,10 +65,13 @@ async fn stateless_2026_tool_call(
     token: &str,
     id: i64,
     name: &str,
-    arguments: Value,
+    mut arguments: Value,
     legacy_session_id: Option<&str>,
 ) -> (StatusCode, Value) {
-    let (call_name, call_params) = if matches!(
+    let invocation_envelope = arguments
+        .as_object_mut()
+        .and_then(|arguments| arguments.remove("_wc"));
+    let (call_name, mut call_params) = if matches!(
         crate::model_surface::adaptive_runtime_gateway_target_route(name),
         crate::model_surface::AdaptiveRuntimeGatewayTargetRoute::Gateway
     ) {
@@ -80,6 +82,9 @@ async fn stateless_2026_tool_call(
     } else {
         (name, json!({"name": name, "arguments": arguments}))
     };
+    if let Some(envelope) = invocation_envelope {
+        call_params["arguments"]["_wc"] = envelope;
+    }
     stateless_2026_jsonrpc(
         service,
         token,
@@ -102,6 +107,7 @@ async fn stateless_observation_runner_registry() -> Arc<crate::runner_http::Runn
     runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -308,7 +314,7 @@ async fn stateless_full_trace_preserves_raw_context_request_and_records_clean_ef
     let (_tmp, db) = test_db();
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
-    let arguments = json!({"context_request": ["webcodex.workflow"]});
+    let arguments = json!({"_wc": {"context": ["webcodex.workflow"]}});
     let (status, body) = stateless_2026_tool_call(
         &service,
         "secret",
@@ -343,10 +349,11 @@ async fn stateless_full_trace_preserves_raw_context_request_and_records_clean_ef
     };
 
     let raw = read_phase("raw_arguments");
-    assert_eq!(raw["context_request"], json!(["webcodex.workflow"]));
+    assert_eq!(raw["_wc"]["context"], json!(["webcodex.workflow"]));
     let effective = read_phase("effective_arguments");
+    assert!(effective.get("_wc").is_none());
     assert!(effective.get("context_request").is_none());
-    assert_eq!(effective, json!({}));
+    assert_eq!(effective, json!({"compact": true}));
     assert!(!effective.to_string().contains("__webcodex_"));
     let final_response = read_phase("final_response");
     assert_eq!(final_response["result"]["isError"], false);
@@ -669,7 +676,7 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
         "summary must not embed tool output: {summary}"
     );
     let telemetry = &summary["model_ergonomics"];
-    assert_eq!(telemetry["schema_version"], 7);
+    assert_eq!(telemetry["schema_version"], 13);
     assert_eq!(telemetry["tool_name"], "runtime_status");
     assert_eq!(telemetry["tool_category"], "runtime");
     assert_eq!(telemetry["success"], true);
@@ -1183,12 +1190,13 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
         first["session_attention"]["messages"][0]["message"],
         "Keep the exact request-scoped ACK contract."
     );
+    let first_ack_ref = first["session_attention"]["ack_ref"]
+        .as_str()
+        .expect("projected Session ACK set should expose ack_ref")
+        .to_string();
 
     let mut ack_args = with_mcp_recording_session(json!({}), &session_id);
-    ack_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD.to_string(),
-        json!([message_id, message_id]),
-    );
+    ack_args["_wc"]["ack_ref"] = json!(first_ack_ref);
     let (status, ack_body) =
         stateless_2026_tool_call(&service, "secret", 223, "list_tools", ack_args, None).await;
     assert_eq!(status, StatusCode::OK, "{ack_body}");
@@ -1279,19 +1287,39 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
         .as_str()
         .unwrap()
         .to_string();
-    let mut resolve_with_ack_args = json!({
-        "session_id": session_id,
-        "message_id": second_message_id,
-        "resolution": "handled with same-request ACK"
-    });
-    resolve_with_ack_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD.to_string(),
-        json!([second_message_id]),
+
+    let mut stale_ref_args = with_mcp_recording_session(json!({}), &session_id);
+    stale_ref_args["_wc"]["ack_ref"] = json!(first_ack_ref);
+    let (status, stale_ref_body) =
+        stateless_2026_tool_call(&service, "secret", 2271, "list_tools", stale_ref_args, None)
+            .await;
+    assert_eq!(status, StatusCode::OK, "{stale_ref_body}");
+    let stale_ref_output = stateless_tool_output(&stale_ref_body);
+    assert_eq!(
+        stale_ref_output["session_attention"]["ack"]["accepted_count"],
+        0
     );
-    // Collaboration session_id is business input, not an inner recorder. Carry
-    // the same Session explicitly as wrapper recorder provenance so ACK is
-    // observed before the concrete resolve mutation without conflating roles.
-    let resolve_with_ack_args = with_mcp_recording_session(resolve_with_ack_args, &session_id);
+    assert_eq!(
+        stale_ref_output["session_attention"]["messages"][0]["message_id"],
+        second_message_id
+    );
+    assert_ne!(
+        stale_ref_output["session_attention"]["ack_ref"], first_ack_ref,
+        "changed Session ACK membership must replace the old ref"
+    );
+
+    let mut resolve_with_ack_args = with_mcp_recording_session(
+        json!({
+            "session_id": session_id,
+            "message_id": second_message_id.clone(),
+            "resolution": "handled with same-request ACK"
+        }),
+        &session_id,
+    );
+    resolve_with_ack_args["_wc"]["ack"] = json!([second_message_id]);
+    // Collaboration session_id is business input, not recorder provenance.
+    // Carry the same Session explicitly in _wc.record so ACK is observed before
+    // the concrete resolve mutation without conflating the two roles.
     let (status, resolve_with_ack_body) = stateless_2026_tool_call(
         &service,
         "secret",
@@ -1354,15 +1382,11 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
         .to_string();
     let resolution_text = "handled through ordinary list_tools wrapper metadata";
 
-    let missing_ack_args = with_mcp_recording_session(
-        json!({
-            crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
-                "message_id": third_message_id,
-                "resolution": resolution_text
-            }
-        }),
-        &session_id,
-    );
+    let mut missing_ack_args = with_mcp_recording_session(json!({}), &session_id);
+    missing_ack_args["_wc"]["resolve"] = json!({
+        "message_id": third_message_id,
+        "resolution": resolution_text
+    });
     let (status, missing_ack_body) = stateless_2026_tool_call(
         &service,
         "secret",
@@ -1392,19 +1416,12 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
         crate::tool_runtime::sessions::SessionMessageStatus::Open
     );
 
-    let mut piggyback_args = with_mcp_recording_session(
-        json!({
-            crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
-                "message_id": third_message_id,
-                "resolution": resolution_text
-            }
-        }),
-        &session_id,
-    );
-    piggyback_args.as_object_mut().unwrap().insert(
-        crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD.to_string(),
-        json!([third_message_id]),
-    );
+    let mut piggyback_args = with_mcp_recording_session(json!({}), &session_id);
+    piggyback_args["_wc"]["resolve"] = json!({
+        "message_id": third_message_id,
+        "resolution": resolution_text
+    });
+    piggyback_args["_wc"]["ack"] = json!([third_message_id]);
     let (status, piggyback_body) = stateless_2026_tool_call(
         &service,
         "secret",
@@ -1458,6 +1475,7 @@ async fn http_mcp_2026_request_scoped_ack_redelivers_until_durable_resolution_bo
     )
     .unwrap();
     assert!(!audit.contains("ack_session_message_ids"));
+    assert!(!audit.contains("ack_ref"));
     assert!(!audit.contains("__webcodex_stateless_ack_session_message_ids"));
     assert!(!audit.contains("__webcodex_stateless_session_message_resolution"));
     assert!(!audit.contains("handled through ordinary list_tools wrapper metadata"));
@@ -1470,12 +1488,14 @@ async fn http_mcp_2026_context_request_projects_post_tool_materials_nonfatally()
     let runtime = Arc::new(test_runtime());
     let service = Service::new(build_test_router(config, db, runtime));
     let arguments = json!({
-        crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: [
-            "webcodex.workflow",
-            "future.material",
-            "webcodex.workflow",
-            "project.instructions"
-        ]
+        "_wc": {
+            "context": [
+                "webcodex.workflow",
+                "future.material",
+                "webcodex.workflow",
+                "project.instructions"
+            ]
+        }
     });
     let (status, body) =
         stateless_2026_tool_call(&service, "secret", 226, "list_tools", arguments, None).await;
@@ -3088,3 +3108,6 @@ async fn http_mcp_get_discovery_returns_metadata() {
         "MCP auth metadata must not regress to PAT-only placeholder: {auth_json}"
     );
 }
+
+#[path = "external_observations.rs"]
+mod external_observations;

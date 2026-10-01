@@ -4,8 +4,10 @@ import type { RuntimeLanguage } from "../../runtime_i18n.js";
 import { translate } from "../../runtime_i18n.js";
 import type { RuntimeV2Client } from "../api/client.js";
 import { SessionExecution } from "../components/SessionExecution.js";
+import { GoalWorkbench, type WorkSurface } from "../components/GoalWorkbench.js";
 import { SessionInspector } from "../components/SessionInspector.js";
 import { WorkList } from "../components/WorkList.js";
+import { WindowWorkbench } from "../components/WindowWorkbench.js";
 import { selectedWorkFromDetail, workBucket, type WorkItem } from "../model/work.js";
 import type { ProjectRow } from "../model/types.js";
 import { useProjectGit } from "../state/useProjectGit.js";
@@ -18,9 +20,18 @@ type Props = {
   projects: ProjectRow[];
   language: RuntimeLanguage;
   inventoryIncomplete: boolean;
+  hydratingSessions?: boolean;
+  surface?: WorkSurface;
+  onSurfaceChange?: (surface: WorkSurface) => void;
+  onOpenAgent?: (agentId: string) => void;
+  onOpenWindow?: (windowKey: string) => void;
   onOpenSession: (location: SessionLocation) => void;
+  onOpenSessionRecord?: (location: SessionLocation) => void;
   onLocateSession: (sessionId: string) => Promise<boolean>;
   onUnauthorized: () => void;
+  requestedWindowKey?: string;
+  requestedSessionId?: string;
+  onRequestedWindowConsumed?: () => void;
 };
 
 export function WorkView({
@@ -30,16 +41,61 @@ export function WorkView({
   projects,
   language,
   inventoryIncomplete,
+  hydratingSessions = false,
+  surface = "windows",
+  onSurfaceChange = () => {},
+  onOpenAgent = () => {},
+  onOpenWindow = () => {},
   onOpenSession,
+  onOpenSessionRecord,
   onLocateSession,
   onUnauthorized,
+  requestedWindowKey,
+  requestedSessionId,
+  onRequestedWindowConsumed,
 }: Props) {
   const t = (value: string) => translate(value, language);
   const [search, setSearch] = useState("");
   const [locating, setLocating] = useState(false);
-  const session = useSessionWorkspace(client, Boolean(selected), selected, onUnauthorized);
+  const session = useSessionWorkspace(client, Boolean(selected && surface === "session"), selected, onUnauthorized);
   const project = selected ? projects.find((row) => row.id === selected.projectId) : undefined;
-  const git = useProjectGit(client, Boolean(selected), selected?.projectId || "");
+  const git = useProjectGit(client, Boolean(selected && surface === "session"), selected?.projectId || "");
+
+  if (surface === "goals") {
+    return (
+      <GoalWorkbench
+        client={client}
+        language={language}
+        projects={projects}
+        surface={surface}
+        onSurfaceChange={onSurfaceChange}
+        onOpenSession={onOpenSession}
+        onOpenAgent={onOpenAgent}
+        onOpenWindow={onOpenWindow}
+        onUnauthorized={onUnauthorized}
+      />
+    );
+  }
+
+  if (surface === "windows") {
+    return (
+      <WindowWorkbench
+        client={client}
+        language={language}
+        projects={projects}
+        surface={surface}
+        onSurfaceChange={onSurfaceChange}
+        onUnauthorized={onUnauthorized}
+        onOpenSessionRecord={onOpenSessionRecord ? (projectId, sessionId) => {
+          const project = projects.find(row => row.id === projectId);
+          onOpenSessionRecord({ projectId, sessionId, projectName: project?.name || projectId, runner: project?.client_id || "" });
+        } : undefined}
+        requestedWindowKey={requestedWindowKey}
+        requestedSessionId={requestedSessionId}
+        onRequestedWindowConsumed={onRequestedWindowConsumed}
+      />
+    );
+  }
 
   const selectedBase = selected
     ? items.find((item) => item.sessionId === selected.sessionId && item.projectId === selected.projectId)
@@ -106,13 +162,15 @@ export function WorkView({
         locating={locating}
         language={language}
         inventoryIncomplete={inventoryIncomplete}
+        surface={surface}
+        onSurfaceChange={onSurfaceChange}
         onSearch={setSearch}
         onLocateExact={() => void locateExact()}
         onSelect={open}
       />
 
       {sessionDenied ? (
-        <main className="session-main">
+        <main className="session-main ui-workbench-surface">
           <div className="empty-work">
             <CircleDot size={22} />
             <h2>{t("Session unavailable")}</h2>
@@ -120,12 +178,12 @@ export function WorkView({
           </div>
         </main>
       ) : selectedItem && selected ? (
-        <SessionExecution item={selectedItem} location={selected} session={session} language={language} />
+        <SessionExecution item={selectedItem} location={selected} session={session} language={language} onOpenWindow={onOpenWindow} />
       ) : (
-        <main className="session-main">
+        <main className="session-main ui-workbench-surface">
           <div className="empty-work">
             <CircleDot size={22} />
-            <h2>{t("Select a work Session")}</h2>
+            <h2>{t(hydratingSessions ? "Loading work Sessions…" : "Select a work Session")}</h2>
             <p>{t("Running work and attention requests appear first. Raw evidence stays one level deeper.")}</p>
           </div>
         </main>

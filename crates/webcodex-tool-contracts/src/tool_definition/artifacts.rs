@@ -66,38 +66,36 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             PERMISSION_RISK_ARTIFACT_WRITE,
         ),
         55,
+        super::ToolDirectReason::HostIntegration,
     ),
-    adaptive_runtime_direct(
-        permission_risk(
-            model_spec(
-                require_all_scopes(
-                    def(
-                        "transfer_project_artifact",
-                        super::ToolAuditPolicy::TYPED_CANONICAL,
-                        ModelVisible,
-                        TOOL_CATEGORY_ARTIFACT,
-                        None,
-                        TOOL_PROVIDER_CONTROL,
-                        super::ToolSemanticContract {
-                            effect: super::ToolEffect::Mutate,
-                            risk: ProjectWrite,
-                            approval: super::ToolApprovalPolicy::Standard,
-                            idempotency: super::ToolIdempotency::NonIdempotent,
-                        },
-                        None,
-                        false,
-                        Artifact,
-                        true,
-                        false,
-                        super::ToolSessionEvidencePolicy::NONE,
-                    ),
-                    &[PROJECT_READ, PROJECT_WRITE],
+    permission_risk(
+        model_spec(
+            require_all_scopes(
+                def(
+                    "transfer_project_artifact",
+                    super::ToolAuditPolicy::TYPED_CANONICAL,
+                    ModelVisible,
+                    TOOL_CATEGORY_ARTIFACT,
+                    None,
+                    TOOL_PROVIDER_CONTROL,
+                    super::ToolSemanticContract {
+                        effect: super::ToolEffect::Mutate,
+                        risk: ProjectWrite,
+                        approval: super::ToolApprovalPolicy::Standard,
+                        idempotency: super::ToolIdempotency::NonIdempotent,
+                    },
+                    None,
+                    false,
+                    Artifact,
+                    true,
+                    false,
+                    super::ToolSessionEvidencePolicy::NONE,
                 ),
-                "Transfer one regular artifact directly from a source Project to a destination Project through Control. Requires source project:read and destination project:write; each Project is independently resolved and authorized. Control fences the exact source bytes/SHA-256/MIME snapshot, streams bounded internal chunks into the existing destination artifact upload protocol, and verifies the committed destination bytes/SHA-256. Binary payloads do not pass through Host attachments or model text. overwrite defaults to false.",
-            ).with_gpt_action_description("Transfer one Project artifact directly through Control. Requires project:read on source and project:write on destination; both are independently authorized. Streams exact bytes/SHA without Host attachments or model base64. overwrite defaults to false."),
-            PERMISSION_RISK_ARTIFACT_WRITE,
-        ),
-        57,
+                &[PROJECT_READ, PROJECT_WRITE],
+            ),
+            "Transfer one regular artifact directly from a source Project to a destination Project through Control. Requires source project:read and destination project:write; each Project is independently resolved and authorized. Control fences the exact source bytes/SHA-256/MIME snapshot, streams bounded internal chunks into the existing destination artifact upload protocol, and verifies the committed destination bytes/SHA-256. Binary payloads do not pass through Host attachments or model text. overwrite defaults to false.",
+        ).with_gpt_action_description("Transfer one Project artifact directly through Control. Requires project:read on source and project:write on destination; both are independently authorized. Streams exact bytes/SHA without Host attachments or model base64. overwrite defaults to false."),
+        PERMISSION_RISK_ARTIFACT_WRITE,
     ),
     adaptive_runtime_direct(
         model_spec(
@@ -125,6 +123,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         )
         .with_gpt_action_description("Project artifact read surface. GPT Actions supports metadata and bounded inspect; native image and ResourceLink export require MCP."),
         56,
+        super::ToolDirectReason::CoreWorkflow,
     ),
     model_spec(
         def(

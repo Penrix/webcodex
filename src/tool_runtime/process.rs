@@ -10,7 +10,8 @@ use super::shell::{
     command_execution_state_name, dispatch_uncertainty_lifecycle, runner_command_lifecycle,
 };
 use super::structured_execution::{
-    await_hidden_structured_job, HiddenStructuredJobWait, StructuredExecutionBudget,
+    await_hidden_structured_job, finalize_hidden_terminal_projection, HiddenStructuredJobWait,
+    StructuredExecutionBudget,
 };
 use super::tool_audit::{assertion_validation_identity, run_process_validation_identity};
 use super::{ExecutionPurpose, ToolResult, ToolRuntime};
@@ -271,7 +272,7 @@ pub(crate) fn classify_process_failure(message: &str) -> &'static str {
     }
 }
 
-fn validate_process_input(
+pub(super) fn validate_process_input(
     process: &ShellProcessArgv,
     stdin: Option<&str>,
     cwd: Option<&str>,
@@ -315,10 +316,10 @@ fn decorate(
 }
 
 impl ToolRuntime {
-    /// Advisory conversion only, before execution. Recovery requires a Runner
-    /// that explicitly supports semantic shell selection and reports the target
-    /// sh/bash interpreter as resolvable. No target, stdin, expectation,
-    /// login-shell or positional-argv semantics may be guessed.
+    /// Build a canonical shell call only for exact, lossless process forms.
+    /// The caller re-enters shell authorization and policy before dispatch.
+    /// Runner capabilities must advertise explicit shell selection and, for
+    /// Bash login mode, support for that exact mode.
     pub(super) async fn process_shell_recovery_call(
         &self,
         call: &super::ToolCall,
@@ -327,6 +328,7 @@ impl ToolRuntime {
         resolved: Option<&super::project_resolution::ResolvedProject>,
     ) -> Option<serde_json::Value> {
         let super::ToolCall::RunProcess {
+            interactive,
             project,
             executable,
             args,
@@ -340,9 +342,11 @@ impl ToolRuntime {
         else {
             return None;
         };
-        if !matches!(executable.as_str(), "sh" | "bash")
+        let login = executable == "bash" && args.first().is_some_and(|flag| flag == "-lc");
+        if *interactive
+            || !matches!(executable.as_str(), "sh" | "bash")
             || args.len() != 2
-            || args[0] != "-c"
+            || !(args[0] == "-c" || login)
             || stdin.is_some()
             || cwd
                 .as_ref()
@@ -372,11 +376,15 @@ impl ToolRuntime {
             return None;
         }
         let resolved = resolved?;
+        resolve_runner_cwd(&resolved.config, cwd.as_deref()).ok()?;
         let runner = self
             .runner_registry
             .get_runner_view(&resolved.config.client_id)
             .await?;
         if !runner.capabilities.explicit_shell_selection {
+            return None;
+        }
+        if login && !runner.capabilities.bash_login_shell {
             return None;
         }
         let policy = runner.policy.as_ref()?;
@@ -391,7 +399,8 @@ impl ToolRuntime {
         if !available.iter().any(|dialect| dialect == executable) {
             return None;
         }
-        let mut arguments = json!({"project": project, "shell": executable, "command": args[1]});
+        let mut arguments =
+            json!({"project": project, "shell": executable, "login": login, "command": args[1]});
         for (name, value) in [
             ("session_id", json!(session_id)),
             ("cwd", json!(cwd)),
@@ -407,7 +416,7 @@ impl ToolRuntime {
         }
         // Use the real canonical parser, including wrapper-field validation.
         super::ToolCall::from_tool_name("run_shell", arguments.clone()).ok()?;
-        Some(super::SuggestedToolCall::new("run_shell", arguments).to_value())
+        Some(super::SuggestedToolCall::mechanically_followable("run_shell", arguments).to_value())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -569,7 +578,7 @@ impl ToolRuntime {
             Err(error) => {
                 return process_tool_failure_result(
                     command_rejected_message(
-                        error.to_string(),
+                        &error,
                         "confirm the Runner is registered and connected, then retry.",
                     ),
                     "agent_offline",
@@ -606,6 +615,7 @@ impl ToolRuntime {
             .runner_registry
             .start_job_with_metadata_for_access(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some(client_id),
                     cwd: Some(effective_cwd),
@@ -911,6 +921,7 @@ impl ToolRuntime {
                 .runner_registry
                 .start_job_with_metadata_for_access(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: Some(effective_cwd),
@@ -999,10 +1010,15 @@ impl ToolRuntime {
                     stdout,
                     stderr,
                 }) => {
-                    let result = terminal_structured_job_result(&job, stdout, stderr, timeout);
-                    self.runner_registry
-                        .remove_projected_hidden_structured_job_record(&job.job_id)
-                        .await;
+                    let mut result = terminal_structured_job_result(&job, stdout, stderr, timeout);
+                    finalize_hidden_terminal_projection(
+                        self.runner_registry.as_ref(),
+                        auth,
+                        &job,
+                        &mut result,
+                        budget,
+                    )
+                    .await;
                     result
                 }
                 Ok(HiddenStructuredJobWait::Continued {

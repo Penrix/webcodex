@@ -1,5 +1,8 @@
 use crate::{
-    execution_purpose_for_validation_kind, validation_adapter_for_tool, ValidationCommandOptions,
+    execution_purpose_for_validation_kind, project_validation_operation,
+    validation_adapter_for_tool, CargoCheckOptions, CargoReadOnlyValidationOperation,
+    CargoTestOptions, GoCheckOptions, GoReadOnlyValidationOperation, GoTestOptions,
+    ReadOnlyValidationOperation, SemanticCheck, ValidationCommandOptions,
     ValidationFailureEvidence,
 };
 use webcodex_core::runner_protocol::{GO_TEST_PACKAGE_MAX_BYTES, GO_TEST_PACKAGE_MAX_ITEMS};
@@ -15,6 +18,250 @@ use webcodex_tool_runtime_contracts::{
     },
     ToolCallAuditProjection,
 };
+
+#[test]
+fn project_test_filter_plans_and_identities_share_native_semantics() {
+    for (backend, filter, expected) in [
+        (
+            "rust",
+            "  module::selected  ",
+            vec!["test", "module::selected", "-p", "pkg"],
+        ),
+        (
+            "go",
+            "^TestA/sub.*$",
+            vec!["test", "-json", "-run", "^TestA/sub.*$", "./pkg"],
+        ),
+        (
+            "go",
+            "  space  ",
+            vec!["test", "-json", "-run", "  space  ", "./pkg"],
+        ),
+    ] {
+        let packages = Some(vec![
+            if backend == "rust" { "pkg" } else { "./pkg" }.to_owned()
+        ]);
+        let operation =
+            project_validation_operation(backend, SemanticCheck::Test, packages).unwrap();
+        let baseline = operation.validation_target_id(Some("."));
+        let selected = operation.clone().with_test_filter(Some(filter)).unwrap();
+        let plan = selected.build_readonly_plan().unwrap();
+        assert_eq!(plan.structured_step.args, expected);
+        assert!(plan.structured_step.is_canonical());
+        assert_ne!(selected.validation_target_id(Some(".")), baseline);
+        let empty = operation.with_test_filter(Some("")).unwrap();
+        assert_eq!(empty.validation_target_id(Some(".")), baseline);
+    }
+    let rust = project_validation_operation("rust", SemanticCheck::Test, None).unwrap();
+    for bad in ["--all-features", "bad\nfilter"] {
+        assert!(rust.clone().with_test_filter(Some(bad)).is_err());
+    }
+    for backend in ["rust", "go"] {
+        let check = project_validation_operation(backend, SemanticCheck::Check, None).unwrap();
+        assert!(check.with_test_filter(Some("test")).is_err());
+    }
+}
+
+#[test]
+fn semantic_read_only_operations_preserve_legacy_leaf_plans_and_identity_profiles() {
+    let cases = [
+        (
+            ReadOnlyValidationOperation::Cargo(CargoReadOnlyValidationOperation::FormatCheck),
+            "cargo_fmt",
+            ValidationCommandOptions {
+                check: true,
+                ..ValidationCommandOptions::default()
+            },
+        ),
+        (
+            ReadOnlyValidationOperation::Cargo(CargoReadOnlyValidationOperation::Check(
+                CargoCheckOptions {
+                    all_targets: Some(false),
+                    all_features: Some(true),
+                    no_default_features: Some(true),
+                    features: Some("feature-a,feature-b".to_string()),
+                    package: None,
+                    packages: Some(vec!["package-a".to_string(), "package-b".to_string()]),
+                },
+            )),
+            "cargo_check",
+            ValidationCommandOptions {
+                all_targets: Some(false),
+                all_features: Some(true),
+                no_default_features: Some(true),
+                features: Some("feature-a,feature-b".to_string()),
+                cargo_packages: Some(vec!["package-a".to_string(), "package-b".to_string()]),
+                ..ValidationCommandOptions::default()
+            },
+        ),
+        (
+            ReadOnlyValidationOperation::Cargo(CargoReadOnlyValidationOperation::Test(
+                CargoTestOptions {
+                    filter: Some("runtime".to_string()),
+                    lib: Some(true),
+                    all_targets: Some(true),
+                    all_features: Some(false),
+                    no_default_features: Some(true),
+                    features: Some("feature-a".to_string()),
+                    package: Some("webcodex".to_string()),
+                    packages: None,
+                    no_run: Some(true),
+                },
+            )),
+            "cargo_test",
+            ValidationCommandOptions {
+                filter: Some("runtime".to_string()),
+                lib: Some(true),
+                all_targets: Some(true),
+                all_features: Some(false),
+                no_default_features: Some(true),
+                features: Some("feature-a".to_string()),
+                package: Some("webcodex".to_string()),
+                no_run: Some(true),
+                ..ValidationCommandOptions::default()
+            },
+        ),
+        (
+            ReadOnlyValidationOperation::Go(GoReadOnlyValidationOperation::Test(GoTestOptions {
+                filter: None,
+                packages: Some(vec![
+                    "./internal/control".to_string(),
+                    "./internal/node".to_string(),
+                ]),
+            })),
+            "go_test",
+            ValidationCommandOptions {
+                go_packages: Some(vec![
+                    "./internal/control".to_string(),
+                    "./internal/node".to_string(),
+                ]),
+                ..ValidationCommandOptions::default()
+            },
+        ),
+    ];
+
+    for (operation, tool_name, legacy_options) in cases {
+        let compatibility = operation.compatibility_profile();
+        assert_eq!(compatibility.tool_identity, tool_name);
+        assert_eq!(
+            compatibility.validation_identity,
+            webcodex_tool_contracts::runtime_tool_session_evidence_policy(tool_name)
+                .validation_identity
+        );
+
+        let semantic_plan = operation.build_readonly_plan().unwrap();
+        let legacy_plan = validation_adapter_for_tool(tool_name)
+            .unwrap()
+            .build_readonly_plan(legacy_options)
+            .unwrap();
+        assert_eq!(semantic_plan, legacy_plan, "{tool_name}");
+        assert_eq!(operation.adapter().tool_identity(), tool_name);
+    }
+}
+
+#[test]
+fn project_validation_operations_preserve_default_identities_and_scope_commands() {
+    let defaults = [
+        (
+            "rust",
+            SemanticCheck::Format,
+            "target:dfd175fca2d6e3c744338849",
+        ),
+        (
+            "rust",
+            SemanticCheck::Check,
+            "target:f9d553ae448eadebf9aaae0e",
+        ),
+        (
+            "rust",
+            SemanticCheck::Test,
+            "target:8ca3fd3664d56332a1d5839f",
+        ),
+        (
+            "go",
+            SemanticCheck::Check,
+            "target:6d00fe00bc63c0cd5baaff2d",
+        ),
+        ("go", SemanticCheck::Test, "target:53578a0709b0ce549e125eb7"),
+    ];
+    for (backend, action, expected) in defaults {
+        let operation = project_validation_operation(backend, action, None).unwrap();
+        assert_eq!(
+            operation.validation_target_id(Some(".")).as_deref(),
+            Some(expected)
+        );
+    }
+
+    let rust_packages = Some(vec!["package-b".to_string(), "package-a".to_string()]);
+    for (action, expected) in [
+        (
+            SemanticCheck::Check,
+            vec![
+                "check",
+                "--all-targets",
+                "-p",
+                "package-a",
+                "-p",
+                "package-b",
+            ],
+        ),
+        (
+            SemanticCheck::Test,
+            vec!["test", "-p", "package-a", "-p", "package-b"],
+        ),
+    ] {
+        let operation =
+            project_validation_operation("rust", action, rust_packages.clone()).unwrap();
+        let plan = operation.build_readonly_plan().unwrap();
+        assert_eq!(plan.structured_step.args, expected);
+        assert!(operation.validation_target_id(Some(".")).is_some());
+    }
+
+    let go_packages = Some(vec!["./cmd/...".to_string(), "./internal".to_string()]);
+    for (action, expected) in [
+        (SemanticCheck::Check, vec!["vet", "./cmd/...", "./internal"]),
+        (
+            SemanticCheck::Test,
+            vec!["test", "-json", "./cmd/...", "./internal"],
+        ),
+    ] {
+        let operation = project_validation_operation("go", action, go_packages.clone()).unwrap();
+        let plan = operation.build_readonly_plan().unwrap();
+        assert_eq!(plan.structured_step.args, expected);
+        assert!(operation.validation_target_id(Some(".")).is_some());
+    }
+
+    assert_eq!(
+        project_validation_operation(
+            "rust",
+            SemanticCheck::Format,
+            Some(vec!["package-a".to_string()])
+        )
+        .unwrap_err(),
+        "validation_scope_unsupported"
+    );
+    assert_eq!(
+        project_validation_operation("go", SemanticCheck::Format, None).unwrap_err(),
+        "validation_action_unsupported"
+    );
+}
+
+#[test]
+fn go_check_semantic_operation_uses_canonical_vet_adapter() {
+    let operation =
+        ReadOnlyValidationOperation::Go(GoReadOnlyValidationOperation::Check(GoCheckOptions {
+            packages: Some(vec!["./internal/control".to_string()]),
+        }));
+    assert_eq!(operation.compatibility_profile().tool_identity, "go_vet");
+    assert_eq!(operation.adapter().tool_identity(), "go_vet");
+    assert_eq!(
+        operation
+            .build_readonly_plan()
+            .unwrap()
+            .compatibility_command,
+        "go vet './internal/control'"
+    );
+}
 
 #[test]
 fn execution_purpose_vocabulary_classification_and_validator_mapping_are_canonical() {
@@ -71,6 +318,32 @@ fn rust_profile_selects_cargo_fmt_adapter_and_preserves_command() {
 }
 
 #[test]
+fn cargo_fmt_read_only_plan_excludes_mutating_format() {
+    let adapter = validation_adapter_for_tool("cargo_fmt").expect("cargo_fmt adapter");
+    let readonly = adapter
+        .build_readonly_plan(ValidationCommandOptions {
+            check: true,
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+    assert_eq!(readonly.compatibility_command, "cargo fmt -- --check");
+    assert_eq!(readonly.structured_step.name, "format");
+    assert_eq!(readonly.structured_step.program, "cargo");
+    assert_eq!(readonly.structured_step.args, ["fmt", "--", "--check"]);
+    assert!(readonly.structured_step.is_canonical());
+
+    assert!(adapter
+        .build_readonly_plan(ValidationCommandOptions::default())
+        .is_err());
+    assert_eq!(
+        adapter
+            .build_command(ValidationCommandOptions::default())
+            .unwrap(),
+        "cargo fmt"
+    );
+}
+
+#[test]
 fn rust_profile_selects_cargo_check_adapter_and_preserves_command() {
     let adapter = validation_adapter_for_tool("cargo_check").expect("cargo_check adapter");
     assert_eq!(adapter.tool_identity(), "cargo_check");
@@ -81,12 +354,47 @@ fn rust_profile_selects_cargo_check_adapter_and_preserves_command() {
             .unwrap(),
         "cargo check --all-targets"
     );
+    let legacy_single = adapter
+        .build_command(ValidationCommandOptions {
+            package: Some("webcodex".to_string()),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+    let canonical_single = adapter
+        .build_command(ValidationCommandOptions {
+            cargo_packages: Some(vec!["webcodex".to_string()]),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+    assert_eq!(legacy_single, "cargo check --all-targets -p 'webcodex'");
+    assert_eq!(legacy_single, canonical_single);
     assert!(adapter
         .build_command(ValidationCommandOptions {
             features: Some("feat\0x".to_string()),
             ..ValidationCommandOptions::default()
         })
         .is_err());
+}
+
+#[test]
+fn cargo_check_builds_one_command_with_repeated_package_selectors() {
+    let adapter = validation_adapter_for_tool("cargo_check").expect("cargo_check adapter");
+    let command = adapter
+        .build_command(ValidationCommandOptions {
+            cargo_packages: Some(vec![
+                "package-a".to_string(),
+                "package-b".to_string(),
+                "package-c".to_string(),
+            ]),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        command,
+        "cargo check --all-targets -p 'package-a' -p 'package-b' -p 'package-c'"
+    );
+    assert_eq!(command.matches("cargo check").count(), 1);
 }
 
 #[test]
@@ -215,10 +523,19 @@ fn go_profile_selects_only_go_test_and_preserves_json_command() {
             .unwrap(),
         "go test -json './internal/control' './internal/node'"
     );
+    assert_eq!(
+        adapter
+            .build_command(ValidationCommandOptions {
+                filter: Some("TestOne".to_string()),
+                ..ValidationCommandOptions::default()
+            })
+            .unwrap(),
+        "go test -json -run 'TestOne' ./..."
+    );
     assert!(adapter
         .build_command(ValidationCommandOptions {
-            filter: Some("TestOne".to_string()),
-            ..ValidationCommandOptions::default()
+            filter: Some("bad\nfilter".into()),
+            ..Default::default()
         })
         .is_err());
     assert!(validation_adapter_for_tool("go_check").is_none());

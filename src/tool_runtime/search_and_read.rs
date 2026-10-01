@@ -60,6 +60,115 @@ fn sanitize_batch_search_and_collect_successes(batch: &mut Value) -> Vec<Value> 
     successful
 }
 
+/// Reuse the ordinary search projection only after match-derived read planning has consumed
+/// canonical results. Query indexes, failures, truncation and nonempty source context stay intact.
+pub(crate) fn compact_compound_search(batch: Value, default_timeouts: &[bool]) -> Value {
+    let mut result = ToolResult::ok(batch);
+    super::result_projection::sparsify_search_batch_success_for_model(
+        default_timeouts,
+        &mut result,
+    );
+    result.output
+}
+
+#[derive(Debug)]
+struct MaterializedReadRange<'a> {
+    path: &'a str,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+    complete_file: bool,
+}
+
+fn materialized_read_ranges(reads: &Value) -> Vec<MaterializedReadRange<'_>> {
+    reads
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            if item.get("success").and_then(Value::as_bool) != Some(true) {
+                return None;
+            }
+            let path = item.get("path")?.as_str()?;
+            let output = item.get("output")?.as_object()?;
+            if output.get("text").and_then(Value::as_str).is_none() {
+                return None;
+            }
+            let start_line = output.get("start_line").and_then(Value::as_u64);
+            let end_line = output.get("end_line").and_then(Value::as_u64);
+            let complete_file = start_line.is_none()
+                && end_line.is_none()
+                && output
+                    .get("read_revision")
+                    .and_then(Value::as_u64)
+                    .is_some()
+                && output.get("total_lines").and_then(Value::as_u64).is_some();
+            Some(MaterializedReadRange {
+                path,
+                start_line,
+                end_line,
+                complete_file,
+            })
+        })
+        .collect()
+}
+
+fn match_is_materialized(matched: &Value, materialized: &[MaterializedReadRange<'_>]) -> bool {
+    let Some(path) = matched.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(line) = matched.get("line").and_then(Value::as_u64) else {
+        return false;
+    };
+    materialized.iter().any(|read| {
+        read.path == path
+            && (read.complete_file
+                || read
+                    .start_line
+                    .zip(read.end_line)
+                    .is_some_and(|(start, end)| (start..=end).contains(&line)))
+    })
+}
+
+fn compact_materialized_matches(output: &mut Value, materialized: &[MaterializedReadRange<'_>]) {
+    let Some(matches) = output.get_mut("matches").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for matched in matches {
+        if !match_is_materialized(matched, materialized) {
+            continue;
+        }
+        if let Some(object) = matched.as_object_mut() {
+            for key in ["preview", "context_before", "context_after", "read_hint"] {
+                object.remove(key);
+            }
+        }
+    }
+}
+
+/// Once source text for a match is present in the returned read evidence, keep
+/// only its navigation identity in the search phase. Unmaterialized matches and
+/// per-query failures retain their ordinary search projection so the compound
+/// call never trades away evidence merely to save model-facing bytes.
+fn compact_materialized_search_evidence(search: &mut Value, reads: &Value) {
+    let materialized = materialized_read_ranges(reads);
+    if materialized.is_empty() {
+        return;
+    }
+    if let Some(items) = search.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            if item.get("success").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            if let Some(output) = item.get_mut("output") {
+                compact_materialized_matches(output, &materialized);
+            }
+        }
+    } else {
+        compact_materialized_matches(search, &materialized);
+    }
+}
+
 fn fair_match_read_items(
     searches: &[Value],
     read_before: usize,
@@ -147,6 +256,15 @@ impl ToolRuntime {
         }
 
         let query_count = queries.len();
+        let default_timeouts: Vec<bool> = queries
+            .iter()
+            .map(|query| {
+                query
+                    .timeout_secs
+                    .unwrap_or(super::files::DEFAULT_SEARCH_TIMEOUT_SECS as i64)
+                    == super::files::DEFAULT_SEARCH_TIMEOUT_SECS as i64
+            })
+            .collect();
         let search = self.search_project_texts_resolved(resolved, queries).await;
         if !search.success {
             return search;
@@ -160,13 +278,12 @@ impl ToolRuntime {
             );
         }
         let items = fair_match_read_items(&search_outputs, read_before, read_after, max_reads);
-        let search_output = if query_count == 1 {
-            search_outputs[0].clone()
+        let projected_search = compact_compound_search(batch_search_output, &default_timeouts);
+        let mut search_output = if query_count == 1 {
+            projected_search["items"][0]["output"].clone()
         } else {
-            // Preserve the canonical batch envelope so callers retain input index,
-            // per-query success/failure, and failure provenance. Read planning still
-            // consumes only successful outputs.
-            batch_search_output
+            // Keep query correspondence and failures; only redundant presentation metadata is removed.
+            projected_search
         };
         if items.is_empty() {
             return ToolResult::ok(json!({
@@ -199,7 +316,16 @@ impl ToolRuntime {
         );
         super::read_files::enforce_final_model_facing_hard_cap(&mut reads, &projection);
         super::read_files::add_actionable_read_continuations(&projection, &mut reads);
-        super::dispatch::sparsify_complete_read_success("read_files", &mut reads);
+        super::result_projection::sparsify_complete_read_success("read_files", &mut reads);
+        // The outer Project already identifies both phases; never remove a distinct identity.
+        if reads.output.get("project").and_then(Value::as_str)
+            == Some(resolved.resolved_id.as_str())
+        {
+            if let Some(output) = reads.output.as_object_mut() {
+                output.remove("project");
+            }
+        }
+        compact_materialized_search_evidence(&mut search_output, &reads.output);
         ToolResult::ok(json!({
             "project": resolved.resolved_id,
             "search": search_output,
@@ -315,6 +441,60 @@ mod tests {
         assert!(batch["items"][2]["output"]["matches"][0]
             .get("read_hint")
             .is_none());
+    }
+
+    #[test]
+    fn compound_projection_compacts_only_matches_covered_by_successful_reads() {
+        let mut search = json!({
+            "matches": [
+                {
+                    "path": "src/a.rs",
+                    "line": 10,
+                    "preview": "needle a",
+                    "context_before": [],
+                    "context_after": [],
+                    "read_hint": {"start_line": 1, "limit": 80}
+                },
+                {
+                    "path": "src/b.rs",
+                    "line": 20,
+                    "preview": "needle b",
+                    "context_before": [],
+                    "context_after": [],
+                    "read_hint": {"start_line": 1, "limit": 80}
+                }
+            ]
+        });
+        let reads = json!({
+            "items": [
+                {
+                    "path": "src/a.rs",
+                    "success": true,
+                    "output": {"text": "materialized", "start_line": 1, "end_line": 30},
+                    "error": null
+                },
+                {
+                    "path": "src/b.rs",
+                    "success": false,
+                    "output": {"reason_code": "not_found"},
+                    "error": "read failed"
+                }
+            ]
+        });
+        let before = serde_json::to_vec(&search).unwrap().len();
+        compact_materialized_search_evidence(&mut search, &reads);
+        let after = serde_json::to_vec(&search).unwrap().len();
+
+        assert_eq!(search["matches"][0]["path"], "src/a.rs");
+        assert_eq!(search["matches"][0]["line"], 10);
+        assert!(search["matches"][0].get("preview").is_none());
+        assert!(search["matches"][0].get("read_hint").is_none());
+        assert_eq!(search["matches"][1]["preview"], "needle b");
+        assert!(search["matches"][1].get("read_hint").is_some());
+        assert!(
+            after < before,
+            "materialized duplicate evidence should shrink"
+        );
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
-use crate::auth::AuthContext;
+use crate::auth::{AuthContext, SCOPE_RUNTIME_READ};
+use crate::client_window::ClientWindow;
 use crate::json_digest::update_sha256_with_json;
 
 use super::handoff::review_evidence_summary_for_session;
@@ -12,134 +14,464 @@ use super::validation_events::{
     current_validation_evidence_for_session, validation_summary_from_events,
 };
 use super::{ToolResult, ToolRuntime};
+use webcodex_workflow_session::SessionSummary;
 
+const WORK_RESULT_JOB_LIMIT: usize = 8;
 const WORK_RESULT_SESSION_EVENT_LIMIT: usize = 200;
 const WORK_RESULT_VALIDATION_LIMIT: usize = 20;
+const WORK_RESULT_ACTIVITY_LIMIT: usize = 24;
+const WORK_RESULT_WINDOW_ACTIVITY_LIMIT: usize = 200;
 pub(crate) const MAX_WORK_RESULT_FILES: usize = 8;
 const MAX_WORK_RESULT_PATH_CHARS: usize = 512;
 const MAX_WORK_RESULT_BRANCH_CHARS: usize = 160;
 const MAX_WORK_RESULT_REVIEW_TOOLS: usize = 12;
 const MAX_WORK_RESULT_TOOL_CHARS: usize = 64;
+const MAX_WORK_RESULT_MESSAGES: usize = 6;
+const MAX_WORK_RESULT_FILE_CONTENT_CHARS: usize = 12_000;
 
 impl ToolRuntime {
+    #[cfg(test)]
     pub(crate) async fn present_work_result(
         &self,
         project: String,
         session_id: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        self.exact_work_result(project, session_id, "present_work_result", auth)
+        self.present_work_result_for_window(project, Some(session_id), auth, None)
             .await
     }
 
+    pub(crate) async fn present_work_result_for_window(
+        &self,
+        project: String,
+        session_id: Option<String>,
+        auth: Option<&AuthContext>,
+        window: Option<&ClientWindow>,
+    ) -> ToolResult {
+        self.exact_work_result(project, session_id, "present_work_result", auth, window)
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn work_result_state(
         &self,
         project: String,
         session_id: String,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        self.exact_work_result(project, session_id, "work_result_state", auth)
+        self.work_result_state_for_window(project, Some(session_id), auth, None)
             .await
     }
 
-    /// Project/Session authority is shared by initial presentation and explicit
-    /// live refresh. Only initial presentation may allocate a process-local
-    /// frozen snapshot; neither path writes the target Session.
-    async fn exact_work_result(
+    pub(crate) async fn work_result_state_for_window(
         &self,
         project: String,
-        session_id: String,
-        tool_name: &'static str,
+        session_id: Option<String>,
         auth: Option<&AuthContext>,
+        window: Option<&ClientWindow>,
     ) -> ToolResult {
-        // Session authority is checked first from the exact business identity;
-        // possession of an iframe/project string never grants Session access.
-        if let Err(result) = self
-            .authorize_session_target(&session_id, tool_name, auth)
+        self.exact_work_result(project, session_id, "work_result_state", auth, window)
             .await
-        {
+    }
+
+    pub(crate) async fn work_result_activity_detail(
+        &self,
+        project: String,
+        server_trace_id: String,
+        auth: Option<&AuthContext>,
+        window: Option<&ClientWindow>,
+    ) -> ToolResult {
+        if server_trace_id.trim().is_empty() || server_trace_id.chars().count() > 128 {
+            return ToolResult::err_with_output(
+                "invalid Window activity trace identity",
+                json!({"error_kind":"activity_detail_invalid","state_changed":false}),
+            );
+        }
+        if let Err(result) = self.authorize_work_result_project(&project, auth).await {
             return result;
         }
-        // Independently resolve and authorize the caller-supplied Project on
-        // every read rather than trusting the Session's stored project string.
-        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
-            Ok(resolved) => resolved,
-            Err(error) => return error.into_tool_result(),
-        };
-        if project.trim() != resolved.resolved_id {
+        let Some(window) = window else {
             return ToolResult::err_with_output(
-                "Work Result presentation requires the exact complete runtime project id",
+                "stable Window identity required",
+                json!({"error_kind":"window_identity_unavailable","state_changed":false}),
+            );
+        };
+        let Some(auth) = auth.filter(|auth| !auth.is_open_anonymous()) else {
+            return ToolResult::err_with_output(
+                "Window activity principal unavailable",
+                json!({"error_kind":"principal_identity_unavailable","state_changed":false}),
+            );
+        };
+        if !auth.has_scope(SCOPE_RUNTIME_READ) {
+            return ToolResult::err_with_output(
+                "runtime read scope required",
+                json!({"error_kind":"runtime_read_unavailable","state_changed":false}),
+            );
+        }
+        let Ok((principal_kind, principal_id)) =
+            super::session_context::runtime_observation_principal(Some(auth))
+        else {
+            return ToolResult::err_with_output(
+                "Window activity principal unavailable",
+                json!({"error_kind":"principal_identity_unavailable","state_changed":false}),
+            );
+        };
+        let Some(db) = self.window_activity_db.as_ref() else {
+            return ToolResult::err_with_output(
+                "Window activity store unavailable",
+                json!({"error_kind":"activity_store_unavailable","state_changed":false}),
+            );
+        };
+        let event = match db.get_window_activity_event_by_trace(
+            window.key(),
+            Some((principal_kind.as_str(), principal_id.as_str())),
+            &server_trace_id,
+        ) {
+            Ok(Some(event)) => event,
+            Ok(None) => {
+                return ToolResult::err_with_output(
+                    "Window activity detail unavailable",
+                    json!({"error_kind":"activity_detail_unavailable","state_changed":false}),
+                )
+            }
+            Err(_) => {
+                return ToolResult::err_with_output(
+                    "Window activity query unavailable",
+                    json!({"error_kind":"activity_query_unavailable","state_changed":false}),
+                )
+            }
+        };
+        let mut visibility_cache = HashMap::new();
+        let Some(detail) = super::window_activity_projection::project_window_activity(
+            self,
+            auth,
+            &mut visibility_cache,
+            event,
+        )
+        .await
+        else {
+            return ToolResult::err_with_output(
+                "Window activity detail unavailable",
+                json!({"error_kind":"activity_detail_unavailable","state_changed":false}),
+            );
+        };
+        ToolResult::ok(json!({"activity_detail": detail}))
+    }
+
+    pub(crate) async fn work_result_send_message(
+        &self,
+        project: String,
+        session_id: Option<String>,
+        message: String,
+        delivery_key: String,
+        auth: Option<&AuthContext>,
+        window: Option<&ClientWindow>,
+    ) -> ToolResult {
+        let project = match self.authorize_work_result_project(&project, auth).await {
+            Ok(project) => project,
+            Err(result) => return result,
+        };
+        let Some(window) = window else {
+            return ToolResult::err("stable Window identity required");
+        };
+        self.post_window_operator_message(
+            window.key(),
+            session_id.as_deref(),
+            Some(&project),
+            message,
+            delivery_key,
+            auth,
+        )
+        .await
+    }
+
+    pub(super) async fn authorize_work_result_project(
+        &self,
+        project: &str,
+        auth: Option<&AuthContext>,
+    ) -> Result<String, ToolResult> {
+        let resolved = self
+            .resolve_project_input_for_auth(project, auth)
+            .await
+            .map_err(|error| error.into_tool_result())?;
+        let issued_ref = matches!(
+            webcodex_core::model_reference::parse_model_reference(
+                project.trim(),
+                webcodex_core::model_reference::ModelReferenceKind::Project,
+            ),
+            Some(Ok(_))
+        );
+        // Resolution already checked principal, exact root fingerprint and
+        // current authority. Never generalize this to ambiguous friendly names.
+        if project.trim() != resolved.resolved_id && !issued_ref {
+            return Err(ToolResult::err_with_output(
+                "Work Result requires an exact runtime project id or issued project_ref",
                 json!({
                     "error_kind": "work_result_project_not_exact",
                     "failure_kind": "invalid_arguments",
                     "state_changed": false,
                 }),
-            );
+            ));
         }
+        Ok(resolved.resolved_id)
+    }
+
+    async fn authorize_work_result_target(
+        &self,
+        project: &str,
+        session_id: &str,
+        tool_name: &'static str,
+        auth: Option<&AuthContext>,
+    ) -> Result<(String, SessionSummary), ToolResult> {
+        if let Err(result) = self
+            .authorize_session_target(session_id, tool_name, auth)
+            .await
+        {
+            return Err(result);
+        }
+        let resolved_project = self.authorize_work_result_project(project, auth).await?;
         let Some(summary) = self
             .sessions
-            .summary(&session_id, Some(WORK_RESULT_SESSION_EVENT_LIMIT))
+            .summary(session_id, Some(WORK_RESULT_SESSION_EVENT_LIMIT))
         else {
-            return unknown_session_result(&session_id);
+            return Err(unknown_session_result(session_id));
         };
-        if summary.project.as_deref() != Some(resolved.resolved_id.as_str()) {
+        if summary.project.as_deref() != Some(resolved_project.as_str()) {
             let mismatch = SessionProjectMismatch {
                 session_project: summary
                     .project
                     .clone()
                     .unwrap_or_else(|| "<unscoped>".to_string()),
-                request_project: resolved.resolved_id.clone(),
+                request_project: resolved_project.clone(),
             };
-            return session_project_mismatch_result(&session_id, tool_name, &mismatch);
+            return Err(session_project_mismatch_result(
+                session_id, tool_name, &mismatch,
+            ));
         }
+        Ok((resolved_project, summary))
+    }
 
-        // Deliberately omit business session_id here. This is a live Project
-        // read, not Session evidence, and an explicit App refresh must never
-        // append to the target Session merely because the card requested it.
-        let workspace_result = self
-            .show_changes_for_presentation(resolved.resolved_id.clone())
-            .await;
-        // Work Result refresh is read-only, but source freshness is live
-        // process-local observation state. Re-observe persisted validation fences
-        // in memory so a later canonical mutation can strengthen unproven ->
-        // stale without materializing Jobs or writing the target Session.
-        let projection_summary = self.refresh_validation_source_summary(&summary);
-        let validation = validation_summary_from_events(
-            &projection_summary.events,
-            WORK_RESULT_VALIDATION_LIMIT,
-        );
-        let current_validation = current_validation_evidence_for_session(
-            &projection_summary,
-            WORK_RESULT_VALIDATION_LIMIT,
-        )
-        .evidence;
-        let review = review_evidence_summary_for_session(&projection_summary);
-        let history_partial = summary.events_truncated;
-        let mut projection = build_work_result_projection(
-            &resolved.resolved_id,
-            &session_id,
-            workspace_result.success,
-            &workspace_result.output,
-            &validation,
-            &current_validation,
-            &review,
-            history_partial,
-        );
-        projection["session"] = work_result_session(&summary);
-        // This version covers live domains only. The card keeps the initial
-        // frozen identity locally; refresh neither replaces nor re-creates it.
-        projection["state_version"] = json!(work_result_state_version(&projection));
-        if tool_name == "present_work_result" {
+    /// The persistent card is Window-first. Project authorization is mandatory;
+    /// Workflow Session evidence is optional and may appear later in the same Window.
+    async fn exact_work_result(
+        &self,
+        project: String,
+        session_id: Option<String>,
+        tool_name: &'static str,
+        auth: Option<&AuthContext>,
+        window: Option<&ClientWindow>,
+    ) -> ToolResult {
+        let resolved_project = match self.authorize_work_result_project(&project, auth).await {
+            Ok(project) => project,
+            Err(result) => return result,
+        };
+
+        // Read the same Window ActionAudit truth used by Runtime WebUI. The App's own
+        // hidden refresh tools are excluded from Window correlation at MCP ingress.
+        let observed = match window {
+            Some(window) => {
+                self.current_window_activity(
+                    Some(window),
+                    auth,
+                    Some(WORK_RESULT_WINDOW_ACTIVITY_LIMIT),
+                    true,
+                )
+                .await
+                .output
+            }
+            None => json!({"status":"unavailable","reason_code":"window_identity_unavailable"}),
+        };
+
+        let summary = if let Some(session_id) = session_id.as_deref() {
             match self
-                .freeze_work_result_changes(&resolved.resolved_id, &summary, auth)
+                .authorize_work_result_target(&resolved_project, session_id, tool_name, auth)
                 .await
             {
+                Ok((_, summary)) => Some(summary),
+                Err(result) => return result,
+            }
+        } else if let Some(discovered) = work_result_linked_session_id(&observed, &resolved_project)
+        {
+            self.authorize_work_result_target(&resolved_project, &discovered, tool_name, auth)
+                .await
+                .ok()
+                .map(|(_, summary)| summary)
+        } else {
+            None
+        };
+
+        // The Results pane uses current Project changes and, when linked, Session
+        // check/review evidence separately from sealed final task changes.
+        let workspace_result = self
+            .workspace_metadata_for_presentation(resolved_project.clone())
+            .await;
+        let mut projection = if let Some(summary) = summary.as_ref() {
+            let projection_summary = self.refresh_validation_source_summary(summary);
+            let validation = validation_summary_from_events(
+                &projection_summary.events,
+                WORK_RESULT_VALIDATION_LIMIT,
+            );
+            let current_validation = current_validation_evidence_for_session(
+                &projection_summary,
+                WORK_RESULT_VALIDATION_LIMIT,
+            )
+            .evidence;
+            let review = review_evidence_summary_for_session(&projection_summary);
+            let mut projection = build_work_result_projection(
+                &resolved_project,
+                &summary.session_id,
+                workspace_result.success,
+                &workspace_result.output,
+                &validation,
+                &current_validation,
+                &review,
+                summary.events_truncated,
+            );
+            projection["session"] = work_result_session(summary);
+            projection["session_id"] = json!(summary.session_id);
+            if let Some(detail) = self.workflow_session_console_detail(
+                &resolved_project,
+                &summary.session_id,
+                Some(WORK_RESULT_ACTIVITY_LIMIT),
+            ) {
+                projection["workflow"] = json!({
+                    "activity": detail.activity.iter().map(|item| {
+                        json!({
+                            "label": match item.kind.as_str() {
+                                "Read" => "Read project files",
+                                "Searched" => "Searched the project",
+                                "Navigated" | "Explored" => "Explored the project",
+                                "Edited" => "Edited code",
+                                "Tested" => "Ran checks",
+                                "Reviewed" => "Reviewed changes",
+                                "Ran" => "Ran a command",
+                                _ => "Task activity",
+                            },
+                            "stage": match item.kind.as_str() {
+                                "Read" | "Searched" | "Navigated" | "Explored" => "explore",
+                                "Edited" => "edit",
+                                "Tested" => "check",
+                                "Reviewed" => "review",
+                                "Ran" => "run",
+                                _ => "other",
+                            },
+                            "state": item.state,
+                            "started_at": item.started_at,
+                            "finished_at": item.finished_at,
+                            "duration_ms": item.duration_ms,
+                            "count": item.group_count.unwrap_or(1),
+                        })
+                    }).collect::<Vec<_>>(),
+                    "history_partial": detail.activity_truncated || summary.retention_truncated,
+                });
+            }
+            projection
+        } else {
+            json!({
+                "version": 2,
+                "project": resolved_project,
+                "workspace": work_result_workspace(
+                    workspace_result.success,
+                    &workspace_result.output,
+                ),
+                "validation": empty_work_result_validation(),
+                "review": empty_work_result_review(),
+                "collaboration": {
+                    "available": false,
+                    "can_send": false,
+                    "messages": [],
+                },
+            })
+        };
+
+        if let Some(window) = window {
+            projection["window"] = json!({
+                "key": window.key(),
+                "source": window.source(),
+            });
+        }
+
+        projection["collaboration"] = self.window_collaboration(
+            window.map(ClientWindow::key),
+            auth,
+            MAX_WORK_RESULT_MESSAGES,
+        );
+        projection["window_activity"] = work_result_window_activity_projection(&observed);
+        projection["activity"] = work_result_activity_projection(&observed, summary.as_ref());
+        // Only the exact business Session supplied to this call selects Jobs.
+        // Window correlation may enrich activity but is never Job inventory authority.
+        projection["jobs"] = self
+            .work_result_jobs(&resolved_project, session_id.as_deref(), auth)
+            .await;
+        projection["state_version"] = json!(work_result_state_version(&projection));
+
+        if let Some(summary) = summary.as_ref() {
+            match self.sealed_work_result_changes(&resolved_project, summary, auth) {
                 Ok(Some(changes)) => projection["final_changes"] = changes,
                 Ok(None) => {}
                 Err(result) => return result,
             }
         }
         ToolResult::ok(json!({"work_result": projection}))
+    }
+
+    pub(crate) async fn work_result_jobs(
+        &self,
+        project: &str,
+        session_id: Option<&str>,
+        auth: Option<&AuthContext>,
+    ) -> Value {
+        let Some(session_id) = session_id else {
+            return json!({"available": false});
+        };
+        if auth.is_some_and(|auth| !auth.has_scope(SCOPE_RUNTIME_READ)) {
+            return json!({"available": false});
+        }
+        // This bounded snapshot reads Server records only: no lifecycle refresh,
+        // Runner request, attention cursor, terminal wake or Session event write.
+        let snapshots = self
+            .runner_registry
+            .snapshot_jobs_for_auth_filtered(
+                crate::runner_http::runner_access_from_auth(auth).as_ref(),
+                project,
+                session_id,
+                WORK_RESULT_JOB_LIMIT + 1,
+                WORK_RESULT_JOB_LIMIT + 1,
+            )
+            .await;
+        let active = snapshots
+            .iter()
+            .any(|snapshot| !super::jobs::is_terminal_job_status(&snapshot.job.status));
+        let items: Vec<Value> = snapshots
+            .iter()
+            .take(WORK_RESULT_JOB_LIMIT)
+            .map(|snapshot| self.work_result_job(snapshot))
+            .collect();
+        json!({"available": true, "active": active, "items": items, "truncated": snapshots.len() > WORK_RESULT_JOB_LIMIT})
+    }
+
+    pub(crate) fn work_result_job(
+        &self,
+        snapshot: &webcodex_runner_registry::JobAttentionSnapshot,
+    ) -> Value {
+        let summary = self.passive_job_attention_item(snapshot);
+        let mut item = json!({
+            "job_id": snapshot.job.job_id,
+            "tool": summary["tool"],
+            "status": snapshot.job.status,
+            "state": if super::jobs::is_terminal_job_status(&snapshot.job.status) { "terminal" } else { "active" },
+        });
+        for key in ["outcome", "recovery_state"] {
+            if let Some(value) = summary.get(key) {
+                item[key] = value.clone();
+            }
+        }
+        if summary["outcome"] == "passed"
+            && summary.pointer("/validation/passed") == Some(&Value::Bool(false))
+        {
+            item["outcome"] = json!("failed");
+        }
+        item
     }
 }
 
@@ -200,7 +532,7 @@ pub(crate) fn work_result_state_version(projection: &Value) -> String {
         // serialization failure hashes an empty byte sequence, never a partial one.
         hasher = Sha256::new();
     }
-    format!("wr1_{:x}", hasher.finalize())
+    format!("wr2_{:x}", hasher.finalize())
 }
 
 pub(crate) fn build_work_result_projection(
@@ -214,12 +546,353 @@ pub(crate) fn build_work_result_projection(
     history_partial: bool,
 ) -> Value {
     json!({
-        "version": 1,
+        "version": 2,
         "project": project,
         "session_id": session_id,
         "workspace": work_result_workspace(workspace_call_succeeded, workspace_source),
         "validation": work_result_validation(validation_source, current_validation_source, history_partial),
         "review": work_result_review(review_source, history_partial),
+    })
+}
+
+fn empty_work_result_validation() -> Value {
+    json!({
+        "status": "unknown",
+        "latest_status": "unknown",
+        "current_status": "unknown",
+        "history_partial": false,
+        "successes": 0,
+        "failures": 0,
+        "unresolved_failures": 0,
+        "evidence_gaps": 0,
+    })
+}
+
+fn empty_work_result_review() -> Value {
+    json!({
+        "available": false,
+        "history_partial": false,
+        "total": 0,
+        "read_only_inspection_count": 0,
+        "search_count": 0,
+        "diff_review_count": 0,
+        "workspace_review_count": 0,
+        "hygiene_review_count": 0,
+        "tools": [],
+    })
+}
+
+fn work_result_linked_session_id(observed: &Value, project: &str) -> Option<String> {
+    observed
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|event| {
+            let at = event
+                .get("ended_at_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            event
+                .get("workflow_sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |link| {
+                    let linked_project = link.get("project").and_then(Value::as_str);
+                    if linked_project.is_some() && linked_project != Some(project) {
+                        return None;
+                    }
+                    let session_id = link.get("workflow_session_id")?.as_str()?.to_string();
+                    Some((at, session_id))
+                })
+        })
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, session_id)| session_id)
+}
+
+fn work_result_observed_label(tool: &str, current: bool, meaningful: bool) -> &'static str {
+    if meaningful {
+        return semantic_activity_label(tool, current);
+    }
+    match tool {
+        "observe_jobs" => "Observed job progress",
+        "runtime_status" => "Observed Runtime status",
+        "current_window_activity" => "Observed Window activity",
+        "list_jobs" => "Observed Jobs",
+        _ => "Observed WebCodex activity",
+    }
+}
+
+fn work_result_window_activity_projection(observed: &Value) -> Value {
+    if observed.get("status").and_then(Value::as_str) != Some("available") {
+        return json!({
+            "available": false,
+            "active": false,
+            "active_requests": [],
+            "events": [],
+            "events_returned": 0,
+            "events_observed": 0,
+            "truncated": false,
+            "last_activity_at_ms": Value::Null,
+        });
+    }
+
+    let active_requests = observed
+        .get("active_requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|request| {
+            let tool = request
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let started_at_ms = request.get("started_at_ms").and_then(Value::as_i64)?;
+            let semantics = webcodex_tool_contracts::runtime_tool_activity_semantics(tool);
+            Some(json!({
+                "label": work_result_observed_label(
+                    tool,
+                    true,
+                    semantics.interaction.is_meaningful(),
+                ),
+                "tool_name": (!tool.is_empty()).then_some(tool),
+                "server_trace_id": request.get("server_trace_id"),
+                "kind": semantics.kind.as_str(),
+                "started_at_ms": started_at_ms,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let events = observed
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            let started_at_ms = event.get("started_at_ms").and_then(Value::as_i64)?;
+            let ended_at_ms = event.get("ended_at_ms").and_then(Value::as_i64)?;
+            let tool = event.get("tool_name").and_then(Value::as_str).unwrap_or("");
+            let meaningful = event
+                .get("meaningful")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let semantics = webcodex_tool_contracts::runtime_tool_activity_semantics(tool);
+            Some(json!({
+                "label": work_result_observed_label(tool, false, meaningful),
+                "tool_name": (!tool.is_empty()).then_some(tool),
+                "server_trace_id": event.get("server_trace_id"),
+                "kind": semantics.kind.as_str(),
+                "status": event.get("status").and_then(Value::as_str).unwrap_or("unknown"),
+                "meaningful": meaningful,
+                "started_at_ms": started_at_ms,
+                "ended_at_ms": ended_at_ms,
+                "duration_ms": event.get("duration_ms").and_then(Value::as_i64),
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let last_event = events
+        .iter()
+        .filter_map(|event| event.get("ended_at_ms").and_then(Value::as_i64))
+        .max();
+    let last_active = active_requests
+        .iter()
+        .filter_map(|request| request.get("started_at_ms").and_then(Value::as_i64))
+        .max();
+    let last_activity_at_ms = last_event.into_iter().chain(last_active).max();
+    let events_observed = observed
+        .pointer("/summary/events_scanned")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(events.len());
+
+    json!({
+        "available": true,
+        "active": !active_requests.is_empty(),
+        "active_requests": active_requests,
+        "events_returned": events.len(),
+        "events_observed": events_observed,
+        "events": events,
+        "truncated": observed.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+        "last_activity_at_ms": last_activity_at_ms,
+    })
+}
+
+fn work_result_activity_projection(observed: &Value, summary: Option<&SessionSummary>) -> Value {
+    if observed.get("status").and_then(Value::as_str) != Some("available") {
+        return summary.map(session_activity_fallback).unwrap_or_else(|| {
+            json!({
+                "available": false,
+                "scope": "window",
+                "active": false,
+                "current": Value::Null,
+                "last": Value::Null,
+                "last_activity_at_ms": Value::Null,
+                "last_meaningful_activity_at_ms": Value::Null,
+                "coverage_partial": false,
+            })
+        });
+    }
+
+    let current = observed
+        .get("active_requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|request| {
+            let tool = request
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let started = request.get("started_at_ms").and_then(Value::as_i64)?;
+            let semantics = webcodex_tool_contracts::runtime_tool_activity_semantics(tool);
+            Some((
+                started,
+                json!({
+                    "label": work_result_observed_label(
+                        tool,
+                        true,
+                        semantics.interaction.is_meaningful(),
+                    ),
+                    "kind": semantics.kind.as_str(),
+                    "started_at_ms": started,
+                }),
+            ))
+        })
+        .max_by_key(|(started, _)| *started)
+        .map(|(_, value)| value);
+
+    let last = observed
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            let at = event.get("ended_at_ms").and_then(Value::as_i64)?;
+            let tool = event.get("tool_name").and_then(Value::as_str).unwrap_or("");
+            let meaningful = event
+                .get("meaningful")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some((
+                at,
+                json!({
+                    "label": work_result_observed_label(tool, false, meaningful),
+                    "kind": event.get("activity_kind").and_then(Value::as_str),
+                    "at_ms": at,
+                }),
+            ))
+        })
+        .max_by_key(|(at, _)| *at);
+
+    let last_active = current
+        .as_ref()
+        .and_then(|value| value.get("started_at_ms"))
+        .and_then(Value::as_i64);
+    let last_completed = last.as_ref().map(|(at, _)| *at);
+    let last_activity_at_ms = last_active.into_iter().chain(last_completed).max();
+    let last_value = last.map(|(_, value)| value);
+
+    json!({
+        "available": true,
+        "scope": "window",
+        "active": current.is_some(),
+        "current": current,
+        "last": last_value,
+        "last_activity_at_ms": last_activity_at_ms,
+        // Legacy v6 field name; use the same Window-wide timestamp so cached cards
+        // no longer disagree with Runtime WebUI about the last observed activity.
+        "last_meaningful_activity_at_ms": last_activity_at_ms,
+        "coverage_partial": observed.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+fn semantic_activity_label(tool: &str, current: bool) -> &'static str {
+    match webcodex_tool_contracts::runtime_tool_activity_semantics(tool)
+        .kind
+        .as_str()
+    {
+        Some("read") => {
+            if current {
+                "Reading project files"
+            } else {
+                "Read project files"
+            }
+        }
+        Some("search") => {
+            if current {
+                "Searching the codebase"
+            } else {
+                "Searched the codebase"
+            }
+        }
+        Some("navigate") => {
+            if current {
+                "Inspecting code"
+            } else {
+                "Inspected code"
+            }
+        }
+        Some("edit") => {
+            if current {
+                "Editing code"
+            } else {
+                "Edited code"
+            }
+        }
+        Some("run") => {
+            if current {
+                "Running a command"
+            } else {
+                "Ran a command"
+            }
+        }
+        Some("test") => {
+            if current {
+                "Running checks"
+            } else {
+                "Ran checks"
+            }
+        }
+        Some("review") => {
+            if current {
+                "Reviewing changes"
+            } else {
+                "Reviewed changes"
+            }
+        }
+        _ => {
+            if current {
+                "Working"
+            } else {
+                "Work updated"
+            }
+        }
+    }
+}
+
+fn session_activity_fallback(summary: &SessionSummary) -> Value {
+    let latest = summary.events.iter().rev().find(|event| {
+        webcodex_tool_contracts::runtime_tool_activity_interaction(&event.tool_name).is_meaningful()
+    });
+    let last_at = latest.map(|event| event.timestamp.saturating_mul(1000));
+    let last = latest.map(|event| {
+        let semantics = webcodex_tool_contracts::runtime_tool_activity_semantics(&event.tool_name);
+        json!({
+            "label": semantic_activity_label(&event.tool_name, false),
+            "kind": semantics.kind.as_str(),
+            "at_ms": event.timestamp.saturating_mul(1000),
+        })
+    });
+    json!({
+        "available": false,
+        "scope": "session",
+        "active": false,
+        "current": Value::Null,
+        "last": last,
+        "last_meaningful_activity_at_ms": last_at,
+        "coverage_partial": summary.events_truncated,
     })
 }
 
@@ -250,7 +923,7 @@ fn work_result_workspace(call_succeeded: bool, source: &Value) -> Value {
     let mut files = Vec::new();
     let mut unsafe_file_omitted = false;
     for source_file in source_files.iter().take(MAX_WORK_RESULT_FILES) {
-        match work_result_file(source_file) {
+        match work_result_file(source_file, source) {
             Some(file) => files.push(file),
             None => unsafe_file_omitted = true,
         }
@@ -328,7 +1001,7 @@ fn work_result_workspace(call_succeeded: bool, source: &Value) -> Value {
     Value::Object(workspace)
 }
 
-fn work_result_file(source: &Value) -> Option<Value> {
+fn work_result_file(source: &Value, workspace: &Value) -> Option<Value> {
     let path = source
         .get("path")
         .and_then(Value::as_str)
@@ -363,9 +1036,91 @@ fn work_result_file(source: &Value) -> Option<Value> {
         file.insert("additions".to_string(), json!(additions));
         file.insert("deletions".to_string(), json!(deletions));
     }
+    if let Some(content) = work_result_file_content(workspace, &path) {
+        for (key, value) in content {
+            file.insert(key, value);
+        }
+    }
     Some(Value::Object(file))
 }
 
+fn work_result_file_content(workspace: &Value, path: &str) -> Option<Map<String, Value>> {
+    if let Some(file_hunks) = workspace
+        .get("hunks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|file| file.get("path").and_then(Value::as_str) == Some(path))
+    {
+        let mut text = String::new();
+        let mut partial = workspace
+            .get("hunks_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(hunks) = file_hunks.get("hunks").and_then(Value::as_array) {
+            for hunk in hunks {
+                if let Some(diff) = hunk.get("diff").and_then(Value::as_str) {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(diff);
+                }
+                if hunk.get("source_completeness").and_then(Value::as_str) != Some("complete") {
+                    partial = true;
+                }
+            }
+        }
+        if let Some((content, bounded)) =
+            bounded_multiline_text(&text, MAX_WORK_RESULT_FILE_CONTENT_CHARS)
+        {
+            let mut projected = Map::new();
+            projected.insert("content_kind".to_string(), json!("diff"));
+            projected.insert("content".to_string(), json!(content));
+            projected.insert("content_truncated".to_string(), json!(partial || bounded));
+            return Some(projected);
+        }
+    }
+
+    let preview = workspace
+        .get("untracked_previews")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|preview| preview.get("path").and_then(Value::as_str) == Some(path))?;
+    if preview.get("kind").and_then(Value::as_str) != Some("text") {
+        return None;
+    }
+    let mut text = String::new();
+    for line in preview
+        .get("lines")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(line) = line.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(line);
+    }
+    let (content, bounded) = bounded_multiline_text(&text, MAX_WORK_RESULT_FILE_CONTENT_CHARS)?;
+    let mut projected = Map::new();
+    projected.insert("content_kind".to_string(), json!("preview"));
+    projected.insert("content".to_string(), json!(content));
+    projected.insert(
+        "content_truncated".to_string(),
+        json!(
+            bounded
+                || preview
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        ),
+    );
+    Some(projected)
+}
 fn work_result_head(source: Option<&Value>) -> Option<Value> {
     let source = source?.as_object()?;
     let commit = source.get("commit")?.as_str()?;
@@ -552,6 +1307,21 @@ fn safe_relative_path(value: &str) -> Option<String> {
         return None;
     }
     Some(value.to_string())
+}
+
+fn bounded_multiline_text(value: &str, max_chars: usize) -> Option<(String, bool)> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+    let count = value.chars().count();
+    if count <= max_chars {
+        return Some((value.to_string(), false));
+    }
+    Some((value.chars().take(max_chars).collect(), true))
 }
 
 fn bounded_plain_text(value: &str, max_chars: usize) -> Option<String> {

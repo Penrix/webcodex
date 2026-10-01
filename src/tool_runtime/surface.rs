@@ -12,15 +12,18 @@ use super::kernel::ToolProtocolCapabilities;
 use super::metadata::ToolAuthorityPolicy;
 #[cfg(feature = "experimental-code-mode")]
 use super::orchestration_host::is_server_owned_orchestration_argument;
-use super::registry::{registered_tool_specs, stateless_operator_extension_tool_specs};
+use super::registry::{
+    exact_manifest_specialist_tool_descriptors, registered_tool_descriptors,
+    stateless_operator_extension_tool_descriptors,
+};
 use super::runtime::ToolRuntime;
 use super::tool_definition::{
-    available_tool_manifest_intent_names, is_model_visible_tool_name, resolve_tool_manifest_intent,
-    runtime_tool_category, runtime_tool_execution_contract, runtime_tool_metadata,
+    available_tool_manifest_intent_names, is_model_visible_tool_name,
+    model_visible_recommended_flows, resolve_tool_manifest_intent, runtime_tool_category,
+    runtime_tool_execution_contract, runtime_tool_host_orchestration_hint, runtime_tool_metadata,
     runtime_tool_operator_extension_family, ToolExecutionContract, ToolManifestIntent,
     ToolOperatorExtensionFamily, TOOL_CATEGORY_ARTIFACT, TOOL_CATEGORY_EDIT, TOOL_CATEGORY_GIT,
     TOOL_CATEGORY_PATCH, TOOL_CATEGORY_RUNTIME, TOOL_CATEGORY_SESSION, TOOL_CATEGORY_VALIDATION,
-    TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
 };
 use super::tool_inputs::ListToolsOptions;
 use super::tool_result::ToolResult;
@@ -30,6 +33,8 @@ use serde_json::{json, Value};
 #[cfg(feature = "experimental-code-mode")]
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
+use webcodex_tool_contracts::registry::ToolDescriptor;
+#[cfg(feature = "experimental-code-mode")]
 use webcodex_tool_contracts::ToolSpec;
 
 const TOOL_MANIFEST_SELECTION_DESCRIPTION_MAX_CHARS: usize = 180;
@@ -234,6 +239,13 @@ fn collect_code_mode_output_fields(
         return;
     };
     for (name, child) in properties {
+        // Passive Job attention is an outer model-facing Window/Project/Session
+        // decoration. Nested Code Mode children have no Window and can never
+        // receive it, so projecting its fields would teach an impossible child
+        // result shape and needlessly consume the callable-contract budget.
+        if prefix == "output" && name == "job_attention" {
+            continue;
+        }
         let path = if prefix.is_empty() {
             name.to_string()
         } else {
@@ -297,9 +309,9 @@ text({status:status.output?.stdout,file:detail.output.items?.[0]?.output?.text})
         CodeModeCallableStage::ReadOnly => {}
         CodeModeCallableStage::Validation => examples.push(json!({
             "name": "validation_job_handoff",
-            "source": r#"const check = await tools.cargo_check({sync_wait_secs:1});
-if (!check.output?.terminal && check.output?.job_id) {
-  text({job_id:check.output.job_id,continuation:check.output.continuation});
+            "source": r#"const check = await tools.cargo_check({});
+if (check.output?.execution_state === "pending") {
+  text({execution_state:"pending",continuation:check.output.continuation});
 } else {
   text({passed:check.output?.passed,failure_kind:check.output?.failure_kind,diagnostics:check.output?.diagnostics});
 }"#,
@@ -309,10 +321,10 @@ if (!check.output?.terminal && check.output?.job_id) {
             "source": r#"const path = "src/example.rs";
 const read = await tools.read_files({items:[{path,start_line:1,limit:120}]});
 const revision = read.output.items?.[0]?.output?.read_revision;
-const edit = await tools.apply_text_edits({changes:[{path,old_text:"old",new_text:"new",expected_read_revision:revision}]});
+const edit = await tools.edit_project_files({changes:[{kind:"edit",path,expected_read_revision:revision,edits:[{kind:"replace_exact",old_text:"old",new_text:"new"}]}]});
 if (!edit.success || typeof edit.output?.state_changed !== "boolean") throw new Error("inspect edit recovery before validating");
-const check = await tools.cargo_check({sync_wait_secs:1});
-text({state_changed:edit.output.state_changed,call_success:check.success,source_state:check.output?.source_state,job_handoff:!!check.output?.job_id});"#,
+const check = await tools.cargo_check({});
+text({state_changed:edit.output.state_changed,call_success:check.success,source_state:check.output?.source_state,pending:check.output?.execution_state==="pending"});"#,
         })),
     }
     examples
@@ -359,7 +371,6 @@ fn code_mode_callable_contract(
         "constraints": {
             "max_mutation_calls": policy.max_mutation_calls,
             "validation_after_successful_known_mutation": policy.validation_after_mutation,
-            "nested_sync_wait_max_secs": policy.nested_sync_wait_max_secs,
         },
         "tool_count": tools.len(),
         "tools": tools,
@@ -386,32 +397,24 @@ fn code_mode_callable_contract(
 }
 
 pub(crate) fn registered_tool_categories() -> Value {
-    let mut categories = serde_json::Map::new();
-    for group in TOOL_DISCOVERY_GROUPS {
-        let tools = group
-            .tools
-            .iter()
-            .filter(|name| is_model_visible_tool_name(name))
-            .map(|name| Value::String((*name).to_string()))
-            .collect::<Vec<_>>();
-        categories.insert(group.name.to_string(), Value::Array(tools));
-    }
-    Value::Object(categories)
+    // Category inventory needs static names, not every tool's full schemas.
+    json!(webcodex_tool_contracts::group_tool_names_by_category(
+        webcodex_tool_contracts::model_visible_tool_definitions().map(|definition| definition.name)
+    ))
 }
 
 /// Short GPT-facing flow hints. Their compact-discovery summary budget remains
 /// independently capped at 300 characters.
 pub(crate) fn recommended_flows() -> Vec<&'static str> {
-    TOOL_RECOMMENDED_FLOWS
-        .iter()
+    model_visible_recommended_flows()
         .map(|flow| flow.summary)
         .collect()
 }
 
-fn tool_manifest_specs(capabilities: ToolProtocolCapabilities) -> Vec<ToolSpec> {
-    let mut specs = registered_tool_specs();
+fn tool_manifest_specs(capabilities: ToolProtocolCapabilities) -> Vec<ToolDescriptor> {
+    let mut specs = registered_tool_descriptors();
     specs.extend(
-        stateless_operator_extension_tool_specs()
+        stateless_operator_extension_tool_descriptors()
             .into_iter()
             .filter(|spec| tool_manifest_extension_capability_allows(&spec.name, capabilities)),
     );
@@ -438,7 +441,7 @@ fn tool_manifest_extension_capability_allows(
     }
 }
 
-fn tool_manifest_route(spec: &ToolSpec) -> (&'static str, Option<&'static str>) {
+fn tool_manifest_route(spec: &ToolDescriptor) -> (&'static str, Option<&'static str>) {
     if is_model_visible_tool_name(spec.name.as_str()) {
         crate::model_surface::adaptive_runtime_tool_invocation_route(spec.name.as_str())
     } else {
@@ -449,11 +452,59 @@ fn tool_manifest_route(spec: &ToolSpec) -> (&'static str, Option<&'static str>) 
     }
 }
 
+fn tool_manifest_invocation_route(spec: &ToolDescriptor) -> Value {
+    let target = spec.name.as_str();
+    let (availability, gateway_tool) = tool_manifest_route(spec);
+    let primary = match (availability, gateway_tool) {
+        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT, None) => {
+            json!({"mode": "direct", "tool": target})
+        }
+        (crate::model_surface::TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(gateway)) => {
+            json!({"mode": "gateway", "tool": gateway, "target": target})
+        }
+        _ => json!({"mode": "unavailable", "tool": Value::Null, "target": target}),
+    };
+
+    let fallback = if availability == crate::model_surface::TOOL_SURFACE_AVAILABILITY_DIRECT
+        && target != crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    {
+        json!({
+            "mode": "gateway",
+            "tool": crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+            "target": target,
+            "when": "direct_callable_unavailable",
+            "blocked_when_mcp_apps_enabled": crate::model_surface::tool_requires_direct_app_presentation(target),
+        })
+    } else {
+        Value::Null
+    };
+
+    json!({
+        "primary": primary,
+        "fallback": fallback,
+        "tool_manifest_registers_host_tool": false,
+        "discovery_effect": "none",
+    })
+}
+
+fn manifest_host_orchestration_projection(tool_name: &str) -> Option<Value> {
+    let hint = runtime_tool_host_orchestration_hint(tool_name);
+    if hint.is_unspecified() {
+        return None;
+    }
+    Some(json!({
+        "guidance_only": true,
+        "concurrency": hint.concurrency.as_str(),
+        "native_batch_field": hint.native_batch_field,
+        "compound_preferred": hint.compound_preferred,
+    }))
+}
+
 impl ToolRuntime {
     pub(crate) const LIST_TOOLS_MAX_LIMIT: usize = 256;
 
     pub(crate) fn list_tools_payload(&self, options: ListToolsOptions) -> Value {
-        let specs = registered_tool_specs();
+        let specs = registered_tool_descriptors();
         let total_count = specs.len();
         let filtered_indexes = list_tools_filtered_indexes(&specs, &options);
         let filtered_count = filtered_indexes.len();
@@ -489,7 +540,9 @@ impl ToolRuntime {
         } else {
             returned_indexes
                 .iter()
-                .map(|index| serde_json::to_value(&specs[*index]).unwrap_or(Value::Null))
+                .map(|index| {
+                    serde_json::to_value(specs[*index].clone().into_spec()).unwrap_or(Value::Null)
+                })
                 .collect()
         };
 
@@ -585,8 +638,13 @@ impl ToolRuntime {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         }
         let specs = tool_manifest_specs(protocol_capabilities);
+        let specialist_specs = exact_manifest_specialist_tool_descriptors();
         let tool_count = specs.len();
-        let Some(spec) = specs.iter().find(|spec| spec.name == tool_name) else {
+        let Some(spec) = specs
+            .iter()
+            .chain(specialist_specs.iter())
+            .find(|spec| spec.name == tool_name)
+        else {
             return Err(unknown_tool_manifest_tool_result(tool_name));
         };
         let category = runtime_tool_category(spec.name.as_str());
@@ -602,6 +660,7 @@ impl ToolRuntime {
             "total_count": tool_count,
             "filtered_count": 1,
             "tool_name": spec.name,
+            "route": tool_manifest_invocation_route(spec),
             "contract": {
                 "name": spec.name,
                 "description": spec.description,
@@ -609,8 +668,8 @@ impl ToolRuntime {
                 "risk": metadata.risk.session_risk_class(),
                 "approval": metadata.approval.manifest_label(),
                 "idempotency": metadata.idempotency.manifest_label(),
-                "input_schema": spec.input_schema,
-                "annotations": spec.annotations,
+                "input_schema": spec.input_schema(),
+                "annotations": spec.annotations(),
                 "availability": availability,
                 "gateway_tool": gateway_tool,
             },
@@ -626,9 +685,14 @@ impl ToolRuntime {
             "requested_limit": Value::Null,
             "categories": Value::Object(exact_categories),
             "tools": [compact_manifest_tool_entry(spec)],
+            "routing_note": "tool_manifest only describes an existing route; it never dynamically registers a new Host tool. Follow route.primary, or route.fallback when the direct callable is unavailable and the fallback is not blocked by MCP App presentation requirements.",
         });
         if let Some(execution) = runtime_tool_execution_contract(spec.name.as_str()) {
             output["contract"]["execution"] = manifest_execution_projection(execution);
+        }
+        if let Some(host_orchestration) = manifest_host_orchestration_projection(spec.name.as_str())
+        {
+            output["host_orchestration"] = host_orchestration;
         }
         if include_risk_summary {
             output["risk_summary"] = build_risk_summary(&[spec]);
@@ -641,7 +705,11 @@ impl ToolRuntime {
         }
         #[cfg(feature = "experimental-code-mode")]
         if let Some(stage) = code_mode_callable_stage_for_entry_tool(spec.name.as_str()) {
-            output["code_mode_callable_contract"] = code_mode_callable_contract(stage, &specs)?;
+            let contracts = specs
+                .into_iter()
+                .map(ToolDescriptor::into_spec)
+                .collect::<Vec<_>>();
+            output["code_mode_callable_contract"] = code_mode_callable_contract(stage, &contracts)?;
         }
         Ok(output)
     }
@@ -720,7 +788,7 @@ impl ToolRuntime {
         let available_intents = available_tool_manifest_intent_names();
 
         // Apply optional intent ranking, then optional category filter, then limit.
-        let filtered_specs: Vec<&ToolSpec> =
+        let filtered_specs: Vec<&ToolDescriptor> =
             filter_manifest_specs(&specs, resolved_intent, categories_requested.as_ref());
         let filtered_count = filtered_specs.len();
         let requested_limit = limit;
@@ -730,7 +798,7 @@ impl ToolRuntime {
         let filtered =
             categories_requested.is_some() || resolved_intent.is_some() || limit.is_some();
         let intent_name = resolved_intent.map(|intent| intent.name);
-        let returned_specs: Vec<&ToolSpec> = match limit {
+        let returned_specs: Vec<&ToolDescriptor> = match limit {
             Some(limit) => filtered_specs.into_iter().take(limit).collect(),
             None => filtered_specs,
         };
@@ -782,16 +850,16 @@ impl ToolRuntime {
 }
 
 fn filter_manifest_specs<'a>(
-    specs: &'a [ToolSpec],
+    specs: &'a [ToolDescriptor],
     intent: Option<&'static ToolManifestIntent>,
     categories_requested: Option<&Vec<String>>,
-) -> Vec<&'a ToolSpec> {
-    let by_name: HashMap<&str, &ToolSpec> = specs
+) -> Vec<&'a ToolDescriptor> {
+    let by_name: HashMap<&str, &ToolDescriptor> = specs
         .iter()
         .map(|spec| (spec.name.as_str(), spec))
         .collect();
 
-    let ordered: Vec<&ToolSpec> = match intent {
+    let ordered: Vec<&ToolDescriptor> = match intent {
         Some(intent) => intent
             .tools
             .iter()
@@ -855,7 +923,7 @@ fn tool_manifest_exact_filter_conflict_result() -> ToolResult {
 }
 
 pub(super) fn list_tools_filtered_indexes(
-    specs: &[ToolSpec],
+    specs: &[ToolDescriptor],
     options: &ListToolsOptions,
 ) -> Vec<usize> {
     specs
@@ -892,7 +960,7 @@ pub(super) fn normalize_tool_manifest_categories(
     (!out.is_empty()).then_some(out)
 }
 
-pub(super) fn build_list_tools_summary_entries(specs: &[ToolSpec]) -> Vec<Value> {
+pub(super) fn build_list_tools_summary_entries(specs: &[ToolDescriptor]) -> Vec<Value> {
     specs
         .iter()
         .map(|spec| {
@@ -908,7 +976,7 @@ pub(super) fn build_list_tools_summary_entries(specs: &[ToolSpec]) -> Vec<Value>
                 "idempotency": m.idempotency.manifest_label(),
                 "read_only": m.effect.read_only_hint(),
                 "requires_project": m.requires_project,
-                "annotations": spec.annotations,
+                "annotations": spec.annotations(),
             })
         })
         .collect()
@@ -1092,7 +1160,7 @@ pub(super) fn sparsify_tool_manifest_model_result(result: &mut ToolResult) {
             projected.insert("recommended_flows".to_string(), Value::Array(flows.clone()));
         }
     } else if canonical.get("filtered").and_then(Value::as_bool) == Some(true) {
-        let specs = registered_tool_specs();
+        let specs = registered_tool_descriptors();
         let descriptions: HashMap<&str, &str> = specs
             .iter()
             .map(|spec| (spec.name.as_str(), spec.description.as_str()))
@@ -1199,7 +1267,7 @@ fn manifest_execution_projection(execution: ToolExecutionContract) -> Value {
     })
 }
 
-pub(super) fn compact_manifest_tool_entry(spec: &ToolSpec) -> Value {
+pub(super) fn compact_manifest_tool_entry(spec: &ToolDescriptor) -> Value {
     let name = spec.name.as_str();
     let m = runtime_tool_metadata(name);
     let (availability, gateway_tool) = tool_manifest_route(spec);
@@ -1265,29 +1333,15 @@ fn list_tool_matches_feature(name: &str, feature: &str) -> bool {
     }
 }
 
-/// Build the categories map from runtime tool specs. Each category
-/// maps to a sorted list of tool names.
-pub(super) fn build_manifest_categories(specs: &[ToolSpec]) -> Value {
-    let mut map: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for spec in specs {
-        let name = spec.name.as_str();
-        let category = runtime_tool_category(name);
-        map.entry(category).or_default().push(name.to_string());
-    }
-    let result: serde_json::Map<String, Value> = map
-        .into_iter()
-        .map(|(k, v)| {
-            (
-                k.to_string(),
-                Value::Array(v.into_iter().map(Value::String).collect()),
-            )
-        })
-        .collect();
-    Value::Object(result)
+/// Build a sorted taxonomy from the exact admitted ToolDescriptor selection.
+pub(super) fn build_manifest_categories(specs: &[ToolDescriptor]) -> Value {
+    json!(webcodex_tool_contracts::group_tool_names_by_category(
+        specs.iter().map(|spec| spec.name.as_str())
+    ))
 }
 
 /// Build the risk summary map from the returned compact manifest specs.
-pub(super) fn build_risk_summary(specs: &[&ToolSpec]) -> Value {
+pub(super) fn build_risk_summary(specs: &[&ToolDescriptor]) -> Value {
     let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
     for spec in specs {
         let risk = runtime_tool_metadata(spec.name.as_str())
@@ -1305,8 +1359,7 @@ pub(super) fn build_risk_summary(specs: &[&ToolSpec]) -> Value {
 /// Short, bounded list of recommended tool flows for common tasks. Each
 /// entry references only known tool names. Kept under 10 entries.
 pub(super) fn tool_manifest_recommended_flows() -> Vec<Value> {
-    TOOL_RECOMMENDED_FLOWS
-        .iter()
+    model_visible_recommended_flows()
         .map(|flow| {
             json!({
                 "name": flow.name,
@@ -1328,8 +1381,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let visible: std::collections::HashSet<&str> = visible_tools.into_iter().collect();
-    TOOL_RECOMMENDED_FLOWS
-        .iter()
+    model_visible_recommended_flows()
         .filter_map(|flow| {
             let mut seen = std::collections::HashSet::new();
             let tools: Vec<&str> = flow

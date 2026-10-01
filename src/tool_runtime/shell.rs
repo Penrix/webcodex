@@ -10,7 +10,8 @@ use super::helpers::{
 };
 use super::process::add_structured_continuation_facts;
 use super::structured_execution::{
-    await_hidden_structured_job, HiddenStructuredJobWait, StructuredExecutionBudget,
+    await_hidden_structured_job, finalize_hidden_terminal_projection, HiddenStructuredJobWait,
+    StructuredExecutionBudget,
 };
 use super::tool_result::ToolResult;
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
@@ -265,6 +266,7 @@ impl ToolRuntime {
             self.runner_registry
                 .enqueue_run(
                     ShellRunRequest {
+                        login: false,
                         client_id,
                         cwd: effective_cwd,
                         command,
@@ -339,7 +341,7 @@ impl ToolRuntime {
         }
     }
 
-    fn run_shell_terminal_job_result(
+    pub(super) fn run_shell_terminal_job_result(
         job: &ShellJobInfo,
         stdout: String,
         stderr: String,
@@ -395,6 +397,22 @@ impl ToolRuntime {
                 state,
             ),
         };
+        if result.success {
+            // A recovered terminal snapshot is conclusive, but not an ordinary
+            // fast success. Preserve its canonical recovery facts for projection.
+            if let Some(state) = &job.recovery_state {
+                result.output["recovery_state"] = json!(state);
+            }
+            if job.recovered_after_server_restart {
+                result.output["recovered_after_server_restart"] = json!(true);
+            }
+            if let Some(at) = job.reconciled_at {
+                result.output["reconciled_at"] = json!(at);
+            }
+            if let Some(reason) = &job.recovery_reason_code {
+                result.output["recovery_reason_code"] = json!(reason);
+            }
+        }
         if job.stdout_log_truncated {
             result.output["stdout_truncated"] = json!(true);
         }
@@ -435,6 +453,7 @@ impl ToolRuntime {
             cwd,
             purpose,
             shell,
+            false,
             None,
             None,
             None,
@@ -452,10 +471,18 @@ impl ToolRuntime {
         cwd: Option<String>,
         purpose: Option<ExecutionPurpose>,
         shell: Option<ExecutionShell>,
+        login: bool,
         ssh_resource: Option<&str>,
         session_id: Option<&str>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        if login && (shell != Some(ExecutionShell::Bash) || ssh_resource.is_some()) {
+            return Self::run_shell_tool_failure_result(
+                "run_shell login=true requires local shell=bash".to_string(),
+                "invalid_arguments",
+                ShellCommandExecutionState::NotStarted,
+            );
+        }
         if let Err(error) = validate_raw_shell_command_length(&command) {
             return Self::run_shell_tool_failure_result(
                 command_rejected_message(
@@ -563,13 +590,17 @@ impl ToolRuntime {
                 ShellCommandExecutionState::NotStarted,
             );
         }
-        let actual_shell = shell
-            .map(ExecutionShell::as_str)
-            .unwrap_or(if ssh_resource.is_some() {
-                "remote"
-            } else {
-                "configured"
-            });
+        let actual_shell = if login {
+            "bash_login"
+        } else {
+            shell
+                .map(ExecutionShell::as_str)
+                .unwrap_or(if ssh_resource.is_some() {
+                    "remote"
+                } else {
+                    "configured"
+                })
+        };
         let dispatched_command = match (ssh_resource, shell) {
             // Named SSH keeps the existing remote-login-shell compatibility
             // wrapper. Local explicit shells are selected structurally by the
@@ -661,6 +692,7 @@ impl ToolRuntime {
                         client_id: Some(client_id.clone()),
                         cwd: effective_cwd.clone(),
                         command: Some(dispatched_command.clone()),
+                        login,
                         timeout_secs: Some(timeout),
                         job_id: None,
                         since_stdout_line: None,
@@ -728,10 +760,16 @@ impl ToolRuntime {
                     stdout,
                     stderr,
                 }) => {
-                    let result = Self::run_shell_terminal_job_result(&job, stdout, stderr, timeout);
-                    self.runner_registry
-                        .remove_projected_hidden_terminal_job_record(&job.job_id)
-                        .await;
+                    let mut result =
+                        Self::run_shell_terminal_job_result(&job, stdout, stderr, timeout);
+                    finalize_hidden_terminal_projection(
+                        self.runner_registry.as_ref(),
+                        auth,
+                        &job,
+                        &mut result,
+                        budget,
+                    )
+                    .await;
                     result
                 }
                 Ok(HiddenStructuredJobWait::Continued {
@@ -811,6 +849,7 @@ impl ToolRuntime {
                     client_id,
                     cwd: effective_cwd,
                     command: dispatched_command,
+                    login,
                     stdin: None,
                     timeout_secs: timeout,
                     wait_timeout_secs: wait_timeout,
@@ -903,6 +942,16 @@ impl ToolRuntime {
                     actual_shell,
                     "agent",
                 );
+                // A direct request has no Job identity. Capture the same proven
+                // terminal tuple as the hidden-Job fast path before late projection.
+                if result.success {
+                    add_structured_continuation_facts(
+                        &mut result,
+                        timeout,
+                        budget.sync_wait_secs,
+                        false,
+                    );
+                }
                 if let Some(resource) = ssh_resource {
                     result.output["ssh_resource"] = json!(resource);
                 }

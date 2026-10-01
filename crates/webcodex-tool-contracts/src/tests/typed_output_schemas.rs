@@ -399,6 +399,24 @@ fn lsp_typed_fields_are_closed_while_intentional_projection_boundaries_stay_open
 }
 
 #[test]
+fn apply_text_edits_success_match_ranges_require_occurrence_while_conflicts_keep_it_optional() {
+    let schema = output_schema_for_tool("edit_project_files");
+    let success_range = &schema["properties"]["output"]["properties"]["files"]["items"]
+        ["properties"]["edits"]["items"]["properties"]["match_ranges"]["items"];
+    assert_eq!(
+        success_range["required"],
+        json!(["occurrence", "start_line", "end_line"])
+    );
+
+    let conflict_range = &schema["properties"]["output"]["properties"]["candidate_ranges"]["items"];
+    assert_eq!(
+        conflict_range["required"],
+        json!(["start_line", "end_line"]),
+        "unguarded conflict candidates intentionally omit occurrence"
+    );
+}
+
+#[test]
 fn typed_output_schemas_use_host_normalized_inline_shapes() {
     for name in [
         "runner_config_check",
@@ -417,4 +435,36 @@ fn typed_output_schemas_use_host_normalized_inline_shapes() {
         assert!(!encoded.contains("$ref"), "{name}");
         assert!(!encoded.contains("nullable"), "{name}");
     }
+}
+
+#[test]
+fn project_build_output_schema_accepts_sparse_success_and_typed_failure() {
+    let schema = output_schema_for_tool("project_build");
+    for impossible in [
+        "suggested_call",
+        "requested_surface",
+        "input_normalization",
+        "expectation_satisfied",
+    ] {
+        assert!(
+            schema["properties"]["output"]["properties"]
+                .get(impossible)
+                .is_none(),
+            "project_build must not advertise run_process-only field {impossible}"
+        );
+    }
+    assert_registered_schema_accepts("project_build", true, &json!({"backend": "rust"}));
+    assert_registered_schema_accepts(
+        "project_build",
+        false,
+        &json!({
+            "execution_state": "not_started",
+            "command_started": false,
+            "command_completed": false,
+            "command_ok": false,
+            "failure_kind": "build_adapter_unavailable",
+            "detected_backend": "node",
+            "tool_failure": true
+        }),
+    );
 }

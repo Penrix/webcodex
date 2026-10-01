@@ -7,10 +7,12 @@
 
 use super::reconnect::dispatch_coding_call_in_window;
 use super::support::*;
+use crate::db::{NewGoal, NewGoalStep};
 use crate::lsp_bridge::{RunnerLspRequest, RunnerLspResultEnvelope, AGENT_LSP_REQUEST_KIND};
 use crate::runner_protocol::{RunnerCapabilities, RunnerResultPayload, RunnerResultRequest};
 use crate::tool_runtime::kernel::{
-    HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolTransport,
+    HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
+    ToolProtocolCapabilities, ToolTransport,
 };
 use crate::tool_runtime::permissions::{AuthorityMode, PermissionEvaluator};
 use crate::tool_runtime::sessions::{SessionEvent, SessionGuards};
@@ -132,6 +134,32 @@ async fn call_hygiene_in_window_with_local_runner_transport(
     window_id: &str,
     transport: ToolTransport,
 ) -> crate::tool_runtime::kernel::ToolCallOutcome {
+    call_hygiene_in_window_with_local_runner_metadata(
+        runtime,
+        client_id,
+        project,
+        recording_session_id,
+        business_session_id,
+        auth,
+        window_id,
+        transport,
+        ToolInvocationMetadata::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_hygiene_in_window_with_local_runner_metadata(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: &str,
+    recording_session_id: Option<&str>,
+    business_session_id: Option<&str>,
+    auth: &crate::auth::AuthContext,
+    window_id: &str,
+    transport: ToolTransport,
+    invocation_metadata: ToolInvocationMetadata,
+) -> crate::tool_runtime::kernel::ToolCallOutcome {
     let runtime_for_task = runtime.clone();
     let project = project.to_string();
     let recording_session_id = recording_session_id.map(str::to_string);
@@ -145,7 +173,7 @@ async fn call_hygiene_in_window_with_local_runner_transport(
             arguments["session_id"] = json!(session_id);
         }
         runtime_for_task
-            .call_tool_with_context(
+            .call_tool_with_invocation_metadata(
                 ToolCallRequest {
                     tool_name: "workspace_hygiene_check".to_string(),
                     arguments,
@@ -158,6 +186,8 @@ async fn call_hygiene_in_window_with_local_runner_transport(
                     record_oauth_scope_denials: true,
                     host_file_import_trust: HostFileImportTrust::Untrusted,
                 },
+                invocation_metadata,
+                ToolProtocolCapabilities::default(),
             )
             .await
     });
@@ -323,6 +353,25 @@ fn worktree_work_on_project_call(
         project: String::new(),
         client_id: Some(client_id.to_string()),
         path: Some(path.to_string()),
+        mode: Some("worktree".to_string()),
+        base_ref: base_ref.map(str::to_string),
+        instruction: instruction.to_string(),
+        guidance_profile: Default::default(),
+        include_extension_catalog: false,
+        session_id: session_id.map(str::to_string),
+    }
+}
+
+fn project_worktree_work_on_project_call(
+    project: &str,
+    instruction: &str,
+    base_ref: Option<&str>,
+    session_id: Option<&str>,
+) -> ToolCall {
+    ToolCall::WorkOnProject {
+        project: project.to_string(),
+        client_id: None,
+        path: None,
         mode: Some("worktree".to_string()),
         base_ref: base_ref.map(str::to_string),
         instruction: instruction.to_string(),
@@ -859,7 +908,20 @@ async fn dispatch_with_path_runner(
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let auth = auth_context(None, true);
-        async move { runtime.dispatch_with_auth(call, Some(&auth)).await }
+        async move {
+            runtime
+                .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+                    call,
+                    Some(&auth),
+                    crate::tool_runtime::sessions::SessionTransport::Mcp,
+                    Default::default(),
+                    None,
+                    true,
+                    vec!["project.instructions".into()],
+                    Default::default(),
+                )
+                .await
+        }
     });
     let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
     loop {
@@ -886,6 +948,7 @@ async fn dispatch_with_path_runner(
                     "allow_patch": true,
                     "disabled": false,
                     "revision": format!("sha256:{}", "a".repeat(64)),
+                    "root_fingerprint": format!("wc_projroot_{}", "b".repeat(64)),
                     "source": "path",
                     "outcome": outcome,
                     "registered": registered,
@@ -942,6 +1005,10 @@ fn valid_work_on_project_projection_input() -> serde_json::Value {
         },
         "workspace": {
             "status": "clean",
+            "git": {
+                "status": "clean",
+                "reason_code": null,
+            },
             "git_available": true,
             "branch": "main",
             "head": "0123456789abcdef0123456789abcdef01234567",
@@ -1071,7 +1138,7 @@ fn work_on_project_schema_and_registration() {
     assert_eq!(props["session_id"]["type"], "string");
     assert_eq!(
         props["session_id"]["pattern"],
-        "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+        "^(wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})|~s[1-9][0-9]{0,18})$"
     );
     assert_eq!(props["include_extension_catalog"]["type"], "boolean");
     assert_eq!(props["include_extension_catalog"]["default"], true);
@@ -1148,6 +1215,7 @@ fn work_on_project_schema_and_registration() {
         .unwrap();
     for field in [
         "session_id",
+        "session_ref",
         "project",
         "resolved_project",
         "project_ref",
@@ -1644,6 +1712,19 @@ fn work_on_project_projection_fails_closed_when_required_field_is_missing() {
 }
 
 #[test]
+fn work_on_project_projection_preserves_session_ref() {
+    let mut output = valid_work_on_project_projection_input();
+    output["session"]["session_ref"] = json!("~s12");
+
+    let result = crate::tool_runtime::coding_task::project_work_on_project_output(
+        SAMPLE_PROJECT.to_string(),
+        output,
+    );
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["session_ref"], "~s12");
+}
+
+#[test]
 fn work_on_project_projection_emits_typed_window_session_correlation() {
     let mut correlation = crate::tool_runtime::ToolCallCorrelation::default();
     let result =
@@ -1682,6 +1763,27 @@ fn work_on_project_projection_fails_closed_for_wrong_field_type() {
         "work_on_project_projection_failed"
     );
     assert_eq!(result.output["state_changed"], true);
+}
+
+#[test]
+fn work_on_project_projection_keeps_safe_coding_agent_discovery_and_rejects_private_fields() {
+    let mut input = valid_work_on_project_projection_input();
+    input["coding_agent_providers"] = json!([{"provider_id":"pi", "name":"Pi Agent"}]);
+    let result = crate::tool_runtime::coding_task::project_work_on_project_output(
+        SAMPLE_PROJECT.to_string(),
+        input.clone(),
+    );
+    assert!(result.success);
+    assert_eq!(
+        result.output["coding_agent_providers"],
+        input["coding_agent_providers"]
+    );
+    input["coding_agent_providers"][0]["provider_instance_id"] = json!("private");
+    let result = crate::tool_runtime::coding_task::project_work_on_project_output(
+        SAMPLE_PROJECT.to_string(),
+        input,
+    );
+    assert!(!result.success);
 }
 
 #[test]
@@ -1752,6 +1854,8 @@ fn work_on_project_projection_is_sparse_for_defaults_and_keeps_noteworthy_state(
         );
     }
     assert_eq!(default_result.output["workspace"]["status"], "clean");
+    assert_eq!(default_result.output["workspace"]["git"]["status"], "clean");
+    assert!(default_result.output["workspace"]["git"]["reason_code"].is_null());
     assert!(default_result.output["workspace"]["branch"].is_string());
     assert!(default_result.output["workspace"]["head"].is_string());
     for omitted in ["git_available", "clean", "conflicts"] {
@@ -1825,6 +1929,43 @@ fn work_on_project_projection_is_sparse_for_defaults_and_keeps_noteworthy_state(
     let instance = json!({ "success": true, "output": noteworthy_result.output });
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
         .unwrap_or_else(|error| panic!("noteworthy sparse output must match schema: {error}"));
+}
+
+#[test]
+fn work_on_project_projection_preserves_observed_tracking_and_dirty_paths() {
+    let mut input = valid_work_on_project_projection_input();
+    input["workspace"]["status"] = json!("dirty");
+    input["workspace"]["git"]["status"] = json!("dirty");
+    input["workspace"]["clean"] = json!(false);
+    input["workspace"]["upstream_status"] = json!("available");
+    input["workspace"]["upstream_reason_code"] = Value::Null;
+    input["workspace"]["upstream"] = json!("origin/main");
+    input["workspace"]["ahead"] = json!(2);
+    input["workspace"]["behind"] = json!(1);
+    input["workspace"]["changed_paths"] = json!(["src/a.rs", "src/b.rs"]);
+    input["workspace"]["changed_paths_total"] = json!(3);
+    input["workspace"]["changed_paths_truncated"] = json!(true);
+
+    let result = crate::tool_runtime::coding_task::project_work_on_project_output(
+        SAMPLE_PROJECT.to_string(),
+        input,
+    );
+    assert!(result.success, "{:?}", result.error);
+    let workspace = &result.output["workspace"];
+    assert_eq!(workspace["status"], "dirty");
+    assert_eq!(workspace["upstream_status"], "available");
+    assert_eq!(workspace["upstream"], "origin/main");
+    assert_eq!(workspace["ahead"], 2);
+    assert_eq!(workspace["behind"], 1);
+    assert_eq!(workspace["changed_paths"], json!(["src/a.rs", "src/b.rs"]));
+    assert_eq!(workspace["changed_paths_total"], 3);
+    assert_eq!(workspace["changed_paths_truncated"], true);
+    assert!(workspace.get("clean").is_none());
+
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("work_on_project");
+    let instance = json!({"success": true, "output": result.output});
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
+        .unwrap_or_else(|error| panic!("tracking startup projection must match schema: {error}"));
 }
 
 #[tokio::test]
@@ -2050,6 +2191,7 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
     .await;
     assert!(recorded.success, "{:?}", recorded.error_status);
     assert!(recorded.correlation.recorder_gap_session_id.is_none());
+    assert!(recorded.correlation.business_session_id.is_none());
     assert!(recorded.correlation.workflow_sessions.iter().any(|link| {
         link.session_id == session_id
             && link.relation == crate::tool_runtime::WorkflowSessionCorrelationRelation::Recording
@@ -2073,6 +2215,20 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
         .unwrap()
         .events
         .len();
+    let guidance = runtime
+        .sessions
+        .post_message_with_ack(
+            crate::tool_runtime::sessions::PostSessionMessageInput {
+                session_id: session_id.clone(),
+                kind: crate::tool_runtime::sessions::SessionMessageKind::Guidance,
+                message: "same-window attention without recorder".to_string(),
+                tags: Vec::new(),
+                reply_to: None,
+                priority: crate::tool_runtime::sessions::SessionMessagePriority::High,
+            },
+            true,
+        )
+        .unwrap();
 
     // T3: omitting recording_session_id does not block business execution and
     // does not forge a Session event. The exact same Window/principal/Project
@@ -2082,6 +2238,7 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
     )
     .await;
     assert!(unrecorded.success, "{:?}", unrecorded.error_status);
+    assert!(unrecorded.correlation.business_session_id.is_none());
     assert_eq!(
         unrecorded.correlation.recorder_gap_session_id.as_deref(),
         Some(session_id.as_str())
@@ -2100,6 +2257,26 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
         project
     );
     assert_eq!(
+        unrecorded_result.output["session_attention"]["session_id"],
+        session_id
+    );
+    assert_eq!(
+        unrecorded_result.output["session_attention"]["source"],
+        "window_affinity"
+    );
+    assert_eq!(
+        unrecorded_result.output["session_attention"]["messages"][0]["message_id"],
+        guidance.message_id
+    );
+    assert_eq!(
+        unrecorded_result.output["session_attention"]["messages"][0]["message"],
+        "same-window attention without recorder"
+    );
+    let affinity_ack_ref = unrecorded_result.output["session_attention"]["ack_ref"]
+        .as_str()
+        .expect("Window-affinity Session attention should expose ack_ref")
+        .to_string();
+    assert_eq!(
         runtime
             .sessions
             .summary(&session_id, Some(200))
@@ -2108,6 +2285,68 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
             .len(),
         recorded_event_count,
         "missing recorder must not backfill or mutate the Workflow Session ledger"
+    );
+
+    let acknowledged = call_hygiene_in_window_with_local_runner_metadata(
+        &runtime,
+        "wop-gap",
+        &project,
+        None,
+        None,
+        &auth,
+        window_id,
+        ToolTransport::Mcp,
+        ToolInvocationMetadata {
+            ack_ref: Some(affinity_ack_ref),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(acknowledged.success, "{:?}", acknowledged.error_status);
+    let acknowledged = acknowledged.result.unwrap();
+    assert_eq!(
+        acknowledged.output["session_attention"]["session_id"],
+        session_id
+    );
+    assert_eq!(
+        acknowledged.output["session_attention"]["ack"]["accepted_count"],
+        1
+    );
+    assert!(acknowledged.output["session_attention"]["messages"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(runtime
+        .sessions
+        .list_messages(
+            &session_id,
+            crate::tool_runtime::sessions::ListSessionMessagesFilter {
+                message_id: Some(guidance.message_id.clone()),
+                ..Default::default()
+            }
+        )
+        .unwrap()[0]
+        .first_ack_observed_at
+        .is_some());
+    assert_eq!(
+        runtime
+            .sessions
+            .summary(&session_id, Some(200))
+            .unwrap()
+            .events
+            .len(),
+        recorded_event_count,
+        "fallback ACK must not create a recorder ToolCall event"
+    );
+
+    let forgotten = call_hygiene_in_window_with_local_runner(
+        &runtime, "wop-gap", &project, None, None, &auth, window_id,
+    )
+    .await;
+    assert_eq!(
+        forgotten.result.unwrap().output["session_attention"]["messages"][0]["message_id"],
+        guidance.message_id,
+        "historical first ACK observation is not durable resolution"
     );
 
     // The recorder gap remains auditable, but an exact business Session equal to
@@ -2130,6 +2369,10 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
             .correlation
             .recorder_gap_session_id
             .as_deref(),
+        Some(session_id.as_str())
+    );
+    assert_eq!(
+        business_bound.correlation.business_session_id.as_deref(),
         Some(session_id.as_str())
     );
     assert!(business_bound
@@ -2175,6 +2418,13 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
             .recorder_gap_session_id
             .as_deref(),
         Some(session_id.as_str())
+    );
+    assert_eq!(
+        different_business
+            .correlation
+            .business_session_id
+            .as_deref(),
+        Some(different_session.session_id.as_str())
     );
     assert_eq!(
         different_business
@@ -2268,6 +2518,252 @@ async fn same_window_recorder_gap_is_visible_without_backfilling_session_ledger(
 }
 
 #[tokio::test]
+async fn window_affinity_attention_is_strict_and_explicit_recorder_keeps_precedence() {
+    let root = tempfile::tempdir().unwrap();
+    let audit_root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let window_db = std::sync::Arc::new(
+        crate::Database::open(&audit_root.path().join("attention-strict.db")).unwrap(),
+    );
+    let runtime = ToolRuntime::new_for_tests().with_window_activity_database(window_db.clone());
+    let project =
+        register_runner_project_at_path(&runtime, "attention-strict", "demo", root.path()).await;
+    let auth = auth_context(None, true);
+    let window_id = "attention-strict-window";
+    let affinity = runtime
+        .sessions
+        .start_session(Some(project.clone()), Some("affinity target".to_string()));
+    let affinity_message = runtime
+        .sessions
+        .post_message_with_ack(
+            crate::tool_runtime::sessions::PostSessionMessageInput {
+                session_id: affinity.session_id.clone(),
+                kind: crate::tool_runtime::sessions::SessionMessageKind::Guidance,
+                message: "affinity-only guidance".to_string(),
+                tags: Vec::new(),
+                reply_to: None,
+                priority: crate::tool_runtime::sessions::SessionMessagePriority::High,
+            },
+            true,
+        )
+        .unwrap();
+    record_window_activity_fixture(
+        &window_db,
+        &auth,
+        window_id,
+        &project,
+        "work_on_project",
+        Some((
+            &affinity.session_id,
+            crate::action_audit_sessions::WorkflowSessionRelation::WorkOnProject,
+        )),
+        None,
+        1_000,
+    );
+
+    let wrong_window = call_hygiene_in_window_with_local_runner(
+        &runtime,
+        "attention-strict",
+        &project,
+        None,
+        None,
+        &auth,
+        "attention-strict-other-window",
+    )
+    .await;
+    assert!(wrong_window.success);
+    assert!(wrong_window
+        .result
+        .unwrap()
+        .output
+        .get("session_attention")
+        .is_none());
+
+    let other_principal = auth_context(Some("different-principal"), true);
+    let wrong_principal = call_hygiene_in_window_with_local_runner(
+        &runtime,
+        "attention-strict",
+        &project,
+        None,
+        None,
+        &other_principal,
+        window_id,
+    )
+    .await;
+    assert!(wrong_principal.success);
+    assert!(wrong_principal
+        .result
+        .unwrap()
+        .output
+        .get("session_attention")
+        .is_none());
+
+    let wrong_project_window = "attention-strict-wrong-project";
+    let unrelated_project = "agent:other:unregistered-project";
+    let unrelated = runtime.sessions.start_session(
+        Some(unrelated_project.to_string()),
+        Some("wrong project".to_string()),
+    );
+    record_window_activity_fixture(
+        &window_db,
+        &auth,
+        wrong_project_window,
+        unrelated_project,
+        "work_on_project",
+        Some((
+            &unrelated.session_id,
+            crate::action_audit_sessions::WorkflowSessionRelation::WorkOnProject,
+        )),
+        None,
+        2_000,
+    );
+    let wrong_project = call_hygiene_in_window_with_local_runner(
+        &runtime,
+        "attention-strict",
+        &project,
+        None,
+        None,
+        &auth,
+        wrong_project_window,
+    )
+    .await;
+    assert!(wrong_project.success);
+    assert!(wrong_project
+        .result
+        .unwrap()
+        .output
+        .get("session_attention")
+        .is_none());
+
+    let closed_window = "attention-strict-closed";
+    let closed = runtime
+        .sessions
+        .start_session(Some(project.clone()), Some("closed affinity".to_string()));
+    record_window_activity_fixture(
+        &window_db,
+        &auth,
+        closed_window,
+        &project,
+        "work_on_project",
+        Some((
+            &closed.session_id,
+            crate::action_audit_sessions::WorkflowSessionRelation::WorkOnProject,
+        )),
+        None,
+        3_000,
+    );
+    runtime.sessions.close_session(&closed.session_id).unwrap();
+    let inactive = call_hygiene_in_window_with_local_runner(
+        &runtime,
+        "attention-strict",
+        &project,
+        None,
+        None,
+        &auth,
+        closed_window,
+    )
+    .await;
+    assert!(inactive.success);
+    assert!(inactive
+        .result
+        .unwrap()
+        .output
+        .get("session_attention")
+        .is_none());
+
+    let recorder = runtime
+        .sessions
+        .start_session(Some(project.clone()), Some("explicit recorder".to_string()));
+    let recorder_message = runtime
+        .sessions
+        .post_message_with_ack(
+            crate::tool_runtime::sessions::PostSessionMessageInput {
+                session_id: recorder.session_id.clone(),
+                kind: crate::tool_runtime::sessions::SessionMessageKind::Guidance,
+                message: "explicit recorder guidance".to_string(),
+                tags: Vec::new(),
+                reply_to: None,
+                priority: crate::tool_runtime::sessions::SessionMessagePriority::Normal,
+            },
+            true,
+        )
+        .unwrap();
+    let explicit = call_hygiene_in_window_with_local_runner(
+        &runtime,
+        "attention-strict",
+        &project,
+        Some(&recorder.session_id),
+        None,
+        &auth,
+        window_id,
+    )
+    .await;
+    assert!(explicit.success);
+    let explicit_output = &explicit.result.as_ref().unwrap().output;
+    assert_eq!(
+        explicit_output["session_attention"]["session_id"],
+        recorder.session_id
+    );
+    assert_eq!(
+        explicit_output["session_attention"]["source"],
+        "recording_session"
+    );
+    assert_eq!(
+        explicit_output["session_attention"]["messages"][0]["message_id"],
+        recorder_message.message_id
+    );
+    assert_ne!(
+        explicit_output["session_attention"]["messages"][0]["message_id"],
+        affinity_message.message_id
+    );
+
+    let resolution_without_recorder = call_hygiene_in_window_with_local_runner_metadata(
+        &runtime,
+        "attention-strict",
+        &project,
+        None,
+        None,
+        &auth,
+        window_id,
+        ToolTransport::Mcp,
+        ToolInvocationMetadata {
+            session_message_resolution: Some(
+                crate::tool_runtime::sessions::ToolCallSessionMessageResolution {
+                    message_id: affinity_message.message_id.clone(),
+                    resolution: "must stay explicit".to_string(),
+                },
+            ),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        resolution_without_recorder.error_status,
+        Some(
+            crate::tool_runtime::kernel::ToolCallErrorStatus::InvalidArguments {
+                message: "session_message_resolution requires recording_session_id".to_string(),
+            }
+        )
+    );
+    assert!(resolution_without_recorder.result.is_none());
+    let retained = runtime
+        .sessions
+        .list_messages(
+            &affinity.session_id,
+            crate::tool_runtime::sessions::ListSessionMessagesFilter {
+                message_id: Some(affinity_message.message_id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        retained[0].status,
+        crate::tool_runtime::sessions::SessionMessageStatus::Open
+    );
+    assert!(retained[0].resolution.is_none());
+}
+
+#[tokio::test]
 async fn workflow_resume_context_is_window_principal_scoped_bounded_and_non_authoritative() {
     let root = tempfile::tempdir().unwrap();
     let audit_root = tempfile::tempdir().unwrap();
@@ -2275,10 +2771,28 @@ async fn workflow_resume_context_is_window_principal_scoped_bounded_and_non_auth
     let window_db = std::sync::Arc::new(
         crate::Database::open(&audit_root.path().join("workflow-resume.db")).unwrap(),
     );
-    let runtime = ToolRuntime::new_for_tests().with_window_activity_database(window_db.clone());
+    let runtime = ToolRuntime::new_for_tests()
+        .with_window_activity_database(window_db.clone())
+        .with_project_reference_database(window_db.clone());
     let project =
         register_runner_project_at_path(&runtime, "workflow-resume", "demo", root.path()).await;
     let auth = auth_context(None, true);
+    let owner_authority = crate::tool_runtime::workflow_session_authority_fingerprint(Some(&auth))
+        .expect("test auth has stable Workflow Session authority");
+    let start_owned_session = |project: Option<String>, title: Option<String>| {
+        runtime
+            .sessions
+            .start_session_with_options(
+                crate::tool_runtime::sessions::SessionCreateOptions::new(
+                    project,
+                    title,
+                    SessionMode::Normal,
+                    SessionGuards::default(),
+                )
+                .with_owner_authority_fingerprint(Some(owner_authority.clone())),
+            )
+            .unwrap()
+    };
     let window_id = "workflow-resume-window";
     let window = crate::client_window::ClientWindow::for_test(window_id);
 
@@ -2297,7 +2811,7 @@ async fn workflow_resume_context_is_window_principal_scoped_bounded_and_non_auth
     assert_eq!(empty["count"], 0);
     assert!(empty.get("suggested_call").is_none());
 
-    let first = runtime.sessions.start_session(
+    let first = start_owned_session(
         Some(project.clone()),
         Some("implementation recovery candidate".to_string()),
     );
@@ -2321,10 +2835,22 @@ async fn workflow_resume_context_is_window_principal_scoped_bounded_and_non_auth
         .unwrap();
     assert_eq!(single["count"], 1);
     assert_eq!(single["candidates"][0]["session_id"], first.session_id);
+    let first_ref = single["candidates"][0]["session_ref"]
+        .as_str()
+        .expect("authorized discovery candidate should expose a short Session selector");
+    assert!(first_ref.starts_with("~s"));
     assert_eq!(
         single["suggested_call"]["arguments"]["session_id"],
-        first.session_id
+        first_ref
     );
+    assert_eq!(
+        single["suggested_call"]["follow_up_kind"],
+        "fallback_recovery"
+    );
+    webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(
+        &single["suggested_call"],
+    )
+    .expect("workflow resume recovery must pass session_handoff_summary registered inputSchema");
 
     let other_window = crate::client_window::ClientWindow::for_test("workflow-resume-other");
     let hidden_by_window = runtime
@@ -2341,7 +2867,7 @@ async fn workflow_resume_context_is_window_principal_scoped_bounded_and_non_auth
     assert_eq!(hidden_by_principal["count"], 0);
 
     let inaccessible_project = "agent:missing:workflow-resume";
-    let inaccessible = runtime.sessions.start_session(
+    let inaccessible = start_owned_session(
         Some(inaccessible_project.to_string()),
         Some("must-not-leak-secret-title".to_string()),
     );
@@ -2367,7 +2893,7 @@ async fn workflow_resume_context_is_window_principal_scoped_bounded_and_non_auth
     assert!(!hidden_json.contains(&inaccessible.session_id));
     assert!(!hidden_json.contains("must-not-leak-secret-title"));
 
-    let second = runtime.sessions.start_session(
+    let second = start_owned_session(
         Some(project.clone()),
         Some("independent review recovery candidate".to_string()),
     );
@@ -2402,14 +2928,21 @@ async fn workflow_resume_context_is_window_principal_scoped_bounded_and_non_auth
         active_only["candidates"][0]["session_id"],
         second.session_id
     );
+    let second_ref = active_only["candidates"][0]["session_ref"]
+        .as_str()
+        .expect("remaining authorized candidate should keep its short selector");
     assert_eq!(
         active_only["suggested_call"]["arguments"]["session_id"],
-        second.session_id
+        second_ref
+    );
+    assert_eq!(
+        active_only["suggested_call"]["follow_up_kind"],
+        "fallback_recovery"
     );
 
     let mut newest_session_id = String::new();
     for index in 0..8 {
-        let extra = runtime.sessions.start_session(
+        let extra = start_owned_session(
             Some(project.clone()),
             Some(format!("bounded recovery candidate {index}")),
         );
@@ -2514,12 +3047,21 @@ async fn managed_worktree_bootstrap_recovers_same_operation_and_binds_session_to
     )
     .await;
 
+    let auth = auth_context(None, true);
+    let resolved_source = runtime
+        .resolve_project_input_for_auth("agent:wop-managed:source", Some(&auth))
+        .await
+        .expect("source Project resolves for short-ref bootstrap");
+    let source_project_ref = runtime
+        .project_reference_for_resolved(&resolved_source, Some(&auth))
+        .expect("source Project must have a short Project ref");
+    assert!(source_project_ref.starts_with("~p"));
+
     let (first, payloads) = dispatch_with_managed_worktree_runner(
         &runtime,
         client_id,
-        worktree_work_on_project_call(
-            client_id,
-            &source_path,
+        project_worktree_work_on_project_call(
+            &source_project_ref,
             "work in an isolated checkout",
             Some("HEAD"),
             None,
@@ -2544,6 +3086,19 @@ async fn managed_worktree_bootstrap_recovers_same_operation_and_binds_session_to
     assert_eq!(payloads[0]["operation_id"], payloads[1]["operation_id"]);
     assert!(payloads[0]["resume_project_id"].is_null());
     assert_eq!(payloads[0]["base_ref"], "HEAD");
+    assert_eq!(payloads[0]["expected_source_project_id"], "source");
+    assert_eq!(
+        payloads[0]["expected_source_root_fingerprint"],
+        managed_source_root_fingerprint()
+    );
+    assert_eq!(
+        payloads[1]["expected_source_project_id"],
+        payloads[0]["expected_source_project_id"]
+    );
+    assert_eq!(
+        payloads[1]["expected_source_root_fingerprint"],
+        payloads[0]["expected_source_root_fingerprint"]
+    );
     let project = "agent:wop-managed:managed-a1b2c3d4";
     assert_eq!(first.output["resolved_project"], project);
     assert_eq!(first.output["project"], project);
@@ -2660,6 +3215,89 @@ async fn managed_worktree_bootstrap_recovers_same_operation_and_binds_session_to
     let instance = json!({"success": true, "output": first.output});
     crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
         .unwrap_or_else(|error| panic!("managed worktree output must match schema: {error}"));
+}
+
+#[tokio::test]
+async fn managed_worktree_project_source_failure_scrubs_internal_identity_fence() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    init_git_repo(&source);
+    let source_path = source.canonicalize().unwrap().to_string_lossy().to_string();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "wop-managed-failure";
+    let mut source_project = registered_project("source", &source_path);
+    source_project.root_fingerprint = Some(managed_source_root_fingerprint());
+    register_agent_with_projects(
+        &runtime,
+        client_id,
+        None,
+        RunnerCapabilities {
+            shell: true,
+            git: true,
+            managed_worktree: true,
+            ..Default::default()
+        },
+        vec![source_project],
+    )
+    .await;
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let call = project_worktree_work_on_project_call(
+            "agent:wop-managed-failure:source",
+            "surface a bounded identity failure",
+            None,
+            None,
+        );
+        async move {
+            runtime
+                .dispatch_with_auth(call, Some(&auth_context(None, true)))
+                .await
+        }
+    });
+    let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
+    while !task.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "managed-worktree failure fixture did not finish"
+        );
+        let Some(request) = probe_patch_agent_request(&runtime, client_id).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            continue;
+        };
+        assert_eq!(request.kind, "prepare_managed_worktree");
+        let response = json!({
+            "error_code": "managed_worktree_source_identity_changed",
+            "error_kind": "managed_worktree_source_identity_changed",
+            "failure_kind": "managed_worktree_source_identity_changed",
+            "state_changed": false,
+            "source_project_id": "source",
+            "source_root_fingerprint": managed_source_root_fingerprint(),
+        });
+        complete_patch_agent_request(
+            &runtime,
+            client_id,
+            &request.request_id,
+            1,
+            &response.to_string(),
+            "",
+        )
+        .await;
+    }
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(
+        result.output["error_kind"],
+        "managed_worktree_source_identity_changed"
+    );
+    assert_eq!(
+        result.output["source_project"],
+        "agent:wop-managed-failure:source"
+    );
+    assert!(result.output.get("source_project_id").is_none());
+    assert!(result.output.get("source_root_fingerprint").is_none());
 }
 
 #[tokio::test]
@@ -2793,51 +3431,25 @@ async fn source_project_session_cannot_resume_a_managed_worktree() {
     assert!(started.success, "{:?}", started.error);
     let session_id = started.output["session_id"].as_str().unwrap().to_string();
 
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let auth = auth.clone();
-        let source_path = source_path.clone();
-        let session_id = session_id.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    worktree_work_on_project_call(
-                        client_id,
-                        &source_path,
-                        "must not switch workspace",
-                        None,
-                        Some(&session_id),
-                    ),
-                    Some(&auth),
-                )
-                .await
-        }
-    });
-    let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert_eq!(request.kind, "prepare_managed_worktree");
-    let payload: Value = serde_json::from_str(request.stdin.as_deref().unwrap()).unwrap();
-    assert_eq!(payload["resume_project_id"], "source");
-    let error = json!({
-        "error_code": "managed_worktree_resume_mismatch",
-        "error_kind": "managed_worktree_resume_mismatch",
-        "failure_kind": "managed_worktree_resume_mismatch",
-        "state_changed": false,
-    });
-    complete_patch_agent_request(
-        &runtime,
-        client_id,
-        &request.request_id,
-        1,
-        &error.to_string(),
-        "",
-    )
-    .await;
-    let result = task.await.unwrap();
-    assert!(!result.success);
-    assert_eq!(
-        result.output["error_kind"],
-        "managed_worktree_resume_mismatch"
+    let result = runtime
+        .dispatch_with_auth(
+            project_worktree_work_on_project_call(
+                &source_project,
+                "must not switch workspace",
+                None,
+                Some(&session_id),
+            ),
+            Some(&auth),
+        )
+        .await;
+    assert!(
+        probe_patch_agent_request(&runtime, client_id)
+            .await
+            .is_none(),
+        "source Session mismatch must fail before prepare_managed_worktree"
     );
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "session_project_mismatch");
     assert_eq!(result.output["state_changed"], false);
     assert_eq!(instruction_events(&runtime, &session_id).len(), 1);
     assert_eq!(runtime.list_projects(Some(&auth)).await.output["count"], 1);
@@ -2909,7 +3521,11 @@ async fn path_source_auto_registers_reuses_and_supports_canonical_coding_entry()
     std::fs::write(root.path().join("hello.txt"), "hello\n").unwrap();
     let project_path = root.path().canonicalize().unwrap();
     let project_path = project_path.to_string_lossy().to_string();
-    let runtime = ToolRuntime::new_for_tests();
+    let references = tempfile::tempdir().unwrap();
+    let db = std::sync::Arc::new(
+        crate::Database::open(&references.path().join("references.db")).unwrap(),
+    );
+    let runtime = ToolRuntime::new_for_tests().with_project_reference_database(db);
     let client_id = "wop-path";
     register_agent_with_projects(
         &runtime,
@@ -2954,6 +3570,14 @@ async fn path_source_auto_registers_reuses_and_supports_canonical_coding_entry()
         !first.output.to_string().contains(&project_path),
         "compact work_on_project output leaked the absolute input path"
     );
+    assert_eq!(
+        first.output["context_projection"]["materials"][0]["status"],
+        "available"
+    );
+    assert_eq!(
+        first.output["context_projection"]["materials"][0]["projection"]["fingerprint"],
+        first.output["instructions"]["fingerprint"]
+    );
     let session_id = first.output["session_id"].as_str().unwrap().to_string();
 
     let second = dispatch_with_path_runner(
@@ -2981,6 +3605,31 @@ async fn path_source_auto_registers_reuses_and_supports_canonical_coding_entry()
         "reused_existing_registration"
     );
     assert_eq!(instruction_events(&runtime, &session_id).len(), 2);
+
+    for selector in [
+        first.output["resolved_project"].as_str().unwrap(),
+        first.output["project_ref"].as_str().unwrap(),
+    ] {
+        let canonical = dispatch_with_path_runner(
+            &runtime,
+            client_id,
+            work_on_project_call(selector, "canonical context", None),
+            "repo-a1b2c3d4",
+            &project_path,
+            "reused_existing_registration",
+            false,
+        )
+        .await;
+        assert!(canonical.success, "{canonical:?}");
+        assert_eq!(
+            canonical.output["resolved_project"],
+            first.output["resolved_project"]
+        );
+        assert_eq!(
+            canonical.output["context_projection"]["materials"][0]["status"],
+            "available"
+        );
+    }
 
     let listed = runtime.list_projects(Some(&auth_context(None, true))).await;
     assert!(listed.success);
@@ -3369,8 +4018,12 @@ async fn path_source_respects_restricted_authority_before_runner_enqueue() {
 #[tokio::test]
 async fn work_on_project_continues_exact_session_and_appends_instruction() {
     let root = tempfile::tempdir().unwrap();
+    let goal_store = tempfile::tempdir().unwrap();
     init_git_repo(root.path());
-    let runtime = ToolRuntime::new_for_tests();
+    let goal_db = std::sync::Arc::new(
+        crate::db::Database::open(&goal_store.path().join("goals.db")).unwrap(),
+    );
+    let runtime = ToolRuntime::new_for_tests().with_communication_database(goal_db);
     let project =
         register_runner_project_at_path(&runtime, "wop-continue", "demo", root.path()).await;
     let auth = auth_context(None, true);
@@ -3385,8 +4038,59 @@ async fn work_on_project_continues_exact_session_and_appends_instruction() {
     .await;
     assert!(first.success, "{:?}", first.error);
     let session_id = first.output["session_id"].as_str().unwrap().to_string();
+    assert!(
+        first.output.get("goal_context").is_none(),
+        "fresh Session must not fabricate active Goal context"
+    );
     let before = instruction_events(&runtime, &session_id);
     assert_eq!(before.len(), 1);
+
+    let created = runtime.create_goal_with_plan(
+        Some(&auth),
+        NewGoal {
+            title: "Continue exact Goal".into(),
+            objective: "Reuse this Goal on normal Workflow Session re-entry.".into(),
+            controller_agent_id: None,
+            completion_conditions: vec!["Normal re-entry reuses exact Goal identity".into()],
+            steps: vec![
+                NewGoalStep {
+                    id: "inspect".into(),
+                    title: "Inspect".into(),
+                },
+                NewGoalStep {
+                    id: "verify".into(),
+                    title: "Verify".into(),
+                },
+            ],
+            idempotency_key: "wop-goal-create".into(),
+        },
+    );
+    assert!(created.success, "{:?}", created.output);
+    let goal_id = created.output["goal"]["summary"]["goal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let associated = runtime
+        .associate_goal_workflow_session(
+            Some(&auth),
+            goal_id.clone(),
+            session_id.clone(),
+            "wop-goal-link".into(),
+        )
+        .await;
+    assert!(associated.success, "{:?}", associated.output);
+    let checkpoint = runtime.checkpoint_goal(
+        Some(&auth),
+        goal_id.clone(),
+        2,
+        crate::db::GoalCheckpoint {
+            completed_step_ids: vec!["inspect".into()],
+            current_step_id: Some("verify".into()),
+            summary: "Inspect complete; verify next.".into(),
+        },
+        "wop-goal-checkpoint".into(),
+    );
+    assert!(checkpoint.success, "{:?}", checkpoint.output);
 
     let continued = dispatch_coding_call_in_window(
         &runtime,
@@ -3399,8 +4103,72 @@ async fn work_on_project_continues_exact_session_and_appends_instruction() {
     assert!(continued.success, "{:?}", continued.error);
     assert_eq!(continued.output["session_id"], session_id);
     assert_eq!(continued.output["continuation"], "resumed_explicitly");
+    assert_eq!(continued.output["goal_context"]["available"], true);
+    assert_eq!(continued.output["goal_context"]["truncated"], false);
+    assert_eq!(
+        continued.output["goal_context"]["goals"],
+        json!([{
+            "goal_id": goal_id,
+            "revision": 3,
+            "incomplete_step_count": 1,
+            "current_step": {"id": "verify", "title": "Verify"},
+            "next_action": "checkpoint_goal"
+        }])
+    );
     assert!(first.output.get("workflow").is_none());
     assert!(continued.output.get("workflow").is_none());
+
+    let second = runtime.create_goal(
+        Some(&auth),
+        "Second active Goal".into(),
+        "Remain explicit when multiple active Goals share one Session.".into(),
+        "wop-second-goal-create".into(),
+    );
+    assert!(second.success, "{:?}", second.output);
+    let second_goal_id = second.output["goal"]["summary"]["goal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second_link = runtime
+        .associate_goal_workflow_session(
+            Some(&auth),
+            second_goal_id.clone(),
+            session_id.clone(),
+            "wop-second-goal-link".into(),
+        )
+        .await;
+    assert!(second_link.success, "{:?}", second_link.output);
+    let continued_with_multiple = dispatch_coding_call_in_window(
+        &runtime,
+        "wop-continue",
+        work_on_project_call(&project, "choose explicit active Goal", Some(&session_id)),
+        Some(&auth),
+        "wop-continue-window",
+    )
+    .await;
+    assert!(
+        continued_with_multiple.success,
+        "{:?}",
+        continued_with_multiple.error
+    );
+    let goals = continued_with_multiple.output["goal_context"]["goals"]
+        .as_array()
+        .unwrap();
+    assert_eq!(goals.len(), 2);
+    let mut returned_ids = goals
+        .iter()
+        .map(|goal| goal["goal_id"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    returned_ids.sort();
+    let mut expected_ids = vec![goal_id, second_goal_id];
+    expected_ids.sort();
+    assert_eq!(returned_ids, expected_ids);
+    assert!(
+        continued_with_multiple.output["goal_context"]
+            .get("selected_goal_id")
+            .is_none(),
+        "startup Goal context must never auto-select among active Goals"
+    );
 
     // Explicit resume reuses exactly one Session and appends one instruction.
     assert_eq!(
@@ -3412,11 +4180,15 @@ async fn work_on_project_continues_exact_session_and_appends_instruction() {
 
     // Follow-up instruction appended; root title preserved.
     let events = instruction_events(&runtime, &session_id);
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 3);
     assert_eq!(events[0].instruction.as_deref(), Some("root objective"));
     assert_eq!(
         events[1].instruction.as_deref(),
         Some("follow-up instruction")
+    );
+    assert_eq!(
+        events[2].instruction.as_deref(),
+        Some("choose explicit active Goal")
     );
     let summary = runtime.sessions.summary(&session_id, Some(50)).unwrap();
     assert_eq!(summary.title.as_deref(), Some("root objective"));
@@ -3428,6 +4200,47 @@ async fn work_on_project_continues_exact_session_and_appends_instruction() {
             .unwrap()
             .contains("webcodex.coding_workflow"),
         "workflow projection must not become Session state"
+    );
+}
+
+#[tokio::test]
+async fn work_on_project_exact_resume_omits_goal_context_without_active_goal() {
+    let root = tempfile::tempdir().unwrap();
+    let goal_store = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let goal_db = std::sync::Arc::new(
+        crate::db::Database::open(&goal_store.path().join("goals.db")).unwrap(),
+    );
+    let runtime = ToolRuntime::new_for_tests().with_communication_database(goal_db);
+    let project =
+        register_runner_project_at_path(&runtime, "wop-no-goal", "demo", root.path()).await;
+    let auth = auth_context(None, true);
+
+    let first = dispatch_coding_call_in_window(
+        &runtime,
+        "wop-no-goal",
+        work_on_project_call(&project, "root objective", None),
+        Some(&auth),
+        "wop-no-goal-window",
+    )
+    .await;
+    assert!(first.success, "{:?}", first.error);
+    let session_id = first.output["session_id"].as_str().unwrap().to_string();
+
+    let resumed = dispatch_coding_call_in_window(
+        &runtime,
+        "wop-no-goal",
+        work_on_project_call(&project, "ordinary continuation", Some(&session_id)),
+        Some(&auth),
+        "wop-no-goal-window",
+    )
+    .await;
+    assert!(resumed.success, "{:?}", resumed.error);
+    assert_eq!(resumed.output["session_id"], session_id);
+    assert_eq!(resumed.output["continuation"], "resumed_explicitly");
+    assert!(
+        resumed.output.get("goal_context").is_none(),
+        "exact Session re-entry with zero active Goals must keep startup sparse"
     );
 }
 
@@ -3685,6 +4498,10 @@ async fn work_on_project_new_task_is_lightweight_and_preserves_startup_context()
 
     // resolved_project is the full runtime project id.
     assert_eq!(result.output["resolved_project"], project);
+    assert_eq!(result.output["workspace"]["upstream_status"], "absent");
+    assert!(result.output["workspace"].get("upstream").is_none());
+    assert!(result.output["workspace"].get("ahead").is_none());
+    assert!(result.output["workspace"].get("behind").is_none());
     // Neither an inconclusive LSP probe nor an intentionally skipped
     // repository overview is a readiness warning.
     assert!(result.output.get("repository").is_none());
@@ -4031,6 +4848,76 @@ async fn work_on_project_omits_instruction_bodies_even_for_a_fresh_session() {
         Some(stored_agents.fingerprint.as_str()),
         agents_source["fingerprint"].as_str()
     );
+}
+
+#[tokio::test]
+async fn work_on_project_fresh_window_discovers_only_owning_runner_acp_and_admits_it() {
+    let root = tempfile::tempdir().unwrap();
+    seed_coding_repository(root.path(), "Review source without changing files");
+    let runtime = ToolRuntime::new_for_tests();
+    let provider = |id: &str, name: &str| webcodex_core::coding_agent::CodingAgentProvider {
+        provider_id: id.to_owned(),
+        name: name.to_owned(),
+        provider_instance_id: format!("private-provider-{id}"),
+    };
+    let project = register_runner_project_at_path_with_coding_agents(
+        &runtime,
+        "wop-acp",
+        "demo",
+        root.path(),
+        Some(vec![provider("pi", "Pi Agent")]),
+    )
+    .await;
+    register_runner_project_at_path_with_coding_agents(
+        &runtime,
+        "other-acp",
+        "other",
+        root.path(),
+        Some(vec![provider("codex", "Codex Agent")]),
+    )
+    .await;
+    let auth = auth_context(None, true);
+    for window in ["fresh-acp-window-a", "fresh-acp-window-b"] {
+        let result = dispatch_coding_call_in_window(
+            &runtime,
+            "wop-acp",
+            work_on_project_call(
+                &project,
+                "Review the repository without changing files",
+                None,
+            ),
+            Some(&auth),
+            window,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output["coding_agent_providers"],
+            json!([{"provider_id":"pi","name":"Pi Agent"}])
+        );
+        assert!(!result.output.to_string().contains("private-provider-"));
+        let advertised = result.output["coding_agent_providers"][0]["provider_id"]
+            .as_str()
+            .unwrap();
+        assert!(runtime
+            .prepare_coding_agent_start(
+                project.clone(),
+                advertised.to_owned(),
+                format!("discover-{window}"),
+                "Read-only module review".to_owned(),
+                None,
+                Some(10),
+                Some(&auth),
+            )
+            .await
+            .is_ok());
+        let schema = crate::tool_runtime::registry::output_schema_for_tool("work_on_project");
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+            &json!({"success": true, "output": result.output}),
+            &schema,
+        )
+        .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -4992,7 +5879,7 @@ async fn work_on_project_guidance_profile_is_request_local_and_not_durable() {
     let session_id = first.output["session_id"].as_str().unwrap().to_string();
     let before =
         serde_json::to_value(runtime.sessions.summary(&session_id, Some(50)).unwrap()).unwrap();
-    let mut cases = vec![Some("direct")];
+    let mut cases = vec![Some("direct"), Some("host_code_mode")];
     #[cfg(feature = "experimental-code-mode")]
     cases.push(Some("code_mode"));
     cases.push(None); // Same Window/Session must not remember the last profile.
@@ -5237,15 +6124,15 @@ async fn work_on_project_distinguishes_unavailable_from_inconclusive_lsp_probes(
     use std::time::{Duration, Instant};
 
     for (status, reason) in [
-        ("probe_timeout", "status_probe_timed_out"),
-        ("probe_failed", "status_probe_failed"),
-        ("unavailable", "server_unavailable"),
+        ("not_observed", None),
+        ("probe_failed", Some("status_probe_failed")),
+        ("unavailable", Some("server_unavailable")),
     ] {
         let root = tempfile::tempdir().unwrap();
         init_git_repo(root.path());
         commit_file(root.path(), "README.md", "# fixture\n", "seed");
         let runtime = ToolRuntime::new_for_tests()
-            .with_semantic_navigation_probe_timeout(Duration::from_millis(100));
+            .with_semantic_navigation_probe_timeout(Duration::from_secs(60));
         let project =
             register_runner_project_at_path(&runtime, "wop-probe-state", "demo", root.path()).await;
         let task = tokio::spawn({
@@ -5273,9 +6160,9 @@ async fn work_on_project_distinguishes_unavailable_from_inconclusive_lsp_probes(
                 continue;
             }
             probe_count += 1;
-            if status == "probe_timeout" {
-                // Leave exactly this probe unanswered; the normal timeout path
-                // must cancel it without blocking the rest of coding startup.
+            if status == "not_observed" {
+                // Leave only the optional probe unanswered. Mandatory completion
+                // must cancel it without waiting for the provider timeout.
                 continue;
             }
             let envelope = if status == "unavailable" {
@@ -5312,7 +6199,7 @@ async fn work_on_project_distinguishes_unavailable_from_inconclusive_lsp_probes(
         let semantic = &result.output["semantic_navigation"];
         assert_eq!(semantic["supported"], true);
         assert_eq!(semantic["status"], status);
-        assert_eq!(semantic["reason_code"], reason);
+        assert_eq!(semantic["reason_code"], json!(reason));
         if status == "unavailable" {
             assert_eq!(semantic["available"], false);
             assert_eq!(result.output["readiness"]["status"], "warn");

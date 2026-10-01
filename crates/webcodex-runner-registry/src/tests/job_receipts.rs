@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, Weak};
 struct MemoryReceipts {
     rows: Mutex<Vec<RetainedJobReceipt>>,
     fail: bool,
+    failures_remaining: std::sync::atomic::AtomicUsize,
     registry: Mutex<Option<Weak<crate::receipts::ReceiptRegistryState>>>,
 }
 impl JobReceiptStore for MemoryReceipts {
@@ -26,7 +27,16 @@ impl JobReceiptStore for MemoryReceipts {
                 "storage must run after registry unlock"
             );
         }
-        if self.fail {
+        if self.fail
+            || self
+                .failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+        {
             return Err("injected failure".into());
         }
         let mut rows = self.rows.lock().unwrap();
@@ -174,6 +184,27 @@ async fn terminal_events_emit_once_only_after_accepted_sequenced_terminal_truth(
         .unwrap();
     assert_eq!(replay.status, "completed");
     assert_eq!(events.rows.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_events_canonicalize_both_timeout_wire_spellings() {
+    for wire_status in ["timeout", "timed_out"] {
+        let store = Arc::new(MemoryReceipts::default());
+        let events = Arc::new(MemoryTerminalEvents::default());
+        let registry = durable_with_events(&store, &events).await;
+        register(&registry, INSTANCE_A, empty_inventory()).await;
+        let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+
+        registry
+            .update_job(update(INSTANCE_A, &job.job_id, 1, wire_status, None, true))
+            .await
+            .unwrap();
+
+        let rows = events.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1, "wire status {wire_status}");
+        assert_eq!(rows[0].status, "timed_out", "wire status {wire_status}");
+        assert_eq!(rows[0].outcome, "timed_out", "wire status {wire_status}");
+    }
 }
 
 
@@ -807,4 +838,110 @@ async fn receipts_unowned_admission_preserves_only_existing_global_visibility() 
         .get_job_for_auth(Some(&access(Some("tester"), None)), &job.job_id)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn receipts_transient_storage_failure_retries_without_job_reexecution() {
+    let store = Arc::new(MemoryReceipts {
+        failures_remaining: std::sync::atomic::AtomicUsize::new(1),
+        ..Default::default()
+    });
+    let registry = durable(&store).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            2,
+            "completed",
+            Some("done\n"),
+            true,
+        ))
+        .await
+        .unwrap();
+    let observed = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(observed.exit_code, Some(0));
+    let rows = store.rows.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].snapshot.job_id, job.job_id);
+}
+
+#[tokio::test]
+async fn passive_snapshot_keeps_recent_terminal_transition_beside_terminal_history() {
+    let registry = RunnerRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+
+    let (old, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(INSTANCE_A, &old.job_id, 1, "running", None, false))
+        .await
+        .unwrap();
+    {
+        let mut inner = registry.inner.lock().await;
+        inner.jobs_by_id.get_mut(&old.job_id).unwrap().created_at = 1;
+    }
+
+    let mut newer = Vec::new();
+    for index in 0..32 {
+        let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+        registry
+            .update_job(update(INSTANCE_A, &job.job_id, 1, "running", None, false))
+            .await
+            .unwrap();
+        registry
+            .update_job(update(INSTANCE_A, &job.job_id, 2, "completed", None, true))
+            .await
+            .unwrap();
+        {
+            let mut inner = registry.inner.lock().await;
+            let record = inner.jobs_by_id.get_mut(&job.job_id).unwrap();
+            record.created_at = 10 + index;
+            record.observation.terminal_observed_at = Some(100 + index);
+        }
+        newer.push(job.job_id);
+    }
+
+    let baseline = registry
+        .snapshot_jobs_for_auth_filtered(None, RUNTIME_PROJECT_ID, SESSION_ID, 64, 32)
+        .await;
+    assert!(baseline.iter().any(|snapshot| snapshot.job.job_id == old.job_id));
+    assert_eq!(
+        baseline.len(),
+        33,
+        "active baseline and terminal history have independent bounded pages"
+    );
+
+    registry
+        .update_job(update(INSTANCE_A, &old.job_id, 2, "completed", None, true))
+        .await
+        .unwrap();
+    {
+        let mut inner = registry.inner.lock().await;
+        inner
+            .jobs_by_id
+            .get_mut(&old.job_id)
+            .unwrap()
+            .observation
+            .terminal_observed_at = Some(1_000);
+    }
+    let terminal = registry
+        .snapshot_jobs_for_auth_filtered(None, RUNTIME_PROJECT_ID, SESSION_ID, 64, 32)
+        .await;
+    assert!(
+        terminal.iter().any(|snapshot| snapshot.job.job_id == old.job_id),
+        "a newly terminalized old Job must remain observable even with 32 newer terminal records"
+    );
+    assert_eq!(terminal.len(), 32);
+    assert!(newer.iter().any(|id| terminal.iter().any(|snapshot| &snapshot.job.job_id == id)));
+}
+
+#[tokio::test]
+async fn job_telemetry_contention_omits_snapshot_without_waiting_or_mutating() {
+    let registry = RunnerRegistry::default();
+    let guard = registry.inner.lock().await;
+    assert!(registry.try_job_telemetry_snapshots_for_auth(None, &["unknown"]).is_none());
+    assert!(guard.jobs_by_id.is_empty());
+    drop(guard);
+    assert!(registry.try_job_telemetry_snapshots_for_auth(None, &["unknown"]).unwrap().is_empty());
 }

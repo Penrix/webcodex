@@ -98,6 +98,19 @@ fn run_python_candidate(
 ) -> std::process::Output {
     let target = target.to_str().expect("test Skill path must be UTF-8");
     for (executable, args) in skill_execution_candidates(request, target).unwrap() {
+        #[cfg(windows)]
+        let executable = {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let Some(resolved) =
+                crate::webcodex_runner::util::resolve_program_in_path(&executable, &path)
+            else {
+                continue;
+            };
+            if !windows_skill_interpreter_path_available(resolved.path()) {
+                continue;
+            }
+            resolved.path().to_string_lossy().into_owned()
+        };
         let child = Command::new(&executable)
             .args(&args)
             .current_dir(cwd)
@@ -119,6 +132,32 @@ fn run_python_candidate(
         return child.wait_with_output().unwrap();
     }
     panic!("no supported Python interpreter is available for the real-process regression test")
+}
+
+#[cfg(all(feature = "runner-real-process-tests", windows))]
+#[test]
+fn python_interpreter_admission_skips_windows_app_execution_aliases() {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(python3) = crate::webcodex_runner::util::resolve_program_in_path("python3", &path) {
+        if std::fs::symlink_metadata(python3.path())
+            .ok()
+            .is_some_and(|metadata| configured_skills::metadata_is_link_like(&metadata))
+        {
+            assert!(
+                !windows_skill_interpreter_path_available(python3.path()),
+                "App Execution Alias must not be admitted as a Skill interpreter: {}",
+                python3.path().display()
+            );
+        }
+    }
+    if let Some(python) = crate::webcodex_runner::util::resolve_program_in_path("python", &path) {
+        if std::fs::symlink_metadata(python.path())
+            .ok()
+            .is_some_and(|metadata| !configured_skills::metadata_is_link_like(&metadata))
+        {
+            assert!(windows_skill_interpreter_path_available(python.path()));
+        }
+    }
 }
 
 #[cfg(feature = "runner-real-process-tests")]
@@ -274,7 +313,7 @@ fn managed_only_runtime_resolve_read_and_explicit_revision_checks_are_preserved(
             "SKILL.md",
             1,
             20,
-            Some(&"wc_skillpkg___________________________________________8".to_string()),
+            Some("wc_skillpkg___________________________________________8"),
             None,
         )
         .unwrap_err(),
@@ -313,13 +352,11 @@ fn mixed_list_keeps_configured_and_managed_source_identity_explicit() {
         .iter()
         .any(|skill| skill.skill_id() == managed.skill_id()
             && skill.source() == RunnerSkillSource::Managed));
-    assert!(resolve_runner_skill(
-        &config,
-        &store,
-        &"wc_skill_AAAAAAAAAAAAAAAAAAAAAA".to_string()
-    )
-    .unwrap()
-    .is_none());
+    assert!(
+        resolve_runner_skill(&config, &store, "wc_skill_AAAAAAAAAAAAAAAAAAAAAA")
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

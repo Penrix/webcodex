@@ -174,7 +174,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         runtime_tool_session_risk_class, tool_definitions, PERMISSION_RISK_ARTIFACT_WRITE,
         PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_JOB, PERMISSION_RISK_PATCH,
         PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE,
-        TOOL_DISCOVERY_GROUPS, TOOL_DISCOVERY_GROUP_GIT,
+        TOOL_CATEGORY_GIT,
     };
     use crate::tool_policy::lookup_tool_definition;
 
@@ -187,7 +187,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
     for (name, effect, risk) in [
         ("apply_patch", ToolEffect::Mutate, ToolRisk::ProjectWrite),
         (
-            "apply_text_edits",
+            "edit_project_files",
             ToolEffect::Mutate,
             ToolRisk::ProjectWrite,
         ),
@@ -230,13 +230,11 @@ fn tool_definitions_drive_session_and_permission_policy() {
     assert_eq!(patch_metadata.approval, ToolApprovalPolicy::Standard);
     assert_eq!(patch_metadata.idempotency, ToolIdempotency::NonIdempotent);
 
-    let git_group = TOOL_DISCOVERY_GROUPS
-        .iter()
-        .find(|group| group.name == TOOL_DISCOVERY_GROUP_GIT)
-        .expect("git discovery group")
-        .tools
-        .iter()
-        .copied()
+    let git_group = tool_definitions()
+        .filter(|definition| {
+            definition.visibility.is_model_visible() && definition.category == TOOL_CATEGORY_GIT
+        })
+        .map(|definition| definition.name)
         .collect::<BTreeSet<_>>();
 
     for retired_primitive in ["git_diff", "git_diff_summary"] {
@@ -413,7 +411,12 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .collect::<Vec<_>>();
     assert_eq!(
         change_summary_tools,
-        vec!["git_review_summary", "show_changes", "git_diff_hunks",]
+        vec![
+            "git_review_summary",
+            "review_changes",
+            "show_changes",
+            "git_diff_hunks",
+        ]
     );
 
     let validation_output_tools = tool_definitions()
@@ -422,7 +425,13 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .collect::<Vec<_>>();
     assert_eq!(
         validation_output_tools,
-        vec!["cargo_fmt", "cargo_check", "cargo_test", "go_test"]
+        vec![
+            "cargo_fmt",
+            "cargo_check",
+            "cargo_test",
+            "project_validate",
+            "go_test",
+        ]
     );
 
     let explicit_business_session_tools = tool_definitions()
@@ -432,8 +441,9 @@ fn tool_definitions_drive_session_and_permission_policy() {
     assert_eq!(
         explicit_business_session_tools,
         vec![
+            "record_external_observation",
+            "list_external_observations",
             "finish_coding_task",
-            "present_work_result",
             "session_summary",
             "update_session_context",
             "close_session",
@@ -446,6 +456,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
             "complete_session_message",
             "session_discussion_summary",
             "session_handoff_summary",
+            "session_handoff_state",
             #[cfg(feature = "experimental-code-mode")]
             "code_mode_exec",
             #[cfg(feature = "experimental-code-mode")]
@@ -502,13 +513,14 @@ fn tool_definitions_drive_session_and_permission_policy() {
         #[cfg(feature = "workspace-checkpoints")]
         ("workspace_checkpoint_restore", PERMISSION_RISK_PATCH),
         ("write_project_file", PERMISSION_RISK_WRITE),
-        ("apply_text_edits", PERMISSION_RISK_WRITE),
+        ("edit_project_files", PERMISSION_RISK_WRITE),
         ("assign_agent_task", PERMISSION_RISK_WRITE),
         ("reconcile_agent_task_coding_run", PERMISSION_RISK_WRITE),
         ("heartbeat_agent_task_attempt", PERMISSION_RISK_WRITE),
         ("complete_agent_task_attempt", PERMISSION_RISK_WRITE),
         ("update_agent_identity", PERMISSION_RISK_WRITE),
         ("rotate_agent_continuation_endpoint", PERMISSION_RISK_WRITE),
+        #[cfg(feature = "legacy-gpt-actions")]
         ("attach_agent_endpoint", PERMISSION_RISK_WRITE),
         ("detach_agent_endpoint", PERMISSION_RISK_WRITE),
         ("consume_agent_deliveries", PERMISSION_RISK_WRITE),
@@ -562,336 +574,25 @@ fn tool_definitions_drive_session_and_permission_policy() {
 }
 
 #[test]
-fn required_runner_capability_matches_metadata_risk_table() {
-    use crate::metadata::{lookup_tool_metadata, ToolRisk, TOOL_PROVIDER_RUNNER};
-    use crate::tool_definition::is_model_visible_tool_name;
-
-    let cases = [
-        (
-            "run_process",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::StructuredProcess,
-        ),
-        (
-            "run_skill_resource",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::SkillResourceExecution,
-        ),
-        (
-            "run_detached_process",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::DetachedProcess,
-        ),
-        (
-            "run_script",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::StructuredScript,
-        ),
-        (
-            "coding_agent_start",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::CodingAgentRuns,
-        ),
-        (
-            "start_agent_task_coding_run",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::CodingAgentRuns,
-        ),
-        (
-            "run_shell",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "open_session_shell",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::PersistentShell,
-        ),
-        (
-            "session_shell_exec",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::PersistentShell,
-        ),
-        (
-            "session_shell_status",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::PersistentShell,
-        ),
-        (
-            "close_session_shell",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::PersistentShell,
-        ),
-        (
-            "apply_patch",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::ApplyPatch,
-        ),
-        (
-            "apply_unified_diff",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "delete_project_files",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "git_restore_paths",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::StructuredProcess,
-        ),
-        (
-            "git_commit_paths",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "discard_untracked",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::StructuredProcess,
-        ),
-        (
-            "write_project_file",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "save_project_artifact",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "computer_save_snapshot",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "read_project_artifact_metadata",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "read_project_artifact",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "artifact_upload_begin",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "artifact_upload_chunk",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "artifact_upload_finish",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "artifact_upload_abort",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "apply_text_edits",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "git_status",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "git_diff_hunks",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "git_review_summary",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "git_log",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "cargo_fmt",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "cargo_check",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "cargo_test",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "go_test",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::OwnerOnly,
-        ),
-        (
-            "read_files",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "skill_load",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "lsp_status",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "document_symbols",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "document_diagnostics",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "hover",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "workspace_symbols",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "goto_definition",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "find_references",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "call_hierarchy",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspCallHierarchy,
-        ),
-        (
-            "run_job",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::AsyncJobs,
-        ),
-        (
-            "project_overview",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "list_project_files",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "list_project_tracked_files",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "search_project_texts",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "search_and_read",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "show_changes",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "workspace_hygiene_check",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_create",
-            ToolRisk::CheckpointManage,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_restore",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_list",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::OwnerOnly,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_show",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::OwnerOnly,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_delete",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::OwnerOnly,
-        ),
-    ];
-
-    let specs = registered_tool_specs();
-    let expected_project_tools = specs
-        .iter()
-        .filter_map(|spec| {
-            let metadata = lookup_tool_metadata(&spec.name).unwrap();
-            ((metadata.provider_id == TOOL_PROVIDER_RUNNER
-                || spec.name.starts_with("workspace_checkpoint_")
-                || spec.name == "computer_save_snapshot")
-                && metadata.requires_project)
-                .then_some(spec.name.as_str())
-        })
-        .collect::<BTreeSet<_>>();
-    let table_project_tools = cases
-        .iter()
-        .map(|(name, _, _)| *name)
-        .filter(|name| is_model_visible_tool_name(name))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(table_project_tools, expected_project_tools);
-
-    for (name, risk, capability) in cases {
-        let metadata = lookup_tool_metadata(name).unwrap();
-        assert_eq!(metadata.risk, risk, "{name} metadata risk");
+fn policy_lookups_match_all_tool_definitions() {
+    for definition in tool_definitions() {
         assert_eq!(
-            lookup_tool_definition(name).unwrap().runner_capability,
-            Some(capability),
-            "{name} declarative Runner capability"
+            crate::metadata::lookup_tool_metadata(definition.name),
+            Some(&definition.metadata()),
+            "{}",
+            definition.name
+        );
+        assert_eq!(
+            crate::runtime_tool_runner_capability(definition.name),
+            definition.runner_capability,
+            "{}",
+            definition.name
         );
     }
+    assert!(
+        std::panic::catch_unwind(|| crate::runtime_tool_runner_capability("__unknown_tool__"))
+            .is_err()
+    );
 }
 
 #[test]
@@ -974,13 +675,11 @@ fn workspace_checkpoints_disabled_registry_and_discovery() {
     assert!(registered_tool_specs()
         .iter()
         .all(|spec| !spec.name.starts_with("workspace_checkpoint_")));
-    assert!(crate::tool_catalog::TOOL_DISCOVERY_GROUPS
-        .iter()
-        .all(|group| group.name != "checkpoint"
-            && group
-                .tools
-                .iter()
-                .all(|name| !name.starts_with("workspace_checkpoint_"))));
+    assert!(crate::tool_catalog::group_tool_names_by_category(
+        model_visible_tool_definitions().map(|definition| definition.name)
+    )
+    .get("checkpoint")
+    .is_none());
     for suffix in ["create", "list", "show", "restore", "delete"] {
         assert!(lookup_tool_definition(&format!("workspace_checkpoint_{suffix}")).is_none());
     }

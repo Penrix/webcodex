@@ -12,6 +12,7 @@ impl ToolRuntime {
         trusted_recording_session_id: Option<&str>,
         trusted_recording_session_project: Option<&str>,
         correlation: &mut ToolCallCorrelation,
+        bootstrap_context: &mut Option<super::coding_task::BootstrapContext>,
     ) -> ToolResult {
         match call {
             ToolCall::WorkOnProject {
@@ -25,6 +26,10 @@ impl ToolRuntime {
                 include_extension_catalog,
                 session_id,
             } => {
+                let guidance_profile = self.mcp_host_policy.effective_guidance_profile(
+                    guidance_profile,
+                    matches!(transport, sessions::SessionTransport::Mcp),
+                );
                 self.work_on_project(
                     project,
                     client_id,
@@ -40,6 +45,7 @@ impl ToolRuntime {
                     trusted_recording_session_project,
                     transport,
                     correlation,
+                    bootstrap_context,
                 )
                 .await
             }

@@ -17,7 +17,7 @@ set -euo pipefail
 #   - Canonical run_job starts an async job on the agent and Job observation
 #     round-trip.
 #   - MCP initialize / tools/list / call_runtime_tool(list_projects) work.
-#   - /openapi.json still exposes the expected GPT Actions operation set and
+#   - default builds keep the retired GPT Actions OpenAPI route disabled and
 #     omits legacy/admin paths.
 #
 # What this does NOT do:
@@ -390,7 +390,8 @@ transport = "${TRANSPORT}"
 
 [policy]
 allow_raw_shell = true
-allow_cwd_anywhere = true
+allow_cwd_anywhere = false
+allowed_roots = ["${TMP_ROOT}"]
 max_timeout_secs = 60
 max_output_bytes = 262144
 EOF
@@ -446,7 +447,7 @@ REGISTERED=0
 for _ in $(seq 1 60); do
     check_deadline
     body="$(api_post /api/runtime/status '{}' || true)"
-    agent_count="$(json_get "$body" output.agents.count)"
+    agent_count="$(json_get "$body" output.runners.count)"
     if [ "$agent_count" = "1" ]; then
         REGISTERED=1
         break
@@ -476,9 +477,9 @@ log "keepalive liveness check (idle ${KEEPALIVE_WAIT}s)"
 sleep "$KEEPALIVE_WAIT"
 check_deadline
 body="$(api_post /api/runtime/status '{}' || true)"
-agent_connected="$(json_get "$body" output.agents.clients.0.connected)"
-agent_status="$(json_get "$body" output.agents.clients.0.status)"
-agent_transport="$(json_get "$body" output.agents.clients.0.transport)"
+agent_connected="$(json_get "$body" output.runners.clients.0.connected)"
+agent_status="$(json_get "$body" output.runners.clients.0.status)"
+agent_transport="$(json_get "$body" output.runners.clients.0.transport)"
 if [ "$agent_connected" = "True" ] && [ "$agent_status" = "online" ]; then
     pass "agent still online after idle wait (transport=$agent_transport)"
 else
@@ -633,7 +634,7 @@ mcp_tool_present() {
 
 adaptive_present=1
 for tname in work_on_project runtime_status tool_manifest \
-    search_project_texts read_files apply_text_edits run_process run_shell observe_jobs list_jobs \
+    search_project_texts read_files apply_text_edits run_process run_script run_shell observe_jobs list_jobs \
     cargo_check cargo_test git_review_summary git_diff_hunks \
     show_changes call_runtime_tool; do
     if ! mcp_tool_present "$tname"; then
@@ -642,7 +643,7 @@ for tname in work_on_project runtime_status tool_manifest \
     fi
 done
 for tname in list_tools list_projects workspace_hygiene_check finish_coding_task \
-    project_overview apply_patch run_script apply_unified_diff go_test validation_summary git_status \
+    project_overview apply_patch apply_unified_diff go_test validation_summary git_status \
     goto_definition computer_observe computer_control computer_save_snapshot post_session_message \
     coding_agent_start artifact_upload_begin; do
     if mcp_tool_present "$tname"; then
@@ -869,102 +870,17 @@ for retired_patch_tool in apply_patch_checked validate_patch; do
 done
 
 # ----------------------------------------------------------------------------
-# 7. GPT Actions schema smoke (/openapi.json)
+# 7. Default-off legacy GPT Actions surface
 # ----------------------------------------------------------------------------
 
-log "---- GPT Actions schema (/openapi.json) ----"
+log "---- legacy GPT Actions default-off route ----"
 
-SCHEMA="$(api_get /openapi.json)"
-python3 - "$SCHEMA" "$RUNTIME_PROJECT_ID" <<'PY'
-import json, sys
-schema = json.loads(sys.argv[1])
-errors = []
-
-# Collect operation ids.
-ops = []
-for path, methods in schema.get("paths", {}).items():
-    for method, op in methods.items():
-        ops.append(op.get("operationId"))
-ops_set = set(ops)
-
-if "call_runtime_tool" not in ops_set:
-    errors.append("missing canonical call_runtime_tool operation")
-if any(not isinstance(op, str) or any(ch.isupper() for ch in op) for op in ops):
-    errors.append("operationIds must be canonical snake_case runtime tool names")
-if len(ops) >= 30:
-    errors.append(f"too many operations: {len(ops)} (must stay below 30)")
-
-# GPT Actions has a stricter host presentation budget than the canonical tool surface.
-GPT_ACTION_DESCRIPTION_MAX_CHARS = 300
-for path, methods in schema.get("paths", {}).items():
-    for method, op in methods.items():
-        desc = op.get("description", "") or ""
-        if len(desc) > GPT_ACTION_DESCRIPTION_MAX_CHARS:
-            errors.append(
-                f"{method} {path} operationId {op.get('operationId')} "
-                f"description too long: {len(desc)} chars "
-                f"(hard budget {GPT_ACTION_DESCRIPTION_MAX_CHARS})"
-            )
-
-# Forbidden admin/internal paths must not appear in the generic Action schema.
-forbidden = ["/api/audit/sessions", "/api/audit/session", "/api/audit/stats",
-             "/api/projects/replace_in_file", "/api/projects/write_file",
-             "/api/projects/apply_patch", "/api/projects/apply_patch_checked", "/api/projects/validate_patch",
-             "/api/messages", "/api/files", "/api/desktop/task_op", "/api/desktop/task",
-             "/api/shell/run", "/api/shell/job", "/api/shell/file",
-             "/mcp", "/openapi.json", "/runtime", "/runtime/app.js", "/runtime/styles.css"]
-paths = set(schema.get("paths", {}).keys())
-for path in paths:
-    if not path.startswith("/api/actions/"):
-        errors.append(f"non-canonical GPT Action path present: {path}")
-for fp in forbidden:
-    if fp in paths:
-        errors.append(f"forbidden path present in schema: {fp}")
-
-# Legacy /api/codex/* sub-routes and run_codex must remain removed from
-# GPT Actions/OpenAPI.
-legacy_codex = ["/api/codex/command_request_op", "/api/codex/command_request",
-                "/api/codex/context", "/api/codex/context_batch",
-                "/api/codex/apply_patch", "/api/codex/edit",
-                "/api/codex/artifact", "/api/codex/git",
-                "/api/codex/job", "/api/codex/report",
-                "/api/codex/projects", "/api/codex/run"]
-for p in paths:
-    if p in legacy_codex:
-        errors.append(f"legacy codex path present in schema: {p}")
-
-# Descriptions must not claim server-side projects.toml is the runtime source.
-blob = json.dumps(schema)
-if "projects.toml" in blob and "runtime project source" in blob.lower():
-    errors.append("schema mentions projects.toml as runtime project source")
-
-# Every path must be POST-only.
-for path, methods in schema.get("paths", {}).items():
-    for method in methods:
-        if method != "post":
-            errors.append(f"non-POST method '{method}' on path {path}")
-
-# Each operationId must be unique (no duplicates across the schema).
-seen_ids = {}
-for path, methods in schema.get("paths", {}).items():
-    for method, op in methods.items():
-        oid = op.get("operationId")
-        if oid in seen_ids:
-            errors.append(f"duplicate operationId '{oid}' on {method} {path} and {seen_ids[oid]}")
-        else:
-            seen_ids[oid] = f"{method} {path}"
-
-if errors:
-    print("FAIL")
-    for e in errors:
-        print("  - " + e, file=sys.stderr)
-    sys.exit(1)
-print(f"OK ops={len(ops)} paths={len(paths)}")
-PY
-if [ $? -eq 0 ]; then
-    pass "/openapi.json canonical Action paths + snake_case operations + POST-only + bounded descriptions"
+openapi_status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+    "http://127.0.0.1:${PORT}/openapi.json" 2>/dev/null || true)"
+if [ "$openapi_status" = "404" ]; then
+    pass "default build does not mount /openapi.json"
 else
-    fail "/openapi.json schema checks failed (see stderr above)"
+    fail "default build unexpectedly exposes /openapi.json (status=$openapi_status)"
 fi
 
 # ----------------------------------------------------------------------------
@@ -1029,12 +945,12 @@ else
     fail "POST /api/runtime/status without token returned HTTP ${no_auth_status} (expected 401)"
 fi
 
-# runtime_status now carries per-agent last_seen + stale_count for the console.
+# runtime_status now carries per-Runner last_seen + stale_count for the console.
 status_body="$(api_post /api/runtime/status '{}')"
-if [ "$(json_get "$status_body" output.agents.stale_count)" != "None" ]; then
-    pass "runtime_status exposes agents.stale_count"
+if [ "$(json_get "$status_body" output.runners.stale_count)" != "None" ]; then
+    pass "runtime_status exposes runners.stale_count"
 else
-    fail "runtime_status missing agents.stale_count"
+    fail "runtime_status missing runners.stale_count"
 fi
 
 # ----------------------------------------------------------------------------
@@ -1300,6 +1216,103 @@ PY
     fi
 else
     fail "callRuntimeTool(finish_coding_task) skipped: work_on_project did not return a session_id"
+fi
+
+# Canonical managed-worktree dogfood: a registered Project is sufficient input.
+# The model-facing flow must not reconstruct client_id/source path or select a
+# managed destination. Continue exclusively through the returned Project/ref.
+log "---- canonical project + mode=worktree smoke ----"
+managed_body="$(runtime_tool_call "work_on_project" "{\"project\":\"$RUNTIME_PROJECT_ID\",\"mode\":\"worktree\",\"instruction\":\"e2e isolated managed worktree smoke\"}")"
+managed_fields="$(python3 - "$managed_body" "$RUNTIME_PROJECT_ID" <<'PY'
+import json, sys
+data = json.loads(sys.argv[1])
+source = sys.argv[2]
+out = data.get("output") if isinstance(data, dict) else {}
+out = out if isinstance(out, dict) else {}
+errors = []
+project = out.get("project")
+project_ref = out.get("project_ref")
+session_id = out.get("session_id")
+worktree = out.get("worktree") if isinstance(out.get("worktree"), dict) else {}
+resolution = out.get("project_resolution") if isinstance(out.get("project_resolution"), dict) else {}
+if data.get("success") is not True:
+    errors.append("success must be true")
+if not isinstance(project, str) or not project.startswith("agent:") or project == source:
+    errors.append("output.project must be a distinct canonical managed Project")
+if not isinstance(project_ref, str) or not project_ref.startswith("~p"):
+    errors.append("output.project_ref must be a short Project ref")
+if not isinstance(session_id, str) or not session_id.startswith("wc_sess_"):
+    errors.append("output.session_id must be a Workflow Session")
+if out.get("resolved_project") != project:
+    errors.append("resolved_project must equal managed Project")
+if worktree.get("managed") is not True:
+    errors.append("worktree.managed must be true")
+if resolution.get("source") != "managed_worktree":
+    errors.append("project_resolution.source must be managed_worktree")
+if errors:
+    print("; ".join(errors), file=sys.stderr)
+    sys.exit(1)
+print(project)
+print(project_ref)
+print(session_id)
+PY
+)" || managed_fields=""
+if [ -n "$managed_fields" ]; then
+    MANAGED_PROJECT_ID="$(printf '%s\n' "$managed_fields" | sed -n '1p')"
+    MANAGED_PROJECT_REF="$(printf '%s\n' "$managed_fields" | sed -n '2p')"
+    MANAGED_SESSION_ID="$(printf '%s\n' "$managed_fields" | sed -n '3p')"
+    pass "work_on_project(project, mode=worktree) returns managed Project/ref/Session"
+else
+    MANAGED_PROJECT_ID=""
+    MANAGED_PROJECT_REF=""
+    MANAGED_SESSION_ID=""
+    fail "canonical project + mode=worktree bootstrap failed (body: \${managed_body:0:500})"
+fi
+
+if [ -n "$MANAGED_PROJECT_REF" ]; then
+    body="$(runtime_tool_call "read_files" "{\"project\":\"$MANAGED_PROJECT_REF\",\"session_id\":\"$MANAGED_SESSION_ID\",\"items\":[{\"path\":\"README.md\",\"limit\":20}]}")"
+    if [ "$(json_get "$body" success)" = "True" ] && echo "$(json_get "$body" output.items.0.output.text)" | grep -q "Smoke Project"; then
+        pass "managed Project ref supports read_files"
+    else
+        fail "managed Project ref read_files failed (body: \${body:0:300})"
+    fi
+
+    body="$(runtime_tool_call "search_project_texts" "{\"project\":\"$MANAGED_PROJECT_REF\",\"session_id\":\"$MANAGED_SESSION_ID\",\"queries\":[{\"pattern\":\"Smoke Project\",\"path\":\"README.md\",\"pattern_mode\":\"literal\",\"limit\":5}]}")"
+    if [ "$(json_get "$body" success)" = "True" ]; then
+        pass "managed Project ref supports search_project_texts"
+    else
+        fail "managed Project ref search_project_texts failed (body: \${body:0:300})"
+    fi
+
+    body="$(runtime_tool_call "write_project_file" "{\"project\":\"$MANAGED_PROJECT_REF\",\"session_id\":\"$MANAGED_SESSION_ID\",\"path\":\"MANAGED_WORKTREE_PROBE.txt\",\"content\":\"managed-worktree-probe\\n\"}")"
+    if [ "$(json_get "$body" success)" = "True" ]; then
+        pass "managed Project accepts harmless isolated edit"
+    else
+        fail "managed Project harmless edit failed (body: \${body:0:300})"
+    fi
+
+    body="$(runtime_tool_call "show_changes" "{\"project\":\"$MANAGED_PROJECT_REF\",\"session_id\":\"$MANAGED_SESSION_ID\",\"include_diff\":false}")"
+    if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.clean)" = "False" ]; then
+        pass "managed Project status observes isolated edit"
+    else
+        fail "managed Project status did not observe isolated edit (body: \${body:0:300})"
+    fi
+
+    body="$(runtime_tool_call "delete_project_files" "{\"project\":\"$MANAGED_PROJECT_REF\",\"session_id\":\"$MANAGED_SESSION_ID\",\"paths\":[\"MANAGED_WORKTREE_PROBE.txt\"]}")"
+    if [ "$(json_get "$body" success)" = "True" ]; then
+        pass "managed Project probe cleanup succeeds"
+    else
+        fail "managed Project probe cleanup failed (body: \${body:0:300})"
+    fi
+
+    body="$(show_changes_call)"
+    if [ "$(json_get "$body" success)" = "True" ] && [ "$(json_get "$body" output.clean)" = "True" ]; then
+        pass "source Project remains clean after managed worktree dogfood"
+    else
+        fail "source Project changed during managed worktree dogfood (body: \${body:0:300})"
+    fi
+else
+    fail "managed Project follow-up smoke skipped: bootstrap did not return a Project ref"
 fi
 
 body="$(runtime_tool_call "finish_coding_task" "{\"project\":\"$RUNTIME_PROJECT_ID\"}")"

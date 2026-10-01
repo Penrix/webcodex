@@ -43,7 +43,11 @@ fn validate_coding_agent_registration(
     inventory: Option<&CodingAgentRunInventory>,
 ) -> Result<(), String> {
     match (capability, providers, inventory) {
-        (false, None, None) => return Ok(()),
+        // Older/no-ACP Runners may serialize the optional provider list as []
+        // instead of null/absent. Empty discovery grants no execution capability.
+        (false, providers, None) if providers.is_none_or(|providers| providers.is_empty()) => {
+            return Ok(())
+        }
         (false, _, _) => {
             return Err(
                 "coding-agent provider/inventory metadata requires coding_agent_runs capability"
@@ -302,6 +306,7 @@ impl RunnerRegistry {
             hostname: trim_string(body.hostname),
             host_context,
             runner_features: runner_features.clone(),
+            computer_session_availability: body.computer_session_availability,
             projects,
             project_inventory,
             last_seen: now,
@@ -792,6 +797,37 @@ impl RunnerRegistry {
         Ok(())
     }
 
+    /// Update only brokered Computer availability for the exact active lease.
+    /// A missing field leaves legacy/transient behavior unchanged.
+    pub async fn update_computer_session_availability(
+        &self,
+        client_id: &str,
+        runner_instance_id: &str,
+        connection_id: Option<&str>,
+        availability: Option<bool>,
+    ) -> Result<(), String> {
+        let Some(availability) = availability else {
+            return Ok(());
+        };
+        validate_runner_instance_id(runner_instance_id)?;
+        let mut inner = self.inner.lock().await;
+        let runner = inner
+            .runners
+            .get_mut(client_id)
+            .ok_or_else(|| format!("unknown shell client: {client_id}"))?;
+        if runner.runner_instance_id != runner_instance_id
+            || connection_id.is_some_and(|id| runner.connection_id.as_deref() != Some(id))
+        {
+            return Err("computer session availability has a stale Runner lease".to_string());
+        }
+        if runner.computer_session_availability.is_none() {
+            return Err("computer session availability requires registration opt-in".to_string());
+        }
+        runner.computer_session_availability = Some(availability);
+        runner.last_seen = now_ts();
+        Ok(())
+    }
+
     /// Apply sanitized provider metadata to the active Runner record. Optional
     /// metadata is best-effort: malformed/unknown state is ignored by the
     /// normalizer and never changes transport or tool completion semantics.
@@ -1241,6 +1277,39 @@ impl RunnerRegistry {
             .collect()
     }
 
+    /// Exact Project visibility from the registered Runner snapshot. This is
+    /// deliberately read-only: diagnostic observations must not reconcile Jobs
+    /// or prune Runner records as a side effect of checking visibility.
+    pub async fn exact_project_visible_for_auth_snapshot(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        project: &str,
+    ) -> bool {
+        let now = now_ts();
+        let inner = self.inner.lock().await;
+        inner.runners.values().any(|runner| {
+            if !runner_visible_to_access(auth, runner) {
+                return false;
+            }
+            if matches!(runner.auth_group, Some(RunnerAccessGroup::SharedKey(_))) {
+                let connected = inner.notifiers.contains_key(&runner.client_id);
+                let recently_seen =
+                    now.saturating_sub(runner.last_seen) <= RUNNER_ONLINE_WINDOW_SECS;
+                let offline_since = runner.disconnected_at.unwrap_or(runner.last_seen);
+                if !connected
+                    && !recently_seen
+                    && now.saturating_sub(offline_since) > self.shared_key_limits.offline_ttl_secs
+                {
+                    return false;
+                }
+            }
+            runner
+                .projects
+                .iter()
+                .any(|entry| project == format!("agent:{}:{}", runner.client_id, entry.id))
+        })
+    }
+
     /// Return a complete canonical Runner/Project observation only when both
     /// caller-supplied cardinality bounds hold. `None` means the observation is
     /// incomplete and must never support a negative authority conclusion.
@@ -1507,6 +1576,7 @@ impl RunnerRegistry {
             connected,
             last_seen: runner.last_seen,
             capabilities: runner.runner_features.wire_capabilities().clone(),
+            computer_session_availability: runner.computer_session_availability,
             coding_agent_providers: (!runner.coding_agent_providers.is_empty())
                 .then(|| runner.coding_agent_providers.clone()),
             pending_requests,

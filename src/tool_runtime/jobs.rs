@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_core::runtime_contract::{
-    MAX_JOB_OBSERVATION_WAIT_SECS, MODEL_JOB_CONTINUATION_WAIT_SECS,
+    DEFAULT_JOB_CONTINUATION_WAIT_SECS, MAX_JOB_OBSERVATION_WAIT_SECS,
 };
 use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 
@@ -190,6 +190,14 @@ pub(crate) fn detected_job_summary_with_activity(
         detected["zero_tests_run"] = json!(metadata.zero_tests_run);
         detected["tests_passed"] = json!(metadata.tests_passed);
         detected["tests_failed"] = json!(metadata.tests_failed);
+        if cargo_test
+            && outcome == "passed"
+            && metadata.tests_detected
+            && metadata.tests_run_count == Some(0)
+            && metadata.zero_tests_run == Some(true)
+        {
+            detected["outcome"] = json!("inconclusive");
+        }
         if cargo_test {
             let diagnostics = webcodex_core::validation_evidence::parse_cargo_test_diagnostics(
                 stdout,
@@ -276,6 +284,64 @@ mod detected_summary_tests {
             );
             assert!(detected.get("failed_test_details").is_none());
         }
+    }
+
+    #[test]
+    fn generic_cargo_test_zero_tests_are_inconclusive_without_changing_process_success() {
+        let zero = detected_job_summary(
+            Some("cargo test --lib __webcodex_no_such_test_filter__"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(zero["tests_detected"], true);
+        assert_eq!(zero["tests_run_count"], 0);
+        assert_eq!(zero["zero_tests_run"], true);
+        assert_eq!(zero["outcome"], "inconclusive");
+
+        let passed = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "running 1 test\ntest focused ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(passed["tests_run_count"], 1);
+        assert_eq!(passed["zero_tests_run"], false);
+        assert_eq!(passed["outcome"], "passed");
+
+        let failed = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "failed",
+            Some(101),
+            "running 1 test\ntest focused ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(failed["outcome"], "failed");
+
+        let timed_out = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "timed_out",
+            None,
+            "running 0 tests\n",
+            "",
+        );
+        assert_eq!(timed_out["outcome"], "timed_out");
+
+        let cancelled = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "cancelled",
+            None,
+            "running 0 tests\n",
+            "",
+        );
+        assert_eq!(cancelled["outcome"], "cancelled");
     }
 
     #[test]
@@ -549,7 +615,7 @@ pub(crate) fn validation_job_projection_with_policy(
             value["tests_passed"] = json!(evidence.tests_passed);
             value["tests_failed"] = json!(evidence.tests_failed);
             value["zero_tests_run"] = json!(evidence.zero_tests_run);
-            if tool == "cargo_test" && process_passed {
+            if matches!(tool, "cargo_test" | "go_test") && process_passed {
                 if let Some(minimum_tests) = minimum_tests {
                     let (status, reason_code) = match evidence.tests_run_count {
                         Some(actual) if actual >= minimum_tests => ("passed", "minimum_satisfied"),
@@ -778,6 +844,104 @@ impl ToolRuntime {
         summary
     }
 
+    pub(crate) fn passive_job_validation_projection(
+        &self,
+        job: &ShellJobInfo,
+        output: Option<&webcodex_runner_registry::JobValidationOutput>,
+    ) -> Option<Value> {
+        let metadata = job.validation.as_ref();
+        let generic_validation = job
+            .structured_execution
+            .as_ref()
+            .and_then(|metadata| metadata.validation_identity.as_deref())
+            .is_some()
+            && job
+                .purpose
+                .as_deref()
+                .is_some_and(is_validation_like_execution_purpose);
+        if metadata.is_none() && !generic_validation {
+            return None;
+        }
+
+        let tool = metadata
+            .map(|metadata| metadata.adapter.as_str())
+            .or_else(|| {
+                job.structured_execution
+                    .as_ref()
+                    .and_then(|metadata| metadata.validation_tool.as_deref())
+            })
+            .unwrap_or_else(|| {
+                job.structured_execution
+                    .as_ref()
+                    .map(|metadata| metadata.execution_source.as_str())
+                    .unwrap_or(job.kind.as_str())
+            });
+        let kind = metadata
+            .map(|metadata| metadata.kind.as_str())
+            .or_else(|| {
+                super::validation_profile::validation_adapter_for_tool(tool)
+                    .map(|adapter| adapter.validation_kind())
+            })
+            .or(job.purpose.as_deref());
+        let mut validation = validation_job_projection_with_policy(
+            Some(tool),
+            kind,
+            &job.status,
+            job.exit_code.map(i64::from),
+            output.map(|output| output.stdout.as_str()).unwrap_or(""),
+            output.map(|output| output.stderr.as_str()).unwrap_or(""),
+            output.is_none_or(|output| output.truncated),
+            job.test_count_evidence.as_ref(),
+            metadata.and_then(|metadata| metadata.minimum_tests),
+            metadata.and_then(|metadata| metadata.require_tests),
+            metadata.and_then(|metadata| metadata.no_run),
+        )?;
+        // Preserve negative test-count assertions. Exit zero alone cannot turn
+        // incomplete parser/Runner evidence into a proven validation pass.
+        if validation["passed"] == true
+            && kind == Some("test")
+            && metadata.and_then(|metadata| metadata.no_run) != Some(true)
+            && validation["tests_run_count"].is_null()
+        {
+            validation["passed"] = Value::Null;
+        }
+        let diagnostics = validation.as_object_mut()?.remove("diagnostics");
+        if validation["passed"] != true {
+            if let Some(diagnostics) = diagnostics {
+                validation["diagnostics"] =
+                    super::job_attention::bounded_failure_diagnostics(diagnostics);
+            }
+        }
+        for field in [
+            "warnings_count",
+            "errors_count",
+            "tests_passed",
+            "tests_failed",
+            "truncated",
+        ] {
+            validation.as_object_mut()?.remove(field);
+        }
+        if let Some(target_id) =
+            metadata.and_then(|metadata| metadata.validation_target_id.as_deref())
+        {
+            validation["validation_target_id"] = json!(target_id);
+            annotate_project_validation(&mut validation, metadata);
+        }
+
+        let source_state = match job.project_id.as_deref().filter(|value| !value.is_empty()) {
+            Some(project) => self.validation_sources.observe(
+                project,
+                metadata.and_then(|metadata| metadata.source_fence.as_ref()),
+            ),
+            None => webcodex_core::validation_source::ValidationSourceState::default(),
+        };
+        validation["source_state"] = json!({
+            "freshness": source_state.freshness,
+            "observed_mutation_fence": source_state.observed_mutation_fence,
+        });
+        Some(validation)
+    }
+
     #[cfg(test)]
     pub(crate) fn model_job_summary_value_for_test(&self, job: &ShellJobInfo) -> Value {
         self.model_job_summary_value(job)
@@ -797,19 +961,32 @@ pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&
     if let Some(token) = observation_token.filter(|token| !token.is_empty()) {
         item["after_observation_token"] = json!(token);
     }
-    super::SuggestedToolCall::new(
+    super::SuggestedToolCall::fallback_recovery(
         "observe_jobs",
         json!({
             "items": [item],
-            "wait_secs": MODEL_JOB_CONTINUATION_WAIT_SECS,
+            "wait_secs": DEFAULT_JOB_CONTINUATION_WAIT_SECS,
             "wake_on": "terminal",
         }),
     )
     .to_value()
 }
 
-/// Keep the internal handoff receipt intact for recording, then project the
-/// exact observe call as the sole observation-token carrier on normal handoff.
+pub(crate) fn observe_job_details_call(job_id: &str) -> Value {
+    super::SuggestedToolCall::fallback_recovery(
+        "observe_jobs",
+        json!({
+            "items": [{"job_id": job_id}],
+        }),
+    )
+    .to_value()
+}
+
+/// Keep the internal handoff receipt intact for recording, then collapse a
+/// normal successful same-execution handoff to one generic pending marker and its
+/// exact fallback continuation. Static scheduling guidance lives in startup/discovery.
+/// The continuation retains durable identity; Job lifecycle/bookkeeping stays in canonical
+/// Session/registry state.
 pub(super) fn sparsify_job_handoff_model_result(result: &mut ToolResult) {
     if !result.success {
         return;
@@ -838,26 +1015,18 @@ pub(super) fn sparsify_job_handoff_model_result(result: &mut ToolResult) {
     if call["arguments"]["items"][0]["after_observation_token"].as_str() != token {
         return;
     }
-    output.remove("observation_token");
-    output.remove("continuation_semantics");
-    if output.get("promoted_to_job").and_then(Value::as_bool) == Some(true) {
-        output.remove("promoted_to_job");
-    }
-    if output
-        .get("async_handoff_available")
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        output.remove("async_handoff_available");
-    }
+    let continuation = call.clone();
+    output.clear();
+    output.insert("execution_state".to_string(), json!("pending"));
+    output.insert("continuation".to_string(), continuation);
 }
 
 fn list_jobs_recovery_suggested_call(project: Option<&str>) -> Value {
     let arguments = project.map_or_else(|| json!({}), |project| json!({"project": project}));
-    SuggestedToolCall::new("list_jobs", arguments).to_value()
+    SuggestedToolCall::fallback_recovery("list_jobs", arguments).to_value()
 }
 
-fn invalid_job_observation_result(error_kind: &str, message: String) -> ToolResult {
+pub(super) fn invalid_job_observation_result(error_kind: &str, message: String) -> ToolResult {
     ToolResult::err_with_output(
         message,
         json!({
@@ -1291,6 +1460,7 @@ impl ToolRuntime {
                 .runner_registry
                 .start_job_with_metadata_for_access(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: effective_cwd,
@@ -1428,7 +1598,7 @@ impl ToolRuntime {
                     add_command_preview_metadata(&mut output, job.command_preview.clone());
                 }
                 let validation_metadata = job.validation.as_ref();
-                let tool = validation_metadata.map(|metadata| metadata.tool.as_str());
+                let tool = validation_metadata.map(|metadata| metadata.adapter.as_str());
                 let kind = validation_metadata.map(|metadata| metadata.kind.as_str());
                 if tool.is_some() {
                     let logs = self
@@ -1484,6 +1654,7 @@ impl ToolRuntime {
                             job.project_id.as_deref().unwrap_or_default(),
                             validation_metadata.and_then(|metadata| metadata.source_fence.as_ref()),
                         ));
+                        annotate_project_validation(&mut validation, validation_metadata);
                         output["validation"] = validation;
                     }
                 }
@@ -1567,7 +1738,7 @@ impl ToolRuntime {
                 let validation_tool = job
                     .validation
                     .as_ref()
-                    .map(|metadata| metadata.tool.as_str());
+                    .map(|metadata| metadata.adapter.as_str());
                 let validation_kind = job
                     .validation
                     .as_ref()
@@ -1590,6 +1761,7 @@ impl ToolRuntime {
                     job.validation.as_ref().and_then(|metadata| metadata.no_run),
                 );
                 if let Some(validation) = validation.as_mut() {
+                    annotate_project_validation(validation, job.validation.as_ref());
                     validation["source_state"] = json!(self.validation_sources.observe(
                         job.project_id.as_deref().unwrap_or_default(),
                         job.validation
@@ -1607,6 +1779,7 @@ impl ToolRuntime {
                 }
                 ToolResult::ok(json!({
                     "job_id": job.job_id,
+                    "project": job.project_id,
                     "status": job.status,
                     "exit_code": job.exit_code,
                     "command_execution_state": job.command_execution_state,
@@ -1649,6 +1822,8 @@ impl ToolRuntime {
                     "wait_outcome": wait.wait_outcome.as_str(),
                     "waited_ms": wait.waited_ms,
                     "changed": wait.changed,
+                    "meaningful_changed": wait.meaningful_changed,
+                    "heartbeat_changed": wait.heartbeat_changed,
                     "terminal": wait.terminal,
                     "executor": "agent",
                     "session_id": job.session_id,
@@ -1684,82 +1859,29 @@ impl ToolRuntime {
         session_id: Option<String>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
-        let max = limit.unwrap_or(20).clamp(1, 100);
-        let status_filter = status
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let project_filter = match project {
-            Some(value) => {
-                let value = value.trim();
-                if value.is_empty() || value.chars().count() > 512 {
-                    return invalid_job_observation_result(
-                        "invalid_project_filter",
-                        "invalid_project_filter: project must contain 1..=512 characters"
-                            .to_string(),
-                    );
-                }
-                Some(value.to_string())
-            }
-            None => None,
-        };
-        let session_filter = match session_id {
-            Some(value) => {
-                let value = value.trim();
-                if value.is_empty() || value.chars().count() > 128 {
-                    return invalid_job_observation_result(
-                        "invalid_session_filter",
-                        "invalid_session_filter: session_id must contain 1..=128 characters"
-                            .to_string(),
-                    );
-                }
-                Some(value.to_string())
-            }
-            None => None,
-        };
-
-        // Authorization/visibility is applied by the registry first. Focused
-        // filters only reduce that already-visible set, and limit is applied
-        // after every filter so exact project/session targets cannot be hidden
-        // behind unrelated recent Jobs.
-        let agent_jobs = self
-            .runner_registry
-            .list_jobs_for_auth_filtered(
-                crate::runner_http::runner_access_from_auth(auth).as_ref(),
-                project_filter.as_deref(),
-                session_filter.as_deref(),
+        let page = match self
+            .query_job_inventory_for_auth(
+                limit,
+                status.as_deref(),
+                project.as_deref(),
+                session_id.as_deref(),
+                auth,
             )
-            .await;
-        let mut summaries: Vec<Value> = agent_jobs
+            .await
+        {
+            Ok(page) => page,
+            Err(result) => return result,
+        };
+        let summaries = page
+            .jobs
             .iter()
-            .filter(|job| {
-                status_filter
-                    .as_ref()
-                    .map(|status| status == &job.status)
-                    .unwrap_or(true)
-            })
             .map(|job| self.model_job_summary_value(job))
-            .collect();
-
-        summaries.sort_by(|a, b| {
-            b["created_at"]
-                .as_i64()
-                .unwrap_or(0)
-                .cmp(&a["created_at"].as_i64().unwrap_or(0))
-                .then_with(|| {
-                    a["job_id"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .cmp(b["job_id"].as_str().unwrap_or_default())
-                })
-        });
-        let matched_count = summaries.len();
-        let truncated = matched_count > max;
-        summaries.truncate(max);
+            .collect::<Vec<_>>();
         ToolResult::ok(json!({
             "jobs": summaries,
             "count": summaries.len(),
-            "matched_count": matched_count,
-            "truncated": truncated,
+            "matched_count": page.matched_count,
+            "truncated": page.truncated(),
         }))
     }
 
@@ -2193,9 +2315,11 @@ mod recovery_projection_tests {
         assert!(missing.output.get("recovery_tool").is_none());
         assert_eq!(
             missing.output["suggested_call"],
-            json!({"tool": "list_jobs", "arguments": {"project": "agent:special:demo"}})
+            json!({"follow_up_kind": "fallback_recovery", "tool": "list_jobs", "arguments": {"project": "agent:special:demo"}})
         );
         let suggested = &missing.output["suggested_call"];
+        webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(suggested)
+            .expect("stop_job identity recovery must pass list_jobs registered inputSchema");
         let parsed = crate::tool_runtime::ToolCall::from_tool_name(
             suggested["tool"].as_str().unwrap(),
             suggested["arguments"].clone(),
@@ -2756,5 +2880,19 @@ mod recovery_projection_tests {
             value.get("command").is_none(),
             "summary must not surface command"
         );
+    }
+}
+
+fn annotate_project_validation(
+    value: &mut Value,
+    metadata: Option<&crate::runner_protocol::ShellJobValidationMetadata>,
+) {
+    if let Some(metadata) = metadata {
+        if let Some(provenance) = &metadata.project_validation {
+            value["tool"] = json!(metadata.tool);
+            value["backend"] = json!(provenance.backend);
+            value["action"] = json!(provenance.request.action);
+            value["adapter"] = json!(metadata.adapter);
+        }
     }
 }

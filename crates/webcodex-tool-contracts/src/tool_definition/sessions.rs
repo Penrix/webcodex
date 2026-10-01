@@ -1,8 +1,9 @@
 use super::RunnerCapabilityRequirement::{GitOrShell, InternalPosixScript, OwnerOnly};
 use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
-    adaptive_runtime_direct, def, model_spec, permission_risk, requires_explicit_business_session,
-    ToolDefinition, PERMISSION_RISK_WRITE, TOOL_CATEGORY_SESSION, TOOL_CATEGORY_VALIDATION,
+    adaptive_runtime_direct, def, model_spec, permission_risk, require_all_scopes,
+    requires_explicit_business_session, ToolDefinition, PERMISSION_RISK_WRITE,
+    TOOL_CATEGORY_SESSION, TOOL_CATEGORY_VALIDATION,
 };
 use crate::metadata::{
     ToolPathHint::None as NoPath, ToolRisk::Read, PROJECT_READ, PROJECT_WRITE, RUNTIME_READ,
@@ -10,6 +11,84 @@ use crate::metadata::{
 };
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
+    requires_explicit_business_session(
+        def(
+            "record_external_observation",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelHidden,
+            TOOL_CATEGORY_SESSION,
+            None,
+            TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Mutate,
+                risk: super::ToolRisk::SessionCollaborate,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::FencedReplay,
+            },
+            Some(SESSION_COLLABORATE),
+            true,
+            NoPath,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE
+                .lifecycle(super::ToolSessionLifecycleEffect::Mutation),
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        ),
+    ),
+
+    require_all_scopes(model_spec(
+        def(
+            "list_sessions",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("project"),
+                super::ToolAuditResultField::value("total"),
+                super::ToolAuditResultField::array_len("returned", "sessions"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelVisible, TOOL_CATEGORY_SESSION, None, TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ), true, NoPath, false, false,
+            super::ToolSessionEvidencePolicy::NONE,
+        ).with_activity(super::ToolActivityPresentation::Support, super::ToolActivityInteraction::NonMeaningful),
+        "Read-only recovery discovery when the exact Session id is missing, including a new Host window or account using the same WebCodex authority. Requires an authorized exact Project and lists only that caller's creation-time Session authority group, including retained Closed history. Lifecycle filter is optional; offset defaults to 0, limit to 10 and is normalized to 1..20. Titles are redacted/bounded and output is capped at 32 KiB. Counts exclude foreign authority groups. Inventory pagination is not a frozen snapshot. Explicitly choose a returned session_id/session_ref, then read session_handoff_summary. Active work needs explicit bootstrap with the selected Session; Closed is historical only. Discovery never infers current/recent work, resumes a Session, grants authority, or restores hidden chat context.",
+    ), &[RUNTIME_READ, PROJECT_READ]),
+
+    requires_explicit_business_session(model_spec(
+        def(
+            "list_external_observations",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelVisible, TOOL_CATEGORY_SESSION, None, TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ), true, NoPath, false, false,
+            super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        )
+        .with_gpt_action_description("Read retained external reports for an exact Session/Project. These are untrusted adapter claims, not native execution or validation evidence; current capture completeness and source order are unproven."),
+        "Read all retained external reports for an exact Session/Project (at most 256). Reports are untrusted adapter claims, separate from native Job and validation evidence. They never establish task completion or authorize replaying work. coverage remains incomplete until a durable source sequence can prove gaps/order.",
+    )),
+
     def(
         "start_session",
         super::ToolAuditPolicy::TYPED_CANONICAL,
@@ -56,9 +135,11 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolActivityPresentation::Support,
                 super::ToolActivityInteraction::Meaningful,
             ),
-            "Canonical bootstrap for ordinary coding/review. Prefer Server-issued project_ref; project or client_id+path and canonical Project ids remain accepted. Omit session_id for a fresh Workflow Session; it does not imply a fresh model context. Exact resume requires an active accessible Session and never guesses prior Session. Runtime re-observes instruction files for change detection and Session metadata; primary result stays compact. For a fresh or uncertain model context, request missing guidance via context_request: project.instructions and/or webcodex.workflow; omission projects neither. guidance_profile selects direct/code_mode model guidance only and grants no authority or Session state. project_ref is durable principal-scoped convenience, not authority; each use reauthorizes the canonical Project. include_extension_catalog controls the bounded Skills/Plugins catalog. Checkout does not require Git; mode=worktree creates an isolated worktree from an exact Git base without bypassing Project authority.",
-        ).with_gpt_action_description("Start/resume exact Project work. Prefer Server-issued project_ref; canonical id or client_id+path also work. Primary output is compact; request missing project.instructions/webcodex.workflow via context_request. worktree creates an isolated managed worktree without widening authority."),
+            "Canonical bootstrap for ordinary coding/review. Prefer principal-scoped project_ref; project or client_id+path. project_ref reauthorizes Project. mode=worktree resolves an exact Git base with Project authority, creating isolated worktree, managed Project/ref and fresh Workflow Session; never retarget source Session or guess paths. Omit session_id for fresh work; this does not imply a fresh model context. Exact resume needs an active accessible Session and never guesses prior Session; missing id: list_sessions(project), then explicitly choose. Read AGENTS.md/CLAUDE.md via _wc.context=[\"project.instructions\"]; Runtime re-observes instruction files; do not immediately reread complete bodies. For fresh or uncertain model context request webcodex.workflow. Reuse successful workspace state, available semantic navigation and sufficient startup Skills/Plugins; refresh stale facts. goal_context has no authority. guidance_profile guides; include_extension_catalog controls Skills/Plugins. checkout does not require Git.",
+        )
+        .with_gpt_action_description("Start/resume exact Project work. Prefer project_ref; canonical id or client_id+path also work. Exact resume accepts session_ref/session_id; sparse goal_context supports explicit Goal reuse. MCP context sidecars are unavailable here."),
         10,
+        super::ToolDirectReason::CoreWorkflow,
     ),
     requires_explicit_business_session(model_spec(
         def(
@@ -85,7 +166,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         "Return an optional deterministic evidence snapshot for model review, including workspace, validation, jobs, and recorded tool events. The result is advisory: it does not decide task completion, replace direct diff or test review, or generate the user-facing final report.",
     )),
     adaptive_runtime_direct(
-        requires_explicit_business_session(model_spec(
+        model_spec(
             def(
                 "present_work_result",
                 super::ToolAuditPolicy::typed_fields(&[
@@ -116,10 +197,11 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolActivityPresentation::Transport,
                 super::ToolActivityInteraction::NonMeaningful,
             ),
-            "Present one exact coding Workflow Session as a persistent read-only WebCodex Progress MCP App card when a long-running task benefits from visible progress. Requires explicit project + session_id, creates no work, runs no validation/review, changes no Session lifecycle, and grants no authority. Call at most once per long-running Session: the mounted App performs bounded app-only live reads of Session activity, workspace, validation, and review, so model-visible polling calls are unnecessary for presentation. Eligible frozen final changes remain available for lazy in-card diff reads. Presentation is UX only, never a correctness requirement; repeated explicit presentation may create another Host card.",
-        ))
+            "Present one persistent user-facing WebCodex card for the current client Window. For substantial Project work, call it once immediately after the first successful project-scoped WebCodex action; do not wait for Workflow Session creation, mutation, validation, or closeout. project is an exact canonical id or issued principal-scoped project_ref; resource identity stays canonical. session_id is optional; supply the exact business Workflow Session to show its authorized Server Job states on normal refresh. Without it the card does not infer Job ownership from Window or Project activity. The card self-refreshes the same bounded Window ActionAudit activity used by WebUI, including observe/diagnostic actions, and may surface linked Session collaboration or sealed final changes only when those later exist. It creates no work, Session, validation, review, lifecycle change, or authority. Never repeat presentation in the same Window because another invocation may create another Host card.",
+        )
         .with_gpt_action_unsupported(),
         155,
+        super::ToolDirectReason::Presentation,
     ),
     def(
         "work_result_state",
@@ -140,6 +222,67 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             idempotency: super::ToolIdempotency::PureRead,
         },
         Some(PROJECT_READ),
+        true,
+        NoPath,
+        false,
+        false,
+        super::ToolSessionEvidencePolicy::NONE,
+    )
+    .with_activity(
+        super::ToolActivityPresentation::Transport,
+        super::ToolActivityInteraction::NonMeaningful,
+    ),
+    def(
+        "work_result_activity_detail",
+        super::ToolAuditPolicy::typed_fields(&[
+            super::ToolAuditResultField::pointer(
+                "server_trace_id",
+                "/activity_detail/server_trace_id",
+            ),
+            super::ToolAuditResultField::value("error_kind"),
+        ]),
+        ModelHidden,
+        "workflow",
+        None,
+        TOOL_PROVIDER_CONTROL,
+        super::ToolSemanticContract {
+            effect: super::ToolEffect::Observe,
+            risk: Read,
+            approval: super::ToolApprovalPolicy::None,
+            idempotency: super::ToolIdempotency::PureRead,
+        },
+        Some(RUNTIME_READ),
+        true,
+        NoPath,
+        false,
+        false,
+        super::ToolSessionEvidencePolicy::NONE,
+    )
+    .with_activity(
+        super::ToolActivityPresentation::Transport,
+        super::ToolActivityInteraction::NonMeaningful,
+    ),
+    def(
+        "work_result_send_message",
+        super::ToolAuditPolicy::typed_fields(&[
+            super::ToolAuditResultField::value("success"),
+            super::ToolAuditResultField::value("session_id"),
+            super::ToolAuditResultField::value("message_id"),
+            super::ToolAuditResultField::value("replayed"),
+            super::ToolAuditResultField::value("state_changed"),
+            super::ToolAuditResultField::value("error_kind"),
+        ]),
+        ModelHidden,
+        "workflow",
+        None,
+        TOOL_PROVIDER_CONTROL,
+        super::ToolSemanticContract {
+            effect: super::ToolEffect::Mutate,
+            risk: super::ToolRisk::SessionCollaborate,
+            approval: super::ToolApprovalPolicy::None,
+            idempotency: super::ToolIdempotency::Keyed,
+        },
+        Some(SESSION_COLLABORATE),
         true,
         NoPath,
         false,
@@ -311,7 +454,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE.lifecycle(super::ToolSessionLifecycleEffect::Mutation),
         ),
-        "Post a bounded collaboration message (todo, question, progress, guidance, risk, or decision). Any message may request request-scoped ACK; ACK proves only current model-context retention and neither resolves nor gates work. Use complete_session_message to atomically answer and resolve a finished todo.",
+        "Post a bounded collaboration message (todo, question, progress, guidance, risk, or decision). Optional delivery_key provides bounded restart-safe sender-scoped replay while the keyed message metadata remains retained; exact retries return the original message and conflicting retained key reuse fails closed. Any message may request request-scoped ACK; ACK proves only current model-context retention and neither resolves nor gates work. Use complete_session_message to atomically answer and resolve a finished todo.",
     )),
     model_spec(
         def(
@@ -340,7 +483,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Send a bounded message to a principal-scoped peer window discovered through peer_awareness. Routing does not require Project equality, so a Project/worktree change alone does not invalidate the retained route; it grants no access to the recipient's Project, Workflow Session, files, or assignment authority. Ordinary messages are projected once; requires_ack messages repeat while retained whenever the recipient omits the request-scoped ACK.",
+        "Send a bounded message to a principal-scoped peer window discovered through peer_awareness. Optional delivery_key provides bounded restart-safe principal-and-sender-Window replay while the keyed peer message remains retained; exact retries return the original message and conflicting retained key reuse fails closed. Routing does not require Project equality, so a Project/worktree change alone does not invalidate the retained route; it grants no access to the recipient's Project, Workflow Session, files, or assignment authority. Ordinary messages are projected once; requires_ack messages repeat while retained whenever the recipient omits the request-scoped ACK.",
     ),
     requires_explicit_business_session(model_spec(
         def(
@@ -528,9 +671,9 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         "Return a bounded structured aggregate of session-local discussion from the recorded session ledger. Does not call an LLM or generate natural-language summaries.",
         )),
         15,
+        super::ToolDirectReason::CoreWorkflow,
     ),
-    adaptive_runtime_direct(
-        requires_explicit_business_session(model_spec(
+    requires_explicit_business_session(model_spec(
             def(
                 "session_handoff_summary",
             super::ToolAuditPolicy::typed_fields(&[
@@ -565,8 +708,36 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolActivityPresentation::Support,
             super::ToolActivityInteraction::Meaningful,
         ),
-            "Explicit read-only recovery for genuinely missing task context or an explicit handoff; requires the exact session_id. Do not use as routine progress/status polling or to establish a Session baseline when current context is coherent. Defaults to identity plus deterministic handoff_brief, hard-bounded at 8 KiB: task instructions, workspace, progress, validation, jobs, collaboration attention, next actions and basis completeness. Omitted project uses the authorized Session Project. diagnostic=true adds detailed ledger and closeout evidence. A concurrent Session change marks the basis incomplete; re-observe before dependent work. No checkpoint allocation, ACK token, or authority grant.",
-        ).with_gpt_action_description("Recover missing task context or perform an explicit handoff for an exact session_id. Do not use for routine progress/status polling or to establish a baseline. Returns a bounded handoff_brief; diagnostic=true adds detailed evidence. Check basis completeness before dependent work. Read-only.")),
-        16,
+            "Explicit read-only recovery for missing task context or an explicit handoff; requires exact session_id/session_ref and is not routine status polling. Returns deterministic 8 KiB handoff_brief with task, workspace, progress, validation, Jobs, collaboration/external-report evidence, next actions and basis completeness. If the same owner has active Goals explicitly correlated to the Session, optional bounded goal_context is returned separately: zero omit it and multiple remain selection_required. Goal context is read-only: no inference, Goal mutation, liveness refresh, scheduling or authority grant. External reports retain unknown outcomes/incomplete coverage and are not native execution/validation. Omitted project uses the authorized Session Project; diagnostic=true adds ledger/closeout evidence. Concurrent Session change makes basis incomplete; re-observe before dependent work.",
+        ).with_gpt_action_description("Read-only recovery for exact session_id/session_ref; not routine polling. Returns bounded handoff_brief and optional explicitly correlated goal_context; multiple Goals stay unselected. diagnostic=true adds evidence. Check basis completeness before dependent work.")),
+    requires_explicit_business_session(
+        def(
+            "session_handoff_state",
+            super::ToolAuditPolicy::typed_fields(&[
+                super::ToolAuditResultField::value("session_id"),
+                super::ToolAuditResultField::value("project"),
+                super::ToolAuditResultField::value("error_kind"),
+            ]),
+            ModelHidden,
+            TOOL_CATEGORY_SESSION,
+            None,
+            TOOL_PROVIDER_CONTROL,
+            super::ToolSemanticContract {
+                effect: super::ToolEffect::Observe,
+                risk: Read,
+                approval: super::ToolApprovalPolicy::None,
+                idempotency: super::ToolIdempotency::PureRead,
+            },
+            Some(RUNTIME_READ),
+            true,
+            NoPath,
+            false,
+            false,
+            super::ToolSessionEvidencePolicy::NONE,
+        )
+        .with_activity(
+            super::ToolActivityPresentation::Support,
+            super::ToolActivityInteraction::NonMeaningful,
+        ),
     ),
 ];

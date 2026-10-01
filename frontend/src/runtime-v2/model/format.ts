@@ -1,3 +1,5 @@
+import { projectPresentationName } from "../../ui/projectPresentation.js";
+
 export function shortId(value: string, head = 10, tail = 5): string {
   if (!value || value.length <= head + tail + 1) return value;
   return `${value.slice(0, head)}…${value.slice(-tail)}`;
@@ -20,6 +22,16 @@ export function absoluteTime(timestamp: number | undefined): string {
   return new Date(milliseconds).toLocaleString();
 }
 
+export function clockTime(timestamp: number | undefined): string {
+  if (!timestamp) return "—";
+  const milliseconds = timestamp > 10_000_000_000 ? timestamp : timestamp * 1_000;
+  return new Date(milliseconds).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 export function durationText(milliseconds: number | undefined): string {
   if (milliseconds === undefined || milliseconds === null || milliseconds < 0) return "—";
   if (milliseconds < 1_000) return `${milliseconds}ms`;
@@ -30,6 +42,6 @@ export function durationText(milliseconds: number | undefined): string {
   return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
 }
 
-export function projectDisplayName(name: string | undefined, id: string): string {
-  return name?.trim() || id;
+export function projectDisplayName(name: string | undefined, id: string, path?: string): string {
+  return projectPresentationName({ name, id, path });
 }

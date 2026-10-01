@@ -41,13 +41,17 @@ impl RetainedJobReceipt {
             || !text(&snapshot.job_id, 128)
             || !text(&snapshot.request_id, 128)
             || !text(&self.kind, 128)
-            || !matches!(self.kind.as_str(), "shell" | "run_process" | "run_script")
+            || !matches!(
+                self.kind.as_str(),
+                "shell" | "project_build" | "run_process" | "run_script"
+            )
             || self.terminal_observed_at <= 0
             || self.terminal_observed_at > now
-            || self.expires_at
-                != self
-                    .terminal_observed_at
-                    .saturating_add(JOB_TERMINAL_RETENTION_SECS)
+            // Accept the exact pre-24h retention contract without extending
+            // its persisted deadline. Other durations remain invalid.
+            || ![15 * 60, JOB_TERMINAL_RETENTION_SECS].into_iter().any(|ttl| {
+                self.expires_at == self.terminal_observed_at.saturating_add(ttl)
+            })
             || self.expires_at <= now
         {
             return Err("invalid receipt identity or deadline");
