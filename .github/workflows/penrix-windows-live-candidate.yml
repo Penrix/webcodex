@@ -46,6 +46,30 @@ jobs:
               throw "Unexpected $name version: $version"
             }
           }
+      - name: Observe Microsoft Defender on exact binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $status = Get-MpComputerStatus -ErrorAction SilentlyContinue
+          if ($null -eq $status -or -not $status.AMServiceEnabled -or -not $status.AntivirusEnabled) {
+            "Microsoft Defender runtime scan: UNVERIFIED on this hosted runner (engine unavailable or disabled)." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+            exit 0
+          }
+          foreach ($name in @("webcodex.exe", "webcodex-server.exe", "webcodex-runner.exe")) {
+            $target = (Resolve-Path (Join-Path "target\dogfood" $name)).Path
+            Start-MpScan -ScanType CustomScan -ScanPath $target
+            if (-not (Test-Path -LiteralPath $target)) {
+              throw "Microsoft Defender removed or quarantined $name"
+            }
+            $escaped = [regex]::Escape($target)
+            $hit = Get-MpThreatDetection -ErrorAction SilentlyContinue |
+              Where-Object { ($_.Resources -join [Environment]::NewLine) -match $escaped } |
+              Select-Object -First 1
+            if ($null -ne $hit) {
+              throw "Microsoft Defender reported a detection for $name"
+            }
+          }
+          "Microsoft Defender runtime scan: PASS for all three exact candidate executables." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
       - name: Probe real Windows share lifecycle
         shell: pwsh
         run: |
