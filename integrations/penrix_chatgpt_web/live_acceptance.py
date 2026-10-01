@@ -90,6 +90,14 @@ def make_repo() -> pathlib.Path:
         raise
 
 
+def state_dir_for(repo: pathlib.Path) -> pathlib.Path:
+    return repo.with_name(repo.name + "-webcodex-state")
+
+
+def remove_state_dir(repo: pathlib.Path) -> None:
+    shutil.rmtree(state_dir_for(repo), ignore_errors=True)
+
+
 def pump(
     stream,
     out: queue.Queue[str] | None,
@@ -121,6 +129,8 @@ def start_share(
         "none",
         "--json",
         "--stop-on-stdin-eof",
+        "--state-dir",
+        str(state_dir_for(repo)),
     ]
     if probe_only:
         cmd.append("--no-copy-url")
@@ -144,31 +154,42 @@ def start_share(
     threading.Thread(target=pump, args=(proc.stderr, None, stderr_lines), daemon=True).start()
 
     deadline = time.monotonic() + READY_TIMEOUT
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            detail = "\n".join(stderr_lines[-30:] or stdout_lines[-30:])
-            raise AcceptanceError(
-                f"webcodex share exited before ready ({proc.returncode}): {detail}"
-            )
-        try:
-            line = stdout_q.get(timeout=0.25)
-        except queue.Empty:
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(event, dict) and event.get("event") == "ready":
-            server = event.get("server")
-            exposure = event.get("exposure")
-            if not isinstance(server, dict) or not isinstance(server.get("url"), str):
-                raise AcceptanceError("share ready event had no local Server URL")
-            if not isinstance(exposure, dict) or exposure.get("state") != "local_ready":
+    try:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                detail = "\n".join(stderr_lines[-30:] or stdout_lines[-30:])
                 raise AcceptanceError(
-                    f"share did not report local_ready: {json.dumps(event, ensure_ascii=False)}"
+                    f"webcodex share exited before ready ({proc.returncode}): {detail}"
                 )
-            return proc, event, stderr_lines
-    raise AcceptanceError("timed out waiting for webcodex share ready event")
+            try:
+                line = stdout_q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("event") == "ready":
+                server = event.get("server")
+                exposure = event.get("exposure")
+                if not isinstance(server, dict) or not isinstance(server.get("url"), str):
+                    raise AcceptanceError("share ready event had no local Server URL")
+                if not isinstance(exposure, dict) or exposure.get("state") != "local_ready":
+                    raise AcceptanceError(
+                        f"share did not report local_ready: {json.dumps(event, ensure_ascii=False)}"
+                    )
+                return proc, event, stderr_lines
+        raise AcceptanceError("timed out waiting for webcodex share ready event")
+    except BaseException:
+        try:
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.close()
+                proc.wait(timeout=5)
+        except Exception:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        raise
 
 
 def stop_share(proc: subprocess.Popen[str]) -> None:
@@ -437,6 +458,7 @@ def live_run(
                 stop_share(share)
             except Exception as exc:
                 cleanup_error = exc
+        remove_state_dir(repo)
         if success and cleanup_error is None:
             shutil.rmtree(repo, ignore_errors=True)
         else:
@@ -480,6 +502,7 @@ def share_probe(webcodex: pathlib.Path) -> dict[str, Any]:
                 stop_share(share)
             except Exception as exc:
                 cleanup_error = exc
+        remove_state_dir(repo)
         if success and cleanup_error is None:
             shutil.rmtree(repo, ignore_errors=True)
         else:
