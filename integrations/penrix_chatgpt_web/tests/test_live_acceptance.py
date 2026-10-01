@@ -87,6 +87,43 @@ class LiveAcceptanceTests(unittest.TestCase):
             ):
                 live.relay_health("http://127.0.0.1:17841/v1")
 
+    def test_invalid_clipboard_credential_stops_before_project_or_driver(self):
+        repo = pathlib.Path(tempfile.mkdtemp(prefix="penrix-live-test-"))
+        fake_share = object()
+        try:
+            with (
+                mock.patch.object(live, "make_repo", return_value=repo),
+                mock.patch.object(
+                    live,
+                    "run_checked",
+                    return_value="webcodex 0.4.4 (commit test, dirty=false, built_at=0)",
+                ),
+                mock.patch.object(
+                    live,
+                    "relay_health",
+                    return_value={"version": "6.1.3", "mode": "browser-only"},
+                ),
+                mock.patch.object(live, "start_share", return_value=(fake_share, READY, [])),
+                mock.patch.object(live, "windows_clipboard_text", return_value="not-a-token"),
+                mock.patch.object(live, "exact_project") as exact_project,
+                mock.patch.object(live, "run_driver") as run_driver,
+                mock.patch.object(live, "stop_share"),
+                mock.patch.object(live, "remove_state_dir"),
+            ):
+                with self.assertRaisesRegex(
+                    live.AcceptanceError,
+                    "Windows clipboard does not contain the temporary WebCodex project credential",
+                ):
+                    live.live_run(
+                        pathlib.Path("webcodex.exe"),
+                        ROOT / "driver.py",
+                        "http://127.0.0.1:17841/v1",
+                    )
+            exact_project.assert_not_called()
+            run_driver.assert_not_called()
+        finally:
+            live.shutil.rmtree(repo, ignore_errors=True)
+
     def test_driver_timeout_is_explicit_unknown_blocker(self):
         with mock.patch.object(
             live.subprocess,
@@ -113,7 +150,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                 ),
                 mock.patch.object(live, "relay_health", return_value={"version": "6.1.3", "mode": "browser-only"}),
                 mock.patch.object(live, "start_share", return_value=(fake_share, READY, [])),
-                mock.patch.object(live.getpass, "getpass", return_value=VALID_TOKEN),
+                mock.patch.object(live, "windows_clipboard_text", return_value=VALID_TOKEN),
                 mock.patch.object(live, "exact_project", return_value="agent:runner:repo"),
                 mock.patch.object(
                     live,
