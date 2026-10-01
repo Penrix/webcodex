@@ -46,7 +46,7 @@ The Web model must return exactly one strict JSON object per round:
 
 - `discover` asks WebCodex for the current exact `tool_manifest` contract. A tool cannot be called until its contract has been discovered or preloaded.
 - `call` sends one admitted tool to the canonical `/api/tools/call` endpoint. The driver binds Project and Workflow Session fields mechanically when the current schema exposes them.
-- `final` is accepted only when no required local work remains. Once a potentially state-changing call has crossed the driver boundary, `finish_coding_task` must succeed before finalization.
+- `final` is accepted only when no required local work remains. Once a potentially state-changing call has crossed the driver boundary, the read-only `finish_coding_task` evidence snapshot must succeed before finalization. This is closeout evidence; it does not itself close the Workflow Session.
 
 The default allowlist is coding-oriented, not administrative. `run_shell` is intentionally **not** enabled by default; an operator can add an exact extra tool with `--allow-tool` when the task really needs it and the WebCodex credential independently authorizes it.
 
@@ -65,7 +65,7 @@ The driver intentionally has no automatic retry loop.
 
 - Python 3.10+
 - current WebCodex Server + Runner, with a credential scoped for the tools you intend to use
-- current `codex-chatgpt-web` relay reachable through its Responses endpoint (default `http://127.0.0.1:17841/v1`)
+- current `codex-chatgpt-web` relay reachable through its Responses endpoint (default `http://127.0.0.1:17841/v1`) and configured for the browser-only path used by this experiment
 - an authenticated ChatGPT Web browser owned by that relay
 
 The driver reads the WebCodex bearer credential only from `WEBCODEX_TOKEN`; do not put it in command-line arguments or repository files.
@@ -91,11 +91,26 @@ python integrations/penrix_chatgpt_web/driver.py --session "~s1" --task "Continu
 
 The driver re-enters through `work_on_project`, reads `session_handoff_summary`, and gives that current durable state to a fresh Web reasoning context. It does not require the previous ChatGPT browser conversation to survive.
 
+Each relay round also carries the minimum current `codex-chatgpt-web` browser identity contract: one stable driver `thread_id`, one fresh `turn_id`, matching current-user turn provenance, and `prompt_cache_key`. The driver does not invent Codex filesystem/sandbox authority; browser-only mode does not need that environment surface.
+
+## REST context boundary
+
+This experiment intentionally uses WebCodex's canonical `/api/tools/call` REST path. That path does not provide the MCP invocation-envelope `_wc.context` sidecar used for projected `project.instructions` / `webcodex.workflow` material.
+
+Consequences for this first slice:
+
+- the full `work_on_project` bootstrap result is still handed to the Web model;
+- when bootstrap reports instruction sources without their bodies, the Web model must use canonical read tools such as `read_files` before an instruction-dependent mutation;
+- the driver does not pretend that REST returned MCP context sidecars;
+- switching the orchestration seam to MCP remains a later option only if live evidence shows this missing projection materially hurts the workflow.
+
 ## Validation performed so far
 
 Deterministic stdlib fake-server tests cover:
 
 - strict JSON-schema Responses request construction;
+- current relay thread/turn identity and current-user turn provenance;
+- positive Responses completion evidence (`status=completed` + `end_turn=true`) before any action is accepted;
 - fixed Project + exact Workflow Session injection;
 - Project retarget rejection before an effect;
 - contract discovery before non-preloaded tools;
@@ -103,13 +118,16 @@ Deterministic stdlib fake-server tests cover:
 - non-idempotent mutation with identical normalized arguments is sent only once;
 - exact Session resume reads the saved handoff;
 - relay disconnect is not automatically retried;
+- HTTP 200 with an incomplete/non-terminal Responses envelope cannot drive a WebCodex effect;
 - a WebCodex mutation whose response transport drops stops immediately with `outcome_unknown` and does not ask the model for another action.
 
-Run:
+Run locally on Windows:
 
 ```text
 python -m unittest discover -s integrations/penrix_chatgpt_web/tests -v
 ```
+
+The fork also carries `.github/workflows/penrix-chatgpt-web-driver.yml`, a Windows-only five-minute contract lane that compiles the two Python sources and runs exactly this test suite when the integration changes.
 
 These tests prove driver logic only. They do **not** prove the current Windows WebCodex build, the local `codex-chatgpt-web` launcher/login, a real ChatGPT Web strict-output turn, or a real edit/Job round-trip. Those remain **LIVE UNVERIFIED** until exercised on the target Windows machine.
 
@@ -122,7 +140,7 @@ Keep the first live test deliberately small:
 3. run this driver on a read-only task and prove `read_files`/`search_and_read` evidence returns through the Web round;
 4. perform one tiny structured edit;
 5. run one focused validation;
-6. prove `finish_coding_task` succeeds and the final answer arrives;
+6. prove the read-only `finish_coding_task` evidence snapshot succeeds and the final answer arrives;
 7. stop the driver, start a new process with the returned Session ref, and prove the saved handoff is enough to continue.
 
 Only after that should this path be promoted beyond **CODE VERIFIED, LIVE UNVERIFIED**.
