@@ -69,7 +69,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                 with self.assertRaisesRegex(live.AcceptanceError, "^primary blocker$"):
                     live.live_run(
                         pathlib.Path("webcodex.exe"),
-                        pathlib.Path("driver.py"),
+                        ROOT / "driver.py",
                         "http://127.0.0.1:17841/v1",
                     )
             self.assertIn(
