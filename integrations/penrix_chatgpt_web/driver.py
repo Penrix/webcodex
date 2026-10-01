@@ -32,7 +32,7 @@ PRELOAD = (
     "read_files", "search_and_read", "edit_project_files", "project_validate",
     "review_changes", "finish_coding_task",
 )
-MAY_CHANGE_WORKSPACE = {"edit_project_files", "run_process", "job_write_input"}
+MAY_CHANGE_WORKSPACE = {"edit_project_files", "run_process", "run_shell", "job_write_input"}
 REPLAY_SAFE = {"desired_state", "keyed", "fenced_replay"}
 
 ACTION_SCHEMA = {
@@ -63,8 +63,9 @@ Preserve exact Job identity; never duplicate an uncertain effect. Bootstrap obse
 that an AGENTS.md/CLAUDE.md/project rule source exists is not proof that its body was read.
 Before an instruction-dependent mutation, use the fixed-Project read tools to read any
 applicable instruction source whose content is missing, truncated, stale, or otherwise
-not actually present in the supplied bootstrap/history. After state-changing work,
-finish_coding_task must settle after the latest mutation before finalization.
+not actually present in the supplied bootstrap/history. After work that may change the
+Project workspace, finish_coding_task must settle after the latest such change before
+finalization.
 """
 
 
@@ -370,14 +371,17 @@ class Driver:
         fixed, effect, idem = self.fixed_params(tool, params, session)
         self.fence_job_identities(tool, fixed)
         fingerprint = dump({"tool": tool, "params": fixed})
-        mutation = effect == "mutate" or tool in MAY_CHANGE_WORKSPACE
-        if mutation and fingerprint in self.dispatched_mutations and idem not in REPLAY_SAFE:
+        consequential = effect == "mutate" or tool in MAY_CHANGE_WORKSPACE
+        workspace_change = tool in MAY_CHANGE_WORKSPACE or (
+            tool not in ALLOWED_TOOLS and effect == "mutate"
+        )
+        if consequential and fingerprint in self.dispatched_mutations and idem not in REPLAY_SAFE:
             raise DriverError(f"refusing repeated non-replay-safe mutation: {tool}")
-        if mutation:
+        if consequential:
             self.dispatched_mutations.add(fingerprint)  # before crossing transport boundary
-            if tool != "finish_coding_task":
-                self.needs_closeout = True
-                self.closeout_ok = False
+        if workspace_change:
+            self.needs_closeout = True
+            self.closeout_ok = False
         self.note(f"[penrix-web] WebCodex tool: {tool}")
         result = self.wc.call(tool, fixed, session)
         self.remember_job_identities(result)
