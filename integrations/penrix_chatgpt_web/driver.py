@@ -318,6 +318,7 @@ class Driver:
             self.dispatched_mutations.add(fingerprint)  # before crossing transport boundary
             if tool != "finish_coding_task":
                 self.needs_closeout = True
+                self.closeout_ok = False
         self.note(f"[penrix-web] WebCodex tool: {tool}")
         result = self.wc.call(tool, fixed, session)
         if tool == "finish_coding_task" and result.get("success") is True:
