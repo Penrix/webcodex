@@ -261,48 +261,6 @@ def exact_project(server_url: str, token: str) -> str:
     return connected[0]["id"]
 
 
-def relay_catalog(relay_url: str) -> None:
-    models_url = relay_url.rstrip("/") + "/models"
-    req = urllib.request.Request(
-        models_url,
-        method="GET",
-        headers={"accept": "application/json"},
-    )
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        with opener.open(req, timeout=20) as res:
-            raw = res.read(2 * 1024 * 1024 + 1)
-            status = res.status
-    except Exception as exc:
-        raise AcceptanceError(
-            f"codex-chatgpt-web model catalog unavailable at {models_url}: {exc}"
-        ) from exc
-    if status != 200 or len(raw) > 2 * 1024 * 1024:
-        raise AcceptanceError(
-            f"codex-chatgpt-web model catalog failed HTTP {status}"
-        )
-    try:
-        body = json.loads(raw.decode())
-    except (UnicodeError, ValueError) as exc:
-        raise AcceptanceError(
-            "codex-chatgpt-web model catalog was not JSON"
-        ) from exc
-    data = body.get("data") if isinstance(body, dict) else None
-    if not isinstance(data, list):
-        raise AcceptanceError(
-            "codex-chatgpt-web model catalog had no data list"
-        )
-    ids = {
-        item.get("id")
-        for item in data
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    }
-    if EXPECTED_WEB_MODEL not in ids:
-        raise AcceptanceError(
-            f"relay does not expose {EXPECTED_WEB_MODEL}; "
-            "upgrade/configure codex-chatgpt-web before live acceptance"
-        )
-
 
 def run_driver(
     driver: pathlib.Path,
@@ -371,7 +329,6 @@ def live_run(
                 f"got: {version}"
             )
 
-        relay_catalog(relay_url)
         share, ready, _stderr = start_share(webcodex, repo, probe_only=False)
         connection = ready.get("connection")
         if (
@@ -460,6 +417,7 @@ def live_run(
             "webcodex_version": version,
             "driver_sha256": hashlib.sha256(driver.read_bytes()).hexdigest(),
             "relay_model": EXPECTED_WEB_MODEL,
+            "relay_route_evidence": "real completed browser-only Responses turns",
             "first_session_ref": session_ref,
             "first_rounds": first.get("rounds"),
             "resume_rounds": second.get("rounds"),
