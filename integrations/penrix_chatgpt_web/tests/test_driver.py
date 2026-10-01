@@ -319,6 +319,43 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(len(state.relay_requests), 1)
         self.assertFalse(any(req["tool"] == "edit_project_files" for req in state.webcodex_requests))
 
+    def test_relay_post_send_failure_codes_are_outcome_unknown(self):
+        for code in ("chatgpt_submission_ambiguous", "chatgpt_submitted_turn_failed"):
+            with self.subTest(code=code):
+                state = FakeState()
+                state.relay_response_override = {
+                    "error": {
+                        "type": "server_error",
+                        "code": code,
+                        "message": "delivery state is not safe to replay",
+                    }
+                }
+                with fake_servers(state) as (relay_url, wc_url):
+                    original_post = driver.JsonClient.post
+
+                    def status_502(client, url, body, bearer=None):
+                        if url.endswith("/responses"):
+                            state.relay_requests.append(body)
+                            return 502, state.relay_response_override
+                        return original_post(client, url, body, bearer)
+
+                    model = driver.WebModel(
+                        relay_url, "chatgpt-web/gpt-5.6-sol", "high", 3
+                    )
+                    model.http.post = lambda url, body, bearer=None: status_502(
+                        model.http, url, body, bearer
+                    )
+                    d = driver.Driver(
+                        driver.WebCodex(wc_url, "secret-test-token", 3),
+                        model,
+                        project="agent:runner:repo",
+                        allowed=driver.ALLOWED_TOOLS,
+                        log=io.StringIO(),
+                    )
+                    with self.assertRaises(driver.OutcomeUnknown):
+                        d.run("inspect")
+                self.assertEqual(len(state.relay_requests), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
