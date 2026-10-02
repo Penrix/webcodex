@@ -260,6 +260,29 @@ class DriverTests(unittest.TestCase):
         }
         self.assertIn("review_changes", manifests)
 
+    def test_observed_turndown_json_corruption_is_recovered(self):
+        observed = '{"kind":"call","tool":"read\\_files","params":{"paths":\\["acceptance.py"\\]},"text":null}'
+        self.assertEqual(
+            driver.parse_web_action_json(observed),
+            {
+                "kind": "call",
+                "tool": "read_files",
+                "params": {"paths": ["acceptance.py"]},
+                "text": None,
+            },
+        )
+
+    def test_valid_json_backslashes_are_preserved(self):
+        raw = '{"kind":"final","tool":null,"params":null,"text":"C:\\\\_keep\\\\[x]"}'
+        action = driver.parse_web_action_json(raw)
+        self.assertEqual(action["text"], "C:\\_keep\\[x]")
+
+    def test_unrelated_invalid_json_escape_is_not_repaired(self):
+        with self.assertRaises(ValueError):
+            driver.parse_web_action_json(
+                '{"kind":"final","tool":null,"params":null,"text":"bad\\q"}'
+            )
+
     def test_non_strict_provider_output_is_still_strictly_rejected_by_driver(self):
         state = FakeState()
         state.relay_response_override = {
