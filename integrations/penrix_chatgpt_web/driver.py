@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from typing import Any
+from json_boundary import parse_json_object_from_markdown
 
 RELAY_URL = "http://127.0.0.1:17841/v1"
 MODEL = "chatgpt-web/gpt-5.6-sol"
@@ -253,14 +254,12 @@ class WebModel:
             )
         text = response_text(body)
         try:
-            action = json.loads(text)
+            action = parse_json_object_from_markdown(text)
         except ValueError as exc:
             preview = text[:240].replace("\\r", "\\r").replace("\\n", "\\n")
             raise DriverError(
                 f"Web action response was not JSON (chars={len(text)}, preview={preview!r})"
             ) from exc
-        if not isinstance(action, dict):
-            raise DriverError("strict Web response was not an object")
         return action, text, current
 
 
