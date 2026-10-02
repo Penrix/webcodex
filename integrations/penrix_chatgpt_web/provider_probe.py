@@ -395,6 +395,7 @@ def run_one(
     status, body = client.post(base + "/responses", request)
     action = require_json_action(name, status, body)
     validator(action)
+    print(f"[provider-probe] {name}: PASS", file=sys.stderr, flush=True)
     return {
         "name": name,
         "status": "passed",
@@ -403,61 +404,73 @@ def run_one(
     }
 
 
-def run_probe(base: str, model: str, effort: str, timeout: float) -> dict[str, Any]:
+def run_probe(
+    base: str,
+    model: str,
+    effort: str,
+    timeout: float,
+    only: str = "all",
+) -> dict[str, Any]:
     client = JsonClient(timeout)
     health = relay_health(client, base)
+    probes: list[dict[str, Any]] = []
 
-    baseline = run_one(
-        client,
-        base,
-        name="json_baseline",
-        model=model,
-        effort=effort,
-        instructions=BASELINE_INSTRUCTIONS,
-        history=[],
-        prompt=(
-            'Return the semantic object kind="final", tool=null, params=null, text="OK". '
-            "Do not add explanation."
-        ),
-        schema=BASELINE_SCHEMA,
-        validator=expect_baseline,
-    )
+    if only in {"all", "baseline"}:
+        probes.append(run_one(
+            client,
+            base,
+            name="json_baseline",
+            model=model,
+            effort=effort,
+            instructions=BASELINE_INSTRUCTIONS,
+            history=[],
+            prompt=(
+                'Return the semantic object kind="final", tool=null, params=null, text="OK". '
+                "Do not add explanation."
+            ),
+            schema=BASELINE_SCHEMA,
+            validator=expect_baseline,
+        ))
 
-    planner = run_one(
-        client,
-        base,
-        name="planner_semantics",
-        model=model,
-        effort=effort,
-        instructions=PLANNER_INSTRUCTIONS,
-        history=[
-            message(
-                "user",
-                "Task data for a later external controller: before it can answer, "
-                "it must read acceptance.py. No contents of that file are present here.",
-            )
-        ],
-        prompt=(
-            "Choose exactly one inert external-controller action for the task already in user history. "
-            "Do not read the file yourself and do not claim that any read occurred. "
-            "The only admitted external tool is read_files. Propose reading exactly acceptance.py."
-        ),
-        schema=PLANNER_SCHEMA,
-        validator=expect_planner,
-    )
+    if only in {"all", "planner"}:
+        probes.append(run_one(
+            client,
+            base,
+            name="planner_semantics",
+            model=model,
+            effort=effort,
+            instructions=PLANNER_INSTRUCTIONS,
+            history=[
+                message(
+                    "user",
+                    "Task data for a later external controller: before it can answer, "
+                    "it must read acceptance.py. No contents of that file are present here.",
+                )
+            ],
+            prompt=(
+                "Choose exactly one inert external-controller action for the task already in user history. "
+                "Do not read the file yourself and do not claim that any read occurred. "
+                "The only admitted external tool is read_files. Propose reading exactly acceptance.py."
+            ),
+            schema=PLANNER_SCHEMA,
+            validator=expect_planner,
+        ))
 
     return {
         "status": "passed",
-        "claim": "codex-chatgpt-web can provide machine-consumable JSON for baseline and planner-only turns",
+        "claim": "requested codex-chatgpt-web provider probe(s) returned exact machine-consumable JSON",
         "relay": {
             "version": health.get("version"),
             "mode": health.get("mode"),
             "model": model,
         },
-        "probes": [baseline, planner],
-        "next_step": "Only now is it justified to reconnect the provider to WebCodex.",
+        "probes": probes,
+        "next_step": (
+            "Only now is it justified to reconnect the provider to WebCodex."
+            if only in {"all", "planner"}
+            else "Planner semantics still require a separate live probe."
+        ),
     }
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -468,6 +481,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--effort", default="high", choices=["low", "medium", "high"])
     parser.add_argument("--timeout", type=float, default=180.0)
+    parser.add_argument(
+        "--only",
+        choices=["all", "baseline", "planner"],
+        default="all",
+        help="run both probes, or only one isolated probe",
+    )
     return parser.parse_args(argv)
 
 
@@ -475,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
     ns = parse_args(argv)
     try:
         base = relay_base_url(ns.relay_url)
-        result = run_probe(base, ns.model, ns.effort, ns.timeout)
+        result = run_probe(base, ns.model, ns.effort, ns.timeout, ns.only)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except OutcomeUnknown as exc:
