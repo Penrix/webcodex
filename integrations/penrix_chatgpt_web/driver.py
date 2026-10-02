@@ -70,34 +70,52 @@ finalization.
 
 
 def undo_turndown_json_escapes(text: str) -> str:
-    """Undo only Turndown Markdown escapes that are illegal JSON lexemes."""
-    markdown_punctuation = set("!#()*+-.<>[]_{}|~")
-    valid_json_escapes = set('"\\/bfnrtu')
+    """Undo only the two ChatGPT Web Markdown escapes proven by Windows live evidence."""
     out: list[str] = []
     in_string = False
     index = 0
+
     while index < len(text):
         ch = text[index]
+
+        if not in_string:
+            if ch == "\\" and index + 1 < len(text) and text[index + 1] in "[]":
+                out.append(text[index + 1])
+                index += 2
+                continue
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            index += 1
+            continue
+
         if ch == '"':
-            in_string = not in_string
+            out.append(ch)
+            in_string = False
+            index += 1
+            continue
+
+        if ch != "\\":
             out.append(ch)
             index += 1
             continue
-        if ch != "\\" or index + 1 >= len(text):
+
+        if index + 1 >= len(text):
             out.append(ch)
             index += 1
             continue
+
         nxt = text[index + 1]
-        if in_string and nxt in valid_json_escapes:
-            out.extend((ch, nxt))
+        if nxt == "_":
+            out.append("_")
             index += 2
             continue
-        if nxt in markdown_punctuation:
-            out.append(nxt)
-            index += 2
-            continue
+
+        # Preserve every other escape byte-for-byte. Standard JSON escapes stay valid;
+        # unsupported escapes remain invalid so json.loads rejects them.
         out.extend((ch, nxt))
         index += 2
+
     return "".join(out)
 
 
