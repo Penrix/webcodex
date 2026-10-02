@@ -39,6 +39,37 @@ class ProviderProbeTests(unittest.TestCase):
         self.assertIs(request["text"]["format"]["strict"], False)
         self.assertEqual(request["text"]["format"]["schema"], probe.PLANNER_SCHEMA)
 
+    def test_exact_live_planner_markdown_escape_parses(self):
+        body = {
+            "status": "completed",
+            "end_turn": True,
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{
+                    "type": "output_text",
+                    "text": '{"kind":"call","tool":"read\\_files","params":{"paths":\\["acceptance.py"\\]},"text":null}',
+                }],
+            }],
+        }
+        action = probe.require_json_action("planner_semantics", 200, body)
+        probe.expect_planner(action)
+
+    def test_probe_rejects_bracket_escape_inside_string(self):
+        body = {
+            "status": "completed",
+            "end_turn": True,
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": '{"kind":"final","tool":null,"params":null,"text":"bad\\[x\\]"}'}],
+            }],
+        }
+        with self.assertRaises(probe.ProbeError):
+            probe.require_json_action("planner_semantics", 200, body)
+
     def test_non_json_final_answer_reports_bounded_preview(self):
         body = {
             "status": "completed",
