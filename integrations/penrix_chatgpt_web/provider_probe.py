@@ -323,23 +323,67 @@ def build_request(
     }
 
 
+def undo_turndown_json_escapes(text: str) -> str:
+    """Undo only the two ChatGPT Web Markdown escapes proven by Windows live evidence."""
+    out: list[str] = []
+    in_string = False
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if not in_string:
+            if ch == "\\" and index + 1 < len(text) and text[index + 1] in "[]":
+                out.append(text[index + 1])
+                index += 2
+                continue
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            index += 1
+            continue
+        if ch == '"':
+            out.append(ch)
+            in_string = False
+            index += 1
+            continue
+        if ch != "\\":
+            out.append(ch)
+            index += 1
+            continue
+        if index + 1 >= len(text):
+            out.append(ch)
+            index += 1
+            continue
+        nxt = text[index + 1]
+        if nxt == "_":
+            out.append("_")
+            index += 2
+            continue
+        out.extend((ch, nxt))
+        index += 2
+    return "".join(out)
+
+
 def require_json_action(name: str, status: int, body: Any) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise ProbeError(f"{name}: invalid Responses envelope: {terminal_summary(body)}")
     text = response_text(body)
     if status != 200 or body.get("status") != "completed" or body.get("end_turn") is not True:
-        preview = text[:300].replace("\r", "\\r").replace("\n", "\\n")
+        preview = text[:300].replace("\\r", "\\\\r").replace("\\n", "\\\\n")
         raise ProbeError(
             f"{name}: terminal failure {json.dumps(terminal_summary(body), ensure_ascii=False)}; "
             f"final_text_preview={preview!r}"
         )
     try:
         action = json.loads(text)
-    except ValueError as exc:
-        preview = text[:300].replace("\r", "\\r").replace("\n", "\\n")
-        raise ProbeError(
-            f"{name}: final answer was not JSON (chars={len(text)}, preview={preview!r})"
-        ) from exc
+    except ValueError as first_error:
+        normalized = undo_turndown_json_escapes(text)
+        try:
+            action = json.loads(normalized)
+        except ValueError:
+            preview = text[:300].replace("\\r", "\\\\r").replace("\\n", "\\\\n")
+            raise ProbeError(
+                f"{name}: final answer was not JSON (chars={len(text)}, preview={preview!r})"
+            ) from first_error
     if not isinstance(action, dict):
         raise ProbeError(f"{name}: JSON final answer was not an object")
     return action
