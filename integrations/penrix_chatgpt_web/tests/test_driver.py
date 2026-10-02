@@ -290,7 +290,7 @@ class DriverTests(unittest.TestCase):
     def test_standard_json_escapes_and_literal_backslash_underscore_survive(self):
         raw = '{"kind":"final","tool":null,"params":null,"text":"quote: \\\"; newline: \\n; literal: \\\\_"}'
         action = driver.parse_web_action_json(raw)
-        self.assertEqual(action["text"], 'quote: "; newline: \\n; literal: \\_')
+        self.assertEqual(action["text"], 'quote: "; newline: \n; literal: \\_')
 
     def test_valid_json_backslashes_are_preserved(self):
         raw = '{"kind":"final","tool":null,"params":null,"text":"C:\\\\_keep\\\\[x]"}'
