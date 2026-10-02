@@ -73,6 +73,41 @@ class ProviderProbeTests(unittest.TestCase):
                 {"kind": "final", "tool": None, "params": None, "text": "no"}
             )
 
+    def test_planner_only_runs_without_repeating_baseline(self):
+        calls = []
+
+        def fake_run_one(client, base, **kwargs):
+            calls.append(kwargs["name"])
+            return {"name": kwargs["name"], "status": "passed"}
+
+        class FakeClient:
+            pass
+
+        original_client = probe.JsonClient
+        original_health = probe.relay_health
+        original_run_one = probe.run_one
+        try:
+            probe.JsonClient = lambda timeout: FakeClient()
+            probe.relay_health = lambda client, base: {
+                "version": "6.1.3",
+                "mode": "browser-only",
+            }
+            probe.run_one = fake_run_one
+            result = probe.run_probe(
+                probe.DEFAULT_RELAY_URL,
+                probe.DEFAULT_MODEL,
+                "high",
+                180.0,
+                "planner",
+            )
+        finally:
+            probe.JsonClient = original_client
+            probe.relay_health = original_health
+            probe.run_one = original_run_one
+
+        self.assertEqual(calls, ["planner_semantics"])
+        self.assertEqual(result["probes"][0]["name"], "planner_semantics")
+
     def test_terminal_failure_preserves_status_and_text_preview(self):
         body = {
             "status": "completed",
