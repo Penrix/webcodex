@@ -14,7 +14,6 @@ import urllib.parse
 import urllib.request
 import uuid
 from typing import Any
-from json_boundary import parse_json_object_from_markdown
 
 RELAY_URL = "http://127.0.0.1:17841/v1"
 MODEL = "chatgpt-web/gpt-5.6-sol"
@@ -68,6 +67,54 @@ not actually present in the supplied bootstrap/history. After work that may chan
 Project workspace, finish_coding_task must settle after the latest such change before
 finalization.
 """
+
+
+def undo_turndown_json_escapes(text: str) -> str:
+    """Undo only Turndown Markdown escapes that are illegal JSON lexemes."""
+    markdown_punctuation = set("!#()*+-.<>[]_{}|~")
+    valid_json_escapes = set('"\\/bfnrtu')
+    out: list[str] = []
+    in_string = False
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        if ch == '"':
+            in_string = not in_string
+            out.append(ch)
+            index += 1
+            continue
+        if ch != "\\" or index + 1 >= len(text):
+            out.append(ch)
+            index += 1
+            continue
+        nxt = text[index + 1]
+        if in_string and nxt in valid_json_escapes:
+            out.extend((ch, nxt))
+            index += 2
+            continue
+        if nxt in markdown_punctuation:
+            out.append(nxt)
+            index += 2
+            continue
+        out.extend((ch, nxt))
+        index += 2
+    return "".join(out)
+
+
+def parse_web_action_json(text: str) -> dict[str, Any]:
+    try:
+        value = json.loads(text)
+    except ValueError as first_error:
+        normalized = undo_turndown_json_escapes(text)
+        if normalized == text:
+            raise
+        try:
+            value = json.loads(normalized)
+        except ValueError:
+            raise first_error
+    if not isinstance(value, dict):
+        raise ValueError("JSON value was not an object")
+    return value
 
 
 class DriverError(RuntimeError):
@@ -254,7 +301,7 @@ class WebModel:
             )
         text = response_text(body)
         try:
-            action = parse_json_object_from_markdown(text)
+            action = parse_web_action_json(text)
         except ValueError as exc:
             preview = text[:240].replace("\\r", "\\r").replace("\\n", "\\n")
             raise DriverError(
