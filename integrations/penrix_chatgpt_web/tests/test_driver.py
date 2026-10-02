@@ -272,6 +272,26 @@ class DriverTests(unittest.TestCase):
             },
         )
 
+    def test_bracket_escapes_inside_json_strings_remain_invalid(self):
+        with self.assertRaises(ValueError):
+            driver.parse_web_action_json(
+                '{"kind":"final","tool":null,"params":null,"text":"bad\\[value\\]"}'
+            )
+
+    def test_unsupported_structural_markdown_escapes_remain_invalid(self):
+        for raw in (
+            '{"kind":"call","tool":"read_files","params":\\{"paths":["a"]\\},"text":null}',
+            '{"kind":"call","tool":"read_files","params":\\*,"text":null}',
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    driver.parse_web_action_json(raw)
+
+    def test_standard_json_escapes_and_literal_backslash_underscore_survive(self):
+        raw = '{"kind":"final","tool":null,"params":null,"text":"quote: \\\"; newline: \\n; literal: \\\\_"}'
+        action = driver.parse_web_action_json(raw)
+        self.assertEqual(action["text"], 'quote: "; newline: \\n; literal: \\_')
+
     def test_valid_json_backslashes_are_preserved(self):
         raw = '{"kind":"final","tool":null,"params":null,"text":"C:\\\\_keep\\\\[x]"}'
         action = driver.parse_web_action_json(raw)
