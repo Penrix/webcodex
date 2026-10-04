@@ -48,7 +48,7 @@ The Web model must return exactly one strict JSON object per round:
 - `call` sends one admitted tool to the canonical `/api/tools/call` endpoint. The driver binds Project and Workflow Session fields mechanically when the current schema exposes them.
 - `final` is accepted only when no required local work remains. Once a call that may change the Project workspace has crossed the driver boundary, the read-only `finish_coding_task` evidence snapshot must succeed **after the latest such change** before finalization. Session/attention-only mutations do not create this source-closeout requirement. The snapshot is evidence; it does not itself close the Workflow Session.
 
-The default allowlist is coding-oriented, not administrative. `run_shell` is intentionally **not** enabled by default; an operator can add an exact extra tool with `--allow-tool` when the task really needs it and the WebCodex credential independently authorizes it.
+The default allowlist is coding-oriented, not administrative. `run_shell` is intentionally **not** enabled by default; `wait_for_job_terminal` is also excluded from the ordinary coding surface because it belongs to an explicitly established durable continuation workflow, while ordinary blocking uses `wait_for_job_readiness` and recovery/detail uses `observe_jobs`. An operator can add an exact extra tool with `--allow-tool` when the task really needs it and the WebCodex credential independently authorizes it.
 
 ## Safety / effect boundaries
 
