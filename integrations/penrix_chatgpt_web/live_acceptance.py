@@ -26,6 +26,15 @@ READY_TIMEOUT = 75
 DRIVER_TIMEOUT = 900
 CLEANUP_TIMEOUT = 20
 TOKEN_RE = re.compile(r"^webcodex_[0-9a-f]{64}$")
+JOB_HANDOFF_RE = re.compile(
+    r"^\[penrix-web\] job_evidence event=handoff tool=run_process job_id=(wc_job_[A-Za-z0-9_-]+)$",
+    re.MULTILINE,
+)
+JOB_TERMINAL_RE = re.compile(
+    r"^\[penrix-web\] job_evidence event=terminal_observation tool=observe_jobs job_id=(wc_job_[A-Za-z0-9_-]+)$",
+    re.MULTILINE,
+)
+RUN_PROCESS_TOOL_LINE = "[penrix-web] WebCodex tool: run_process"
 EXPECTED_WEBCODEX_VERSION = "0.4.4"
 EXPECTED_RELAY_VERSION = "6.1.3"
 EXPECTED_RELAY_MODE = "browser-only"
@@ -416,6 +425,27 @@ def exact_project(server_url: str, token: str) -> str:
     return connected[0]["id"]
 
 
+def require_exact_run_process_job_observation(stderr: str) -> None:
+    run_process_calls = sum(
+        line == RUN_PROCESS_TOOL_LINE for line in stderr.splitlines()
+    )
+    if run_process_calls != 1:
+        raise AcceptanceError(
+            f"expected exactly one run_process dispatch, saw {run_process_calls}"
+        )
+    handoffs = JOB_HANDOFF_RE.findall(stderr)
+    if len(handoffs) != 1:
+        raise AcceptanceError(
+            "expected exactly one durable run_process Job handoff, "
+            f"saw {len(handoffs)}"
+        )
+    terminal_jobs = set(JOB_TERMINAL_RE.findall(stderr))
+    if handoffs[0] not in terminal_jobs:
+        raise AcceptanceError(
+            "run_process durable Job was not terminal-observed through observe_jobs: "
+            + handoffs[0]
+        )
+
 
 def run_driver(
     driver: pathlib.Path,
@@ -423,6 +453,7 @@ def run_driver(
     args: list[str],
     *,
     required_stderr_markers: tuple[str, ...] = (),
+    require_exact_job_observation: bool = False,
 ) -> dict[str, Any]:
     try:
         proc = subprocess.run(
@@ -466,6 +497,8 @@ def run_driver(
             "driver completed without required live evidence: "
             + ", ".join(missing_markers)
         )
+    if require_exact_job_observation:
+        require_exact_run_process_job_observation(proc.stderr)
     return result
 
 
@@ -562,6 +595,7 @@ def live_run(
                 "WebCodex tool: run_process",
                 "WebCodex tool: observe_jobs",
             ),
+            require_exact_job_observation=True,
         )
         first_diff = verify_local_repo(repo)
         session_ref = first.get("session_ref")
