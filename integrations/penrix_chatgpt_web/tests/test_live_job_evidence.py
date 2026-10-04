@@ -122,6 +122,46 @@ class DriverJobEvidenceTests(unittest.TestCase):
         }
         self.assertEqual(driver.terminal_job_ids(result), {"wc_job_done"})
 
+    def test_successful_terminal_job_ids_require_completed_zero_exit(self):
+        result = {
+            "success": True,
+            "output": {
+                "items": [
+                    {
+                        "job_id": "wc_job_good",
+                        "status": "completed",
+                        "terminal": True,
+                        "exit_code": 0,
+                    },
+                    {
+                        "job_id": "wc_job_nonzero",
+                        "status": "completed",
+                        "terminal": True,
+                        "exit_code": 1,
+                    },
+                    {
+                        "job_id": "wc_job_failed",
+                        "status": "failed",
+                        "terminal": True,
+                        "exit_code": 1,
+                    },
+                    {
+                        "job_id": "wc_job_running",
+                        "status": "running",
+                        "terminal": False,
+                        "exit_code": None,
+                    },
+                    {
+                        "job_id": "wc_job_bool_exit",
+                        "status": "completed",
+                        "terminal": True,
+                        "exit_code": False,
+                    },
+                ]
+            },
+        }
+        self.assertEqual(driver.successful_terminal_job_ids(result), {"wc_job_good"})
+
     def test_execute_logs_canonical_handoff_terminal_and_success(self):
         log = io.StringIO()
         instance = driver.Driver(
