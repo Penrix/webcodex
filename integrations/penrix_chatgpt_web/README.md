@@ -57,7 +57,7 @@ The driver intentionally has no automatic retry loop.
 - A ChatGPT Web transport disconnect stops with `outcome_unknown`; it does not send the same prompt again.
 - Relay errors `chatgpt_submission_ambiguous` and `chatgpt_submitted_turn_failed` are also classified as `outcome_unknown`, because current `codex-chatgpt-web` says Send may have occurred / the task already started. They are never treated as a clean pre-send failure.
 - A WebCodex transport disconnect also stops instead of replaying a possibly accepted effect.
-- A non-idempotent/unknown mutating tool call with the same normalized arguments cannot be dispatched twice in one driver run. WebCodex tools whose current manifest explicitly says `desired_state`, `keyed`, or `fenced_replay` may use their canonical replay/reconciliation contract.
+- A non-idempotent/unknown canonical `Mutate` call with the same normalized arguments cannot be dispatched twice in one driver run. Canonical `Execute` calls remain distinct logical invocations (for example, rerunning the same validation command after new work); they are never automatic transport retries. WebCodex tools whose current manifest explicitly says `desired_state`, `keyed`, or `fenced_replay` may use their canonical replay/reconciliation contract.
 - The model cannot retarget another Project or Workflow Session. The driver pins the selectors established by `work_on_project` and rejects conflicting proposals before calling WebCodex.
 - Project-less Job observation/wait calls accept only opaque Job IDs / observation refs already observed in this fixed Project/Session's bootstrap, handoff, current-Project `list_jobs`, or current-Project tool results. Unknown Job identities are rejected before the request crosses to WebCodex.
 - WebCodex HTTP 5xx after dispatch and canonical `output.execution_state="outcome_unknown"` both stop the current driver run. Canonical uncertainty may retain returned Job identity for later explicit recovery, but it never authorizes another effect in the same run.
@@ -92,7 +92,7 @@ To resume an exact durable Workflow Session after the browser/model process is g
 python integrations/penrix_chatgpt_web/driver.py --session "~s1" --task "Continue from the saved handoff and finish the current task."
 ```
 
-The driver re-enters through `work_on_project`, reads `session_handoff_summary`, and gives that current durable state to a fresh Web reasoning context. It does not require the previous ChatGPT browser conversation to survive.
+The driver re-enters through `work_on_project`, reads `session_handoff_summary`, and gives that current durable state to a fresh Web reasoning context. When the compact handoff is not enough to reconcile an exact prior Job/effect fact, the planner may discover the read-only canonical `session_summary` and inspect its bounded durable ledger tail before proposing overlapping work. That summary is evidence, not a raw-argument archive: omitted/redacted arguments are never inferred. The previous ChatGPT browser conversation does not need to survive.
 
 Each relay round also carries the minimum current `codex-chatgpt-web` browser identity contract: one stable driver `thread_id`, one fresh `turn_id`, matching current-user turn provenance, and `prompt_cache_key`. The driver does not invent Codex filesystem/sandbox authority; browser-only mode does not need that environment surface.
 
@@ -119,8 +119,9 @@ Deterministic stdlib fake-server tests cover:
 - contract discovery before non-preloaded tools;
 - current ordinary `review_changes` discovery is preloaded alongside the edit/validation/closeout path;
 - source-changing work cannot finalize before `finish_coding_task`; omitted `summary_only` is pinned to the current upstream normal-closeout default (`true`) while an explicit caller choice is preserved;
-- non-idempotent mutation with identical normalized arguments is sent only once;
-- exact Session resume reads the saved handoff;
+- non-idempotent canonical mutation with identical normalized arguments is sent only once, while repeated canonical `Execute` calls remain distinct logical invocations;
+- every default admitted tool name exists in the exact checkout's canonical `ToolCall::tool_name()` registry, catching rename drift such as `workspace_hygiene_check`;
+- exact Session resume reads the saved handoff, and can recover an authoritative prior Job identity on demand through `session_summary` before observing that Job;
 - relay disconnect is not automatically retried;
 - current relay post-Send uncertainty codes stop as `outcome_unknown` for both HTTP-error and HTTP-200 failed-envelope forms, without a second Web request;
 - HTTP 200 with an incomplete/non-terminal Responses envelope cannot drive a WebCodex effect;
@@ -165,7 +166,7 @@ The carrier:
 - creates a disposable temporary Git project instead of touching a real repository;
 - starts local WebCodex Server + Runner + Project through upstream `share`;
 - never reads WebCodex secret files or prints the temporary credential;
-- relies on upstream's normal clipboard handoff, then asks the owner to paste that temporary Bearer once into hidden console input;
+- relies on upstream's normal clipboard handoff and reads the staged temporary Bearer once through the Windows clipboard API; the credential is validated by shape and is never printed or persisted;
 - resolves the exact canonical Project through `list_projects` instead of trusting a display name;
 - makes ChatGPT Web repair one intentionally failing one-line Python fixture through the driver;
 - requires Runner-side `python -m unittest -v`, change review, and `finish_coding_task` evidence;
