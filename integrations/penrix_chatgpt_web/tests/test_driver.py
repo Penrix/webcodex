@@ -99,6 +99,19 @@ def fake_servers(state: FakeState):
                 out = {"success": True, "output": {"session_id": "wc_sess_test", "session_ref": "~s1"}}
             elif tool == "session_handoff_summary":
                 out = {"success": True, "output": {"session_id": "wc_sess_test", "brief": "saved"}}
+            elif tool == "session_summary":
+                out = {
+                    "success": True,
+                    "output": {
+                        "session_id": "wc_sess_test",
+                        "events_truncated": False,
+                        "events": [{
+                            "tool_name": "project_validate",
+                            "status": "succeeded",
+                            "job_id": "wc_job_saved",
+                        }],
+                    },
+                }
             elif tool == "tool_manifest":
                 name = params["tool_name"]
                 effect, idempotency = {
@@ -123,8 +136,8 @@ def fake_servers(state: FakeState):
                     "read_files", "search_project_texts", "search_and_read",
                     "edit_project_files", "show_changes", "review_changes", "git_status",
                     "project_validate", "project_build", "run_process", "list_jobs",
-                    "finish_coding_task", "session_handoff_summary", "post_session_message",
-                    "workspace_hygiene_check",
+                    "finish_coding_task", "session_summary", "session_handoff_summary",
+                    "post_session_message", "workspace_hygiene_check",
                 }:
                     properties["session_id"] = {"type": "string"}
                 out = {
@@ -389,6 +402,29 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(work["params"]["session_id"], "~s1")
         self.assertTrue(any(req["tool"] == "session_handoff_summary" for req in state.webcodex_requests))
         self.assertEqual(result["final"], "continued")
+
+    def test_resume_can_recover_job_identity_from_session_summary(self):
+        state = FakeState()
+        state.relay_actions = [
+            {"kind": "discover", "tool": "session_summary", "params": None, "text": None},
+            {"kind": "call", "tool": "session_summary", "params": {}, "text": None},
+            {"kind": "discover", "tool": "observe_jobs", "params": None, "text": None},
+            {
+                "kind": "call",
+                "tool": "observe_jobs",
+                "params": {"items": [{"job_id": "wc_job_saved"}]},
+                "text": None,
+            },
+            {"kind": "final", "tool": None, "params": None, "text": "reconciled"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("recover exact prior work", "~s1")
+        summary = next(req for req in state.webcodex_requests if req["tool"] == "session_summary")
+        self.assertEqual(summary["params"]["session_id"], "wc_sess_test")
+        observed = [req for req in state.webcodex_requests if req["tool"] == "observe_jobs"]
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["params"]["items"][0]["job_id"], "wc_job_saved")
+        self.assertEqual(result["final"], "reconciled")
 
     def test_non_idempotent_mutation_is_not_dispatched_twice(self):
         state = FakeState()
