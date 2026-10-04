@@ -114,15 +114,15 @@ def fake_servers(state: FakeState):
                 }
             elif tool == "tool_manifest":
                 name = params["tool_name"]
-                effect, idempotency = {
-                    "edit_project_files": ("mutate", "non_idempotent"),
-                    "project_validate": ("execute", "non_idempotent"),
-                    "project_build": ("execute", "non_idempotent"),
-                    "run_process": ("execute", "non_idempotent"),
-                    "job_write_input": ("execute", "keyed"),
-                    "post_session_message": ("mutate", "non_idempotent"),
-                    "wait_for_job_terminal": ("mutate", "keyed"),
-                }.get(name, ("observe", "pure_read"))
+                effect, idempotency, risk, open_world = {
+                    "edit_project_files": ("mutate", "non_idempotent", "project_write", False),
+                    "project_validate": ("execute", "non_idempotent", "job_run", False),
+                    "project_build": ("execute", "non_idempotent", "job_run", False),
+                    "run_process": ("execute", "non_idempotent", "job_run", True),
+                    "job_write_input": ("execute", "keyed", "job_run", True),
+                    "post_session_message": ("mutate", "non_idempotent", "session_collaborate", False),
+                    "wait_for_job_terminal": ("mutate", "keyed", "job_run", False),
+                }.get(name, ("observe", "pure_read", "read_only", False))
                 properties = {}
                 if name in {
                     "read_files", "search_project_texts", "search_and_read",
@@ -145,7 +145,14 @@ def fake_servers(state: FakeState):
                     "output": {
                         "name": name,
                         "effect": effect,
+                        "risk": risk,
                         "idempotency": idempotency,
+                        "annotations": {
+                            "readOnlyHint": effect == "observe",
+                            "destructiveHint": name in {"edit_project_files", "run_process"},
+                            "idempotentHint": idempotency in {"pure_read", "desired_state", "keyed", "fenced_replay"},
+                            "openWorldHint": open_world,
+                        },
                         "input_schema": {"type": "object", "properties": properties},
                     },
                 }
@@ -463,6 +470,45 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(len(runs), 2)
         self.assertEqual(result["final"], "done")
 
+
+    def test_open_world_execute_invalidates_earlier_closeout_evidence(self):
+        state = FakeState()
+        state.relay_actions = [
+            {"kind": "call", "tool": "finish_coding_task", "params": {}, "text": None},
+            {"kind": "discover", "tool": "run_process", "params": None, "text": None},
+            {
+                "kind": "call",
+                "tool": "run_process",
+                "params": {"executable": "python", "args": ["-V"]},
+                "text": None,
+            },
+            {"kind": "final", "tool": None, "params": None, "text": "stale closeout"},
+            {"kind": "call", "tool": "finish_coding_task", "params": {}, "text": None},
+            {"kind": "final", "tool": None, "params": None, "text": "fresh closeout"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("run an open-world process")
+        finishes = [req for req in state.webcodex_requests if req["tool"] == "finish_coding_task"]
+        self.assertEqual(len(finishes), 2)
+        self.assertEqual(result["final"], "fresh closeout")
+
+    def test_structured_validation_does_not_invalidate_source_closeout(self):
+        state = FakeState()
+        state.relay_actions = [
+            {"kind": "call", "tool": "finish_coding_task", "params": {}, "text": None},
+            {
+                "kind": "call",
+                "tool": "project_validate",
+                "params": {"action": "check"},
+                "text": None,
+            },
+            {"kind": "final", "tool": None, "params": None, "text": "validated"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("validate without changing source")
+        finishes = [req for req in state.webcodex_requests if req["tool"] == "finish_coding_task"]
+        self.assertEqual(len(finishes), 1)
+        self.assertEqual(result["final"], "validated")
 
     def test_later_mutation_invalidates_earlier_closeout_evidence(self):
         state = FakeState()
