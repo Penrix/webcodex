@@ -169,7 +169,8 @@ The carrier:
 - relies on upstream's normal clipboard handoff and reads the staged temporary Bearer once through the Windows clipboard API; the credential is validated by shape and is never printed or persisted;
 - resolves the exact canonical Project through `list_projects` instead of trusting a display name;
 - makes ChatGPT Web repair one intentionally failing one-line Python fixture through the driver;
-- requires Runner-side `python -m unittest -v`, change review, and `finish_coding_task` evidence;
+- requires one disposable `run_process` fixture that lasts more than the canonical 10-second sync-first grace, then requires the driver log to prove the same execution was observed through `observe_jobs` before completion;
+- requires successful Runner-side unittest evidence, change review, and `finish_coding_task` evidence;
 - independently rechecks the resulting file/test locally;
 - starts a fresh driver process with the returned `~s...` ref and requires exact Session handoff recovery without another mutation;
 - stops `share` through its documented stdin-EOF contract and deletes the disposable repository only after a clean pass.
