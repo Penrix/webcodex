@@ -51,6 +51,7 @@ class FakeState:
         self.drop_webcodex_tool = None
         self.webcodex_status_tool = None
         self.outcome_unknown_tool = None
+        self.malformed_manifest_tool = None
         self.relay_response_override = None
         self.relay_status = 200
 
@@ -156,6 +157,8 @@ def fake_servers(state: FakeState):
                         "input_schema": {"type": "object", "properties": properties},
                     },
                 }
+                if state.malformed_manifest_tool == name:
+                    out["output"].pop("risk")
             elif tool == "read_files":
                 out = {"success": True, "output": {"text": "hello"}}
             elif tool == "edit_project_files":
@@ -528,6 +531,20 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(len(finishes), 2)
         self.assertEqual(result["final"], "fresh closeout")
 
+
+    def test_incomplete_canonical_manifest_is_not_admitted(self):
+        state = FakeState()
+        state.malformed_manifest_tool = "show_changes"
+        state.relay_actions = [
+            {"kind": "discover", "tool": "show_changes", "params": None, "text": None},
+            {"kind": "call", "tool": "show_changes", "params": {}, "text": None},
+            {"kind": "final", "tool": None, "params": None, "text": "blocked"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("inspect changes")
+        calls = [req for req in state.webcodex_requests if req["tool"] == "show_changes"]
+        self.assertEqual(calls, [])
+        self.assertEqual(result["final"], "blocked")
 
     def test_allowed_but_undiscovered_tool_is_rejected_until_manifest(self):
         state = FakeState()
