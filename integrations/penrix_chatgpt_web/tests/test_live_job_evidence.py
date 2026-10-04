@@ -63,6 +63,7 @@ class FakeJobWebCodex:
                             "job_id": "wc_job_slow",
                             "status": "completed",
                             "terminal": True,
+                            "exit_code": 0,
                             "observation_token": "token-2",
                         }
                     ]
@@ -110,6 +111,7 @@ class DriverJobEvidenceTests(unittest.TestCase):
                             "job_id": "wc_job_done",
                             "status": "completed",
                             "terminal": True,
+                            "exit_code": 0,
                             "observation_token": "b",
                         },
                         "error_kind": None,
@@ -120,7 +122,7 @@ class DriverJobEvidenceTests(unittest.TestCase):
         }
         self.assertEqual(driver.terminal_job_ids(result), {"wc_job_done"})
 
-    def test_execute_logs_canonical_handoff_and_same_terminal_job(self):
+    def test_execute_logs_canonical_handoff_terminal_and_success(self):
         log = io.StringIO()
         instance = driver.Driver(
             FakeJobWebCodex(),
@@ -150,6 +152,11 @@ class DriverJobEvidenceTests(unittest.TestCase):
             "tool=observe_jobs job_id=wc_job_slow",
             stderr,
         )
+        self.assertIn(
+            "[penrix-web] job_evidence event=terminal_success "
+            "tool=observe_jobs job_id=wc_job_slow",
+            stderr,
+        )
         live.require_exact_run_process_job_observation(stderr)
 
 
@@ -159,6 +166,7 @@ class LiveAcceptanceJobEvidenceTests(unittest.TestCase):
         *,
         handoff: str = "wc_job_slow",
         terminal: str | None = "wc_job_slow",
+        successful: str | None = "wc_job_slow",
         run_process_calls: int = 1,
     ) -> str:
         lines = ["[penrix-web] WebCodex tool: run_process"] * run_process_calls
@@ -171,15 +179,24 @@ class LiveAcceptanceJobEvidenceTests(unittest.TestCase):
                 "[penrix-web] job_evidence event=terminal_observation "
                 f"tool=observe_jobs job_id={terminal}"
             )
+        if successful is not None:
+            lines.append(
+                "[penrix-web] job_evidence event=terminal_success "
+                f"tool=observe_jobs job_id={successful}"
+            )
         return "\n".join(lines) + "\n"
 
-    def test_exact_same_job_terminal_observation_passes(self):
+    def test_exact_same_job_terminal_success_passes(self):
         live.require_exact_run_process_job_observation(self.stderr())
 
     def test_acceptance_does_not_invent_job_id_suffix_grammar(self):
         future_id = "wc_job_future.v2:opaque"
         live.require_exact_run_process_job_observation(
-            self.stderr(handoff=future_id, terminal=future_id)
+            self.stderr(
+                handoff=future_id,
+                terminal=future_id,
+                successful=future_id,
+            )
         )
 
     def test_mismatched_terminal_job_is_rejected(self):
@@ -188,7 +205,7 @@ class LiveAcceptanceJobEvidenceTests(unittest.TestCase):
             "run_process durable Job was not terminal-observed",
         ):
             live.require_exact_run_process_job_observation(
-                self.stderr(terminal="wc_job_other")
+                self.stderr(terminal="wc_job_other", successful=None)
             )
 
     def test_missing_terminal_observation_is_rejected(self):
@@ -197,7 +214,25 @@ class LiveAcceptanceJobEvidenceTests(unittest.TestCase):
             "run_process durable Job was not terminal-observed",
         ):
             live.require_exact_run_process_job_observation(
-                self.stderr(terminal=None)
+                self.stderr(terminal=None, successful=None)
+            )
+
+    def test_failed_terminal_job_is_rejected(self):
+        with self.assertRaisesRegex(
+            live.AcceptanceError,
+            "run_process durable Job did not report successful completion",
+        ):
+            live.require_exact_run_process_job_observation(
+                self.stderr(successful=None)
+            )
+
+    def test_success_for_different_job_is_rejected(self):
+        with self.assertRaisesRegex(
+            live.AcceptanceError,
+            "run_process durable Job did not report successful completion",
+        ):
+            live.require_exact_run_process_job_observation(
+                self.stderr(successful="wc_job_other")
             )
 
     def test_duplicate_run_process_execution_is_rejected(self):
