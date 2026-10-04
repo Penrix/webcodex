@@ -484,13 +484,13 @@ class Driver:
         fixed, effect, idem = self.fixed_params(tool, params, session)
         self.fence_job_identities(tool, fixed)
         fingerprint = dump({"tool": tool, "params": fixed})
-        consequential = effect == "mutate" or tool in MAY_CHANGE_WORKSPACE
+        mutation = effect == "mutate"
         workspace_change = tool in MAY_CHANGE_WORKSPACE or (
-            tool not in ALLOWED_TOOLS and effect == "mutate"
+            tool not in ALLOWED_TOOLS and mutation
         )
-        if consequential and fingerprint in self.dispatched_mutations and idem not in REPLAY_SAFE:
+        if mutation and fingerprint in self.dispatched_mutations and idem not in REPLAY_SAFE:
             raise DriverError(f"refusing repeated non-replay-safe mutation: {tool}")
-        if consequential:
+        if mutation:
             self.dispatched_mutations.add(fingerprint)  # before crossing transport boundary
         if workspace_change:
             self.needs_closeout = True
