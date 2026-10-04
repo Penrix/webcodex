@@ -111,7 +111,7 @@ Consequences for this first slice:
 
 Deterministic stdlib fake-server tests cover:
 
-- strict JSON-schema Responses request construction;
+- JSON-schema-guided Responses request construction with provider `strict=false`, while the driver still strictly parses and validates the returned JSON action;
 - current relay thread/turn identity and current-user turn provenance;
 - positive Responses completion evidence (`status=completed` + `end_turn=true`) before any action is accepted;
 - fixed Project + exact Workflow Session injection;
@@ -139,7 +139,7 @@ python -m unittest discover -s integrations/penrix_chatgpt_web/tests -v
 
 The fork also carries `.github/workflows/penrix-chatgpt-web-driver.yml`, a Windows-only five-minute contract lane that compiles the driver/test sources and runs exactly this suite when the integration changes.
 
-These tests prove driver logic only. They do **not** prove the current Windows WebCodex build, the local `codex-chatgpt-web` launcher/login, a real ChatGPT Web strict-output turn, or a real edit/Job round-trip. Those remain **LIVE UNVERIFIED** until exercised on the target Windows machine.
+These tests prove driver logic only. They do **not** prove the current Windows WebCodex build, the local `codex-chatgpt-web` launcher/login, a real ChatGPT Web browser turn under this provider boundary, or a real edit/Job round-trip. Those remain **LIVE UNVERIFIED** until exercised on the target Windows machine.
 
 ## Windows live carrier
 
@@ -162,7 +162,7 @@ python integrations\penrix_chatgpt_web\live_acceptance.py --webcodex-bin-dir .
 The carrier:
 
 - refuses WebCodex versions other than 0.4.4;
-- proves the configured `chatgpt-web/gpt-5.6-sol` route by completing real browser-only Responses turns; it does not call `/v1/models`, because that catalog endpoint is a native-Codex passthrough requiring Codex Bearer auth;
+- proves the configured `chatgpt-web/gpt-5.6-sol` route by completing real browser-only Responses turns under the non-strict provider / strict driver boundary; it does not call `/v1/models`, because that catalog endpoint is a native-Codex passthrough requiring Codex Bearer auth;
 - creates a disposable temporary Git project instead of touching a real repository;
 - starts local WebCodex Server + Runner + Project through upstream `share`;
 - never reads WebCodex secret files or prints the temporary credential;
