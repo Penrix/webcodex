@@ -228,6 +228,11 @@ def fake_servers(state: FakeState):
 
 
 class DriverTests(unittest.TestCase):
+    def test_default_surface_omits_terminal_continuation_registration(self):
+        self.assertNotIn("wait_for_job_terminal", driver.ALLOWED_TOOLS)
+        self.assertIn("wait_for_job_readiness", driver.ALLOWED_TOOLS)
+        self.assertIn("observe_jobs", driver.ALLOWED_TOOLS)
+
     def test_admitted_tool_names_exist_in_canonical_tool_registry(self):
         repo_root = pathlib.Path(__file__).resolve().parents[3]
         tool_call = (
