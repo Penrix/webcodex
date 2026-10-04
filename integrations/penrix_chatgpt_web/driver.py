@@ -24,7 +24,7 @@ MAX_BODY = 4 * 1024 * 1024
 ALLOWED_TOOLS = {
     "read_files", "search_project_texts", "search_and_read", "edit_project_files",
     "show_changes", "review_changes", "git_status", "project_validate", "project_build", "run_process",
-    "observe_jobs", "wait_for_job_readiness", "wait_for_job_terminal", "list_jobs",
+    "observe_jobs", "wait_for_job_readiness", "list_jobs",
     "job_write_input", "finish_coding_task", "session_summary", "session_handoff_summary",
     "post_session_message", "workspace_hygiene_check",
 }
