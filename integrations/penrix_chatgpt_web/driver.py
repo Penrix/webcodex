@@ -26,7 +26,7 @@ ALLOWED_TOOLS = {
     "show_changes", "review_changes", "git_status", "project_validate", "project_build", "run_process",
     "observe_jobs", "wait_for_job_readiness", "wait_for_job_terminal", "list_jobs",
     "job_write_input", "finish_coding_task", "session_handoff_summary",
-    "post_session_message", "workspace_hygiene",
+    "post_session_message", "workspace_hygiene_check",
 }
 PRELOAD = (
     "read_files", "search_and_read", "edit_project_files", "project_validate",
