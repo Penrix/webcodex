@@ -34,6 +34,10 @@ JOB_TERMINAL_RE = re.compile(
     r"^\[penrix-web\] job_evidence event=terminal_observation tool=observe_jobs job_id=(wc_job_.+)$",
     re.MULTILINE,
 )
+JOB_SUCCESS_RE = re.compile(
+    r"^\[penrix-web\] job_evidence event=terminal_success tool=observe_jobs job_id=(wc_job_.+)$",
+    re.MULTILINE,
+)
 RUN_PROCESS_TOOL_LINE = "[penrix-web] WebCodex tool: run_process"
 EXPECTED_WEBCODEX_VERSION = "0.4.4"
 EXPECTED_RELAY_VERSION = "6.1.3"
@@ -443,6 +447,12 @@ def require_exact_run_process_job_observation(stderr: str) -> None:
     if handoffs[0] not in terminal_jobs:
         raise AcceptanceError(
             "run_process durable Job was not terminal-observed through observe_jobs: "
+            + handoffs[0]
+        )
+    successful_jobs = set(JOB_SUCCESS_RE.findall(stderr))
+    if handoffs[0] not in successful_jobs:
+        raise AcceptanceError(
+            "run_process durable Job did not report successful completion through observe_jobs: "
             + handoffs[0]
         )
 
