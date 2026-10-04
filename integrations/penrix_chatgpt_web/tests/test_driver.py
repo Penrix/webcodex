@@ -101,10 +101,15 @@ def fake_servers(state: FakeState):
                 out = {"success": True, "output": {"session_id": "wc_sess_test", "brief": "saved"}}
             elif tool == "tool_manifest":
                 name = params["tool_name"]
-                effect = "mutate" if name in {
-                    "edit_project_files", "run_shell", "post_session_message",
-                    "wait_for_job_terminal"
-                } else "observe"
+                effect, idempotency = {
+                    "edit_project_files": ("mutate", "non_idempotent"),
+                    "project_validate": ("execute", "non_idempotent"),
+                    "project_build": ("execute", "non_idempotent"),
+                    "run_process": ("execute", "non_idempotent"),
+                    "job_write_input": ("execute", "keyed"),
+                    "post_session_message": ("mutate", "non_idempotent"),
+                    "wait_for_job_terminal": ("mutate", "keyed"),
+                }.get(name, ("observe", "pure_read"))
                 properties = {}
                 if name not in {
                     "observe_jobs", "wait_for_job_readiness", "wait_for_job_terminal"
@@ -112,8 +117,8 @@ def fake_servers(state: FakeState):
                     properties["project"] = {"type": "string"}
                 if name in {
                     "read_files", "edit_project_files", "finish_coding_task",
-                    "run_shell", "list_jobs", "review_changes", "project_validate",
-                    "project_build", "workspace_hygiene", "post_session_message"
+                    "list_jobs", "review_changes", "project_validate", "project_build",
+                    "run_process", "workspace_hygiene_check", "post_session_message"
                 }:
                     properties["session_id"] = {"type": "string"}
                 out = {
@@ -121,7 +126,7 @@ def fake_servers(state: FakeState):
                     "output": {
                         "name": name,
                         "effect": effect,
-                        "idempotency": "non_idempotent" if effect == "mutate" else "pure_read",
+                        "idempotency": idempotency,
                         "input_schema": {"type": "object", "properties": properties},
                     },
                 }
@@ -194,6 +199,17 @@ def fake_servers(state: FakeState):
 
 
 class DriverTests(unittest.TestCase):
+    def test_admitted_tool_names_exist_in_canonical_tool_registry(self):
+        repo_root = pathlib.Path(__file__).resolve().parents[3]
+        tool_call = (
+            repo_root / "crates" / "webcodex-tool-contracts" / "src" / "tool_call.rs"
+        ).read_text(encoding="utf-8")
+        missing = [
+            name for name in sorted(driver.ALLOWED_TOOLS)
+            if f'=> "{name}"' not in tool_call
+        ]
+        self.assertEqual(missing, [])
+
     def make_driver(self, relay_url, wc_url):
         return driver.Driver(
             driver.WebCodex(wc_url, "secret-test-token", 3),
