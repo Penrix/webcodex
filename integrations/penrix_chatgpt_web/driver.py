@@ -473,6 +473,15 @@ class Driver:
             raise DriverError(f"tool not admitted by driver: {tool}")
         result = self.wc.call("tool_manifest", {"tool_name": tool}, session)
         if result.get("success") is True:
+            schema, effect, idem, risk, annotations = contract_parts(result)
+            if (
+                schema is None
+                or effect not in {"observe", "mutate", "execute"}
+                or not isinstance(idem, str)
+                or not isinstance(risk, str)
+                or not isinstance(annotations.get("openWorldHint"), bool)
+            ):
+                raise DriverError(f"incomplete canonical tool_manifest semantics for {tool}")
             self.contracts[tool] = result
         return result
 
