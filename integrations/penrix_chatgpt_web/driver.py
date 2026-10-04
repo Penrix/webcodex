@@ -25,7 +25,7 @@ ALLOWED_TOOLS = {
     "read_files", "search_project_texts", "search_and_read", "edit_project_files",
     "show_changes", "review_changes", "git_status", "project_validate", "project_build", "run_process",
     "observe_jobs", "wait_for_job_readiness", "wait_for_job_terminal", "list_jobs",
-    "job_write_input", "finish_coding_task", "session_handoff_summary",
+    "job_write_input", "finish_coding_task", "session_summary", "session_handoff_summary",
     "post_session_message", "workspace_hygiene_check",
 }
 PRELOAD = (
@@ -59,8 +59,11 @@ JSON object matching the strict schema:
 - discover: request the current contract for one admitted tool before first use;
 - call: propose one admitted tool call using its supplied contract;
 - final: answer only when no more local evidence/effect is needed.
-Preserve exact Job identity; never duplicate an uncertain effect. Bootstrap observation
-that an AGENTS.md/CLAUDE.md/project rule source exists is not proof that its body was read.
+Preserve exact Job identity; never duplicate an uncertain effect. On resume/recovery,
+if the saved handoff lacks prior Job/effect facts needed to avoid overlap, use canonical
+session_summary and current read-only observations; never infer omitted raw arguments from
+a bounded summary. Bootstrap observation that an AGENTS.md/CLAUDE.md/project rule source
+exists is not proof that its body was read.
 Before an instruction-dependent mutation, use the fixed-Project read tools to read any
 applicable instruction source whose content is missing, truncated, stale, or otherwise
 not actually present in the supplied bootstrap/history. After work that may change the
