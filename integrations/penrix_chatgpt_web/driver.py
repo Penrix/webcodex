@@ -32,7 +32,6 @@ PRELOAD = (
     "read_files", "search_and_read", "edit_project_files", "project_validate",
     "review_changes", "finish_coding_task",
 )
-MAY_CHANGE_WORKSPACE = {"edit_project_files", "run_process", "run_shell", "job_write_input"}
 REPLAY_SAFE = {"desired_state", "keyed", "fenced_replay"}
 
 ACTION_SCHEMA = {
@@ -372,15 +371,30 @@ def dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def contract_parts(manifest: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None, str | None]:
+def contract_parts(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None, str | None, str | None, dict[str, Any]]:
     out = manifest.get("output") if isinstance(manifest.get("output"), dict) else {}
     contract = out.get("contract") if isinstance(out.get("contract"), dict) else out
     schema = contract.get("input_schema") or out.get("input_schema")
     effect = contract.get("effect") or out.get("effect")
     idem = contract.get("idempotency") or out.get("idempotency")
-    return (schema if isinstance(schema, dict) else None,
-            effect if isinstance(effect, str) else None,
-            idem if isinstance(idem, str) else None)
+    risk = contract.get("risk") or out.get("risk")
+    annotations = contract.get("annotations") or out.get("annotations")
+    return (
+        schema if isinstance(schema, dict) else None,
+        effect if isinstance(effect, str) else None,
+        idem if isinstance(idem, str) else None,
+        risk if isinstance(risk, str) else None,
+        annotations if isinstance(annotations, dict) else {},
+    )
+
+
+def contract_may_change_workspace(risk: str | None, annotations: dict[str, Any]) -> bool:
+    # Canonical ToolDefinition owns these facts. Project-write tools directly
+    # mutate source state; open-world tools may do so through arbitrary process
+    # behavior, so either invalidates an older closeout snapshot.
+    return risk == "project_write" or annotations.get("openWorldHint") is True
 
 
 def action_parts(action: dict[str, Any]) -> tuple[str, str | None, dict[str, Any] | None, str | None]:
@@ -466,7 +480,7 @@ class Driver:
         manifest = self.contracts.get(tool)
         if manifest is None:
             raise DriverError(f"discover tool contract before call: {tool}")
-        schema, effect, idem = contract_parts(manifest)
+        schema, effect, idem, _, _ = contract_parts(manifest)
         fixed = dict(params)
         if tool == "finish_coding_task" and "summary_only" not in fixed:
             fixed["summary_only"] = True
@@ -485,12 +499,12 @@ class Driver:
         if tool not in self.allowed:
             raise DriverError(f"tool not admitted by driver: {tool}")
         fixed, effect, idem = self.fixed_params(tool, params, session)
+        manifest = self.contracts[tool]
+        _, _, _, risk, annotations = contract_parts(manifest)
         self.fence_job_identities(tool, fixed)
         fingerprint = dump({"tool": tool, "params": fixed})
         mutation = effect == "mutate"
-        workspace_change = tool in MAY_CHANGE_WORKSPACE or (
-            tool not in ALLOWED_TOOLS and mutation
-        )
+        workspace_change = contract_may_change_workspace(risk, annotations)
         if mutation and fingerprint in self.dispatched_mutations and idem not in REPLAY_SAFE:
             raise DriverError(f"refusing repeated non-replay-safe mutation: {tool}")
         if mutation:
