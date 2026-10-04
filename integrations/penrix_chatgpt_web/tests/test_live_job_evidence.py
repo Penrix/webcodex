@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import pathlib
 import sys
 import unittest
@@ -19,6 +20,55 @@ def load_module(name: str, filename: str):
 
 driver = load_module("penrix_web_driver_job_evidence", "driver.py")
 live = load_module("penrix_web_live_job_evidence", "live_acceptance.py")
+
+
+def execute_manifest(*, open_world: bool) -> dict:
+    return {
+        "success": True,
+        "output": {
+            "input_schema": {"type": "object", "properties": {}},
+            "effect": "execute",
+            "idempotency": "non_idempotent",
+            "risk": "job_run",
+            "annotations": {"openWorldHint": open_world},
+        },
+    }
+
+
+class FakeJobWebCodex:
+    def call(self, tool, params, session=None):
+        if tool == "run_process":
+            return {
+                "success": True,
+                "output": {
+                    "execution_state": "pending",
+                    "continuation": {
+                        "arguments": {
+                            "items": [
+                                {
+                                    "job_id": "wc_job_slow",
+                                    "after_observation_token": "token-1",
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        if tool == "observe_jobs":
+            return {
+                "success": True,
+                "output": {
+                    "items": [
+                        {
+                            "job_id": "wc_job_slow",
+                            "status": "completed",
+                            "terminal": True,
+                            "observation_token": "token-2",
+                        }
+                    ]
+                },
+            }
+        raise AssertionError(f"unexpected tool: {tool}")
 
 
 class DriverJobEvidenceTests(unittest.TestCase):
@@ -69,6 +119,38 @@ class DriverJobEvidenceTests(unittest.TestCase):
             },
         }
         self.assertEqual(driver.terminal_job_ids(result), {"wc_job_done"})
+
+    def test_execute_logs_canonical_handoff_and_same_terminal_job(self):
+        log = io.StringIO()
+        instance = driver.Driver(
+            FakeJobWebCodex(),
+            None,
+            "wc_proj_test",
+            allowed={"run_process", "observe_jobs"},
+            log=log,
+        )
+        instance.contracts["run_process"] = execute_manifest(open_world=True)
+        instance.contracts["observe_jobs"] = execute_manifest(open_world=False)
+
+        instance.execute("run_process", {}, "wc_sess_test")
+        instance.execute(
+            "observe_jobs",
+            {"items": [{"job_id": "wc_job_slow"}]},
+            "wc_sess_test",
+        )
+
+        stderr = log.getvalue()
+        self.assertIn(
+            "[penrix-web] job_evidence event=handoff "
+            "tool=run_process job_id=wc_job_slow",
+            stderr,
+        )
+        self.assertIn(
+            "[penrix-web] job_evidence event=terminal_observation "
+            "tool=observe_jobs job_id=wc_job_slow",
+            stderr,
+        )
+        live.require_exact_run_process_job_observation(stderr)
 
 
 class LiveAcceptanceJobEvidenceTests(unittest.TestCase):
