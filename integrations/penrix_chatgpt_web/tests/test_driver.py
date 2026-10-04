@@ -406,6 +406,28 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(result["final"], "done")
 
 
+    def test_execute_calls_are_distinct_logical_invocations(self):
+        state = FakeState()
+        repeated = {
+            "kind": "call",
+            "tool": "run_process",
+            "params": {"executable": "python", "args": ["-V"]},
+            "text": None,
+        }
+        state.relay_actions = [
+            {"kind": "discover", "tool": "run_process", "params": None, "text": None},
+            repeated,
+            repeated,
+            {"kind": "call", "tool": "finish_coding_task", "params": {}, "text": None},
+            {"kind": "final", "tool": None, "params": None, "text": "done"},
+        ]
+        with fake_servers(state) as (relay_url, wc_url):
+            result = self.make_driver(relay_url, wc_url).run("run the same command twice")
+        runs = [req for req in state.webcodex_requests if req["tool"] == "run_process"]
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(result["final"], "done")
+
+
     def test_later_mutation_invalidates_earlier_closeout_evidence(self):
         state = FakeState()
         state.relay_actions = [
