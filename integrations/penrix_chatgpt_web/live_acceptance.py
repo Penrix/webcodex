@@ -119,6 +119,14 @@ def make_repo() -> pathlib.Path:
             "    unittest.main()\n",
             encoding="utf-8",
         )
+        (root / "slow_acceptance.py").write_text(
+            "import subprocess\n"
+            "import sys\n"
+            "import time\n\n"
+            "time.sleep(12)\n"
+            'raise SystemExit(subprocess.call([sys.executable, "-m", "unittest", "-v"]))\n',
+            encoding="utf-8",
+        )
         (root / "README.md").write_text(
             "# Disposable WebCodex live acceptance\n\n"
             "This repository exists only for the Penrix ChatGPT Web -> WebCodex live test.\n",
@@ -413,6 +421,8 @@ def run_driver(
     driver: pathlib.Path,
     env: dict[str, str],
     args: list[str],
+    *,
+    required_stderr_markers: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     try:
         proc = subprocess.run(
@@ -447,6 +457,14 @@ def run_driver(
         raise AcceptanceError(
             "driver did not complete: "
             + json.dumps(result, ensure_ascii=False)[:2000]
+        )
+    missing_markers = [
+        marker for marker in required_stderr_markers if marker not in proc.stderr
+    ]
+    if missing_markers:
+        raise AcceptanceError(
+            "driver completed without required live evidence: "
+            + ", ".join(missing_markers)
         )
     return result
 
@@ -530,12 +548,20 @@ def live_run(
                     "This is a disposable Windows live acceptance repository. "
                     "Read acceptance.py and test_acceptance.py. Change only "
                     "acceptance.py so expected_message() returns exactly "
-                    "WEBCODEX_LIVE_OK. Run python -m unittest -v through canonical "
-                    "WebCodex process execution. Review the actual change, obtain "
-                    "finish_coding_task evidence, and report completion. "
-                    "Do not modify any other file."
+                    "WEBCODEX_LIVE_OK. Run python slow_acceptance.py exactly once through "
+                    "canonical WebCodex run_process, not project_validate. That fixture "
+                    "intentionally exceeds the 10-second sync-first grace; when the same "
+                    "execution is handed off as a Job, observe the exact returned Job with "
+                    "observe_jobs until it is terminal and confirm the unittest succeeded. "
+                    "Do not start another validation execution. Review the actual change, "
+                    "obtain finish_coding_task evidence after the execution, and report "
+                    "completion. Do not modify any other file."
                 ),
             ],
+            required_stderr_markers=(
+                "WebCodex tool: run_process",
+                "WebCodex tool: observe_jobs",
+            ),
         )
         first_diff = verify_local_repo(repo)
         session_ref = first.get("session_ref")
@@ -583,7 +609,8 @@ def live_run(
                 "Windows temporary Git Project",
                 "WebCodex share local Server+Runner+Project",
                 "codex-chatgpt-web browser-only reasoning",
-                "WebCodex read/edit/process validation/finish evidence",
+                "WebCodex read/edit + >10s run_process durable Job handoff",
+                "exact observe_jobs terminal evidence + finish evidence",
                 "local filesystem/test recheck",
                 "fresh driver process exact Session resume",
             ],
