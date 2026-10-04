@@ -111,14 +111,20 @@ def fake_servers(state: FakeState):
                     "wait_for_job_terminal": ("mutate", "keyed"),
                 }.get(name, ("observe", "pure_read"))
                 properties = {}
-                if name not in {
-                    "observe_jobs", "wait_for_job_readiness", "wait_for_job_terminal"
+                if name in {
+                    "read_files", "search_project_texts", "search_and_read",
+                    "edit_project_files", "show_changes", "review_changes", "git_status",
+                    "project_validate", "project_build", "run_process", "list_jobs",
+                    "job_write_input", "finish_coding_task", "session_handoff_summary",
+                    "workspace_hygiene_check",
                 }:
                     properties["project"] = {"type": "string"}
                 if name in {
-                    "read_files", "edit_project_files", "finish_coding_task",
-                    "list_jobs", "review_changes", "project_validate", "project_build",
-                    "run_process", "workspace_hygiene_check", "post_session_message"
+                    "read_files", "search_project_texts", "search_and_read",
+                    "edit_project_files", "show_changes", "review_changes", "git_status",
+                    "project_validate", "project_build", "run_process", "list_jobs",
+                    "finish_coding_task", "session_handoff_summary", "post_session_message",
+                    "workspace_hygiene_check",
                 }:
                     properties["session_id"] = {"type": "string"}
                 out = {
