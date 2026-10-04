@@ -143,7 +143,7 @@ These tests prove driver logic only. They do **not** prove the current Windows W
 
 ## Windows live carrier
 
-Upstream 0.4.4 source is the reviewed baseline, but the latest published WebCodex release is still v0.4.3. The fork therefore does not use the published v0.4.3 Windows installer as acceptance evidence for this path.
+Upstream 0.4.4 source remains the reviewed and pinned baseline for this Provider acceptance. Upstream has since published v0.4.6 (2026-10-03), including additional Windows/runtime fixes, but this PR deliberately does not mix that upgrade into the current Stage A evidence. The exact fork-built 0.4.4 Windows runtime remains the acceptance target for this branch; evaluating/rebasing onto v0.4.6 is a separate follow-up after the Provider loop is proven.
 
 `.github/workflows/penrix-windows-live-candidate.yml` builds the exact PR source on a real `windows-latest` runner, then runs:
 
