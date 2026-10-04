@@ -176,6 +176,12 @@ class LiveAcceptanceJobEvidenceTests(unittest.TestCase):
     def test_exact_same_job_terminal_observation_passes(self):
         live.require_exact_run_process_job_observation(self.stderr())
 
+    def test_acceptance_does_not_invent_job_id_suffix_grammar(self):
+        future_id = "wc_job_future.v2:opaque"
+        live.require_exact_run_process_job_observation(
+            self.stderr(handoff=future_id, terminal=future_id)
+        )
+
     def test_mismatched_terminal_job_is_rejected(self):
         with self.assertRaisesRegex(
             live.AcceptanceError,
