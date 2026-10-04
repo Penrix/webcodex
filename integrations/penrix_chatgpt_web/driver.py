@@ -405,6 +405,29 @@ def terminal_job_ids(value: Any) -> set[str]:
     return found
 
 
+def successful_terminal_job_ids(value: Any) -> set[str]:
+    """Project canonical process success without owning Job lifecycle state."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        job_id = value.get("job_id")
+        exit_code = value.get("exit_code")
+        if (
+            value.get("terminal") is True
+            and value.get("status") == "completed"
+            and type(exit_code) is int
+            and exit_code == 0
+            and isinstance(job_id, str)
+            and job_id.startswith("wc_job_")
+        ):
+            found.add(job_id)
+        for item in value.values():
+            found.update(successful_terminal_job_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(successful_terminal_job_ids(item))
+    return found
+
+
 def contract_parts(
     manifest: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None, str | None, str | None, dict[str, Any]]:
@@ -569,6 +592,11 @@ class Driver:
             for job_id in sorted(terminal_job_ids(result)):
                 self.note(
                     "[penrix-web] job_evidence event=terminal_observation "
+                    f"tool=observe_jobs job_id={job_id}"
+                )
+            for job_id in sorted(successful_terminal_job_ids(result)):
+                self.note(
+                    "[penrix-web] job_evidence event=terminal_success "
                     f"tool=observe_jobs job_id={job_id}"
                 )
         if output.get("execution_state") == "outcome_unknown":
