@@ -371,6 +371,40 @@ def dump(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def job_ids(value: Any) -> set[str]:
+    """Extract canonical Job ids from one WebCodex result without owning their state."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        job_id = value.get("job_id")
+        if isinstance(job_id, str) and job_id.startswith("wc_job_"):
+            found.add(job_id)
+        for item in value.values():
+            found.update(job_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(job_ids(item))
+    return found
+
+
+def terminal_job_ids(value: Any) -> set[str]:
+    """Extract only canonical observations that explicitly report terminal=true."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        job_id = value.get("job_id")
+        if (
+            value.get("terminal") is True
+            and isinstance(job_id, str)
+            and job_id.startswith("wc_job_")
+        ):
+            found.add(job_id)
+        for item in value.values():
+            found.update(terminal_job_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(terminal_job_ids(item))
+    return found
+
+
 def contract_parts(
     manifest: dict[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None, str | None, str | None, dict[str, Any]]:
@@ -525,6 +559,18 @@ class Driver:
         result = self.wc.call(tool, fixed, session)
         self.remember_job_identities(result)
         output = result.get("output") if isinstance(result.get("output"), dict) else {}
+        if result.get("success") is True and tool == "run_process" and output.get("execution_state") == "pending":
+            continuation = output.get("continuation")
+            for job_id in sorted(job_ids(continuation)):
+                self.note(
+                    f"[penrix-web] job_evidence event=handoff tool=run_process job_id={job_id}"
+                )
+        if result.get("success") is True and tool == "observe_jobs":
+            for job_id in sorted(terminal_job_ids(result)):
+                self.note(
+                    "[penrix-web] job_evidence event=terminal_observation "
+                    f"tool=observe_jobs job_id={job_id}"
+                )
         if output.get("execution_state") == "outcome_unknown":
             error_kind = output.get("error_kind")
             job_id = output.get("job_id")
