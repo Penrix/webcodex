@@ -27,11 +27,11 @@ DRIVER_TIMEOUT = 900
 CLEANUP_TIMEOUT = 20
 TOKEN_RE = re.compile(r"^webcodex_[0-9a-f]{64}$")
 JOB_HANDOFF_RE = re.compile(
-    r"^\[penrix-web\] job_evidence event=handoff tool=run_process job_id=(wc_job_[A-Za-z0-9_-]+)$",
+    r"^\[penrix-web\] job_evidence event=handoff tool=run_process job_id=(wc_job_.+)$",
     re.MULTILINE,
 )
 JOB_TERMINAL_RE = re.compile(
-    r"^\[penrix-web\] job_evidence event=terminal_observation tool=observe_jobs job_id=(wc_job_[A-Za-z0-9_-]+)$",
+    r"^\[penrix-web\] job_evidence event=terminal_observation tool=observe_jobs job_id=(wc_job_.+)$",
     re.MULTILINE,
 )
 RUN_PROCESS_TOOL_LINE = "[penrix-web] WebCodex tool: run_process"
