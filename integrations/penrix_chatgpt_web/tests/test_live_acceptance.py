@@ -136,6 +136,28 @@ class LiveAcceptanceTests(unittest.TestCase):
             ):
                 live.run_driver(pathlib.Path("driver.py"), {}, ["--task", "x"])
 
+    def test_driver_requires_requested_live_evidence_markers(self):
+        completed = subprocess.CompletedProcess(
+            ["python", "driver.py"],
+            0,
+            stdout='{"status":"completed"}',
+            stderr="[penrix-web] WebCodex tool: run_process\n",
+        )
+        with mock.patch.object(live.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(
+                live.AcceptanceError,
+                "without required live evidence: WebCodex tool: observe_jobs",
+            ):
+                live.run_driver(
+                    pathlib.Path("driver.py"),
+                    {},
+                    ["--task", "x"],
+                    required_stderr_markers=(
+                        "WebCodex tool: run_process",
+                        "WebCodex tool: observe_jobs",
+                    ),
+                )
+
     def test_primary_blocker_survives_cleanup_failure(self):
         repo = pathlib.Path(tempfile.mkdtemp(prefix="penrix-live-test-"))
         fake_share = object()
