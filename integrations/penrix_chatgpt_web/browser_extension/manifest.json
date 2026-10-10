@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Penrix WebCodex",
+  "version": "0.1.0",
+  "description": "Connect this ChatGPT conversation to an explicitly selected local WebCodex project.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA16A8SDEkgW+B19v4rJMgoKxq1ZeRRSAaQ7lJvFJuLsXfQT/NpWU5/Ijp3yKfinPYZsv5hfjXaInILm2Y5thom7o8CvlPMGV8+ZmFtvpv99diwsQa0oUbrwtWFpknDI3ZeKrhZKycZii79k+DMwjLJZNc/v3Nq3GvNZ8fY2TSWF14f+unElOnrYWnrZE5o+S9HOK4dDPafO/FElTFT/ms/hsZtCrxlRH2ptecHBZAuAHCEdz6uipJzJlwyFwHWpXTPGO26v2Kh5CEgypckHeete86gUxh3HoRancFZvbaVhYrivW3YYjDhBl0l5bs/ovT8ihAGp3D0F285nig8emPawIDAQAB",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1/*", "https://chatgpt.com/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{
+    "matches": ["https://chatgpt.com/*"],
+    "js": ["protocol.js", "content.js"],
+    "run_at": "document_idle"
+  }]
+}
