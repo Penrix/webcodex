@@ -98,6 +98,82 @@ class BrowserEntryTests(unittest.TestCase):
             with self.assertRaises(driver.DriverError):
                 browser_entry.BrowserEntry(None, "different-project", path)
 
+    def test_explicit_transfer_preserves_session_and_persists_new_conversation(self):
+        import browser_entry
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "binding.json"
+            entry = browser_entry.BrowserEntry(None, "project-one", path)
+            entry.state, entry.conversation, entry.session_id = "completed", "chat-one", "wc_sess_saved"
+            entry.final = "old answer"
+            entry.transfer("chat-two")
+            self.assertEqual(entry.session_id, "wc_sess_saved")
+            self.assertEqual(entry.state, "paused")
+            self.assertEqual(entry.final, "")
+            restored = browser_entry.BrowserEntry(None, "project-one", path)
+            self.assertEqual(restored.conversation, "chat-two")
+            self.assertEqual(restored.session_id, "wc_sess_saved")
+            with self.assertRaises(driver.DriverError):
+                entry.check_chat("chat-one")
+
+    def test_transfer_refuses_active_worker_pending_delivery_and_missing_session(self):
+        entry = self.entry()
+        entry.conversation, entry.session_id = "chat-one", "wc_sess_saved"
+        class ActiveWorker:
+            def is_alive(self): return True
+        for state, worker, pending in [("running", None, None), ("paused", ActiveWorker(), None),
+                                       ("paused", None, {"id":"old", "delivery":"claimed"})]:
+            entry.state, entry.worker, entry.pending = state, worker, pending
+            with self.assertRaises(driver.DriverError): entry.transfer("chat-two")
+            self.assertEqual(entry.conversation, "chat-one")
+        entry.state, entry.worker, entry.pending, entry.session_id = "paused", None, None, None
+        with self.assertRaises(driver.DriverError): entry.transfer("chat-two")
+        entry.session_id = "wc_sess_saved"
+        with self.assertRaises(driver.DriverError): entry.transfer("../foreign")
+
+    def test_old_pause_cannot_cross_transfer_admission(self):
+        import browser_entry
+        entry = self.entry()
+        entry.state, entry.conversation, entry.session_id = "completed", "chat-one", "wc_sess_saved"
+        checked, transferred = threading.Event(), threading.Event()
+        original_check = entry.check_chat
+        def held_check(chat):
+            original_check(chat)
+            if chat == "chat-one":
+                checked.set()
+                transferred.wait(.2)
+        entry.check_chat = held_check
+        origin = "chrome-extension://" + "a" * 32
+        server = browser_entry.make_server(entry, origin, ("127.0.0.1", 0))
+        serving = threading.Thread(target=server.serve_forever)
+        serving.start()
+        headers = {"Origin": origin}
+        def post(path, body):
+            req = urllib.request.Request("http://127.0.0.1:" + str(server.server_port) + path,
+                                         data=json.dumps(body).encode(), headers=headers)
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=3) as r:
+                return json.load(r)
+        def move():
+            if not checked.wait(2): return
+            entry.transfer("chat-two")
+            with entry.condition:
+                entry.state = "running"
+                entry.pending = {"id": "new-chat-request", "delivery": "ready"}
+            transferred.set()
+        moving = threading.Thread(target=move)
+        try:
+            headers["Authorization"] = "Bearer " + post("/pair", {})["token"]
+            moving.start()
+            post("/pause", {"conversation": "chat-one"})
+            moving.join(2)
+            self.assertFalse(moving.is_alive())
+            self.assertEqual(entry.conversation, "chat-two")
+            self.assertEqual(entry.state, "running")
+            self.assertEqual(entry.pending["id"], "new-chat-request")
+        finally:
+            transferred.set()
+            if moving.ident: moving.join(2)
+            server.shutdown(); serving.join(2); server.server_close()
+
     def test_http_requires_exact_extension_origin_host_and_pairing_token(self):
         import browser_entry
         entry = self.entry()

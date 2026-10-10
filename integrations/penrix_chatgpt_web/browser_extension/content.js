@@ -6,7 +6,7 @@
   let humanBaseline = new Set();
   const host = document.createElement('div');
   host.id = 'penrix-webcodex-panel';
-  host.setAttribute('data-webcodex-build','20261010-paragraph-lines');
+  host.setAttribute('data-webcodex-build','20261010-explicit-transfer');
   host.style.cssText = 'position:fixed;right:16px;bottom:155px;z-index:2147483645';
   const root = host.attachShadow({mode:'open'});
   const style = document.createElement('style');
@@ -20,6 +20,12 @@
   const connect = button('连接项目', async () => {
     turns(); composer(); humans(); // Validate the current DOM before granting this tab work.
     const s = await rpc('connect'); connectedChat = chat(); humanBaseline = new Set(humans().map(m=>m.id)); render(s);
+  });
+  const transfer = button('转移到本聊天', async () => {
+    turns(); composer(); humans();
+    const s = await rpc('transfer');
+    connectedChat = chat(); inFlight = null;
+    humanBaseline = new Set(humans().map(m=>m.id)); render(s);
   });
   const start = button('开始 / 恢复', async () => {
     if (busy()) throw new Error('请等待当前 ChatGPT 回复完成');
@@ -36,7 +42,7 @@
     await rpc('shutdown'); connectedChat = null; status.textContent = '本地服务已关闭；下次启动后恢复原 Session';
   });
   const toggle = button('WebCodex', async () => {panel.hidden = !panel.hidden;});
-  panel.append(heading,status,task,connect,start,pause,shutdown,result);
+  panel.append(heading,status,task,connect,transfer,start,pause,shutdown,result);
   root.append(style,panel,toggle); document.body.append(host);
 
   function button(text, action) {

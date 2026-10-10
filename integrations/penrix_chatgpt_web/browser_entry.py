@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Same-conversation Chrome transport for the existing canonical Driver."""
+"""Chrome transport with explicit Session transfer for the canonical Driver."""
 from __future__ import annotations
 
 import argparse
@@ -62,7 +62,26 @@ class BrowserEntry:
 
     def check_chat(self, chat):
         if chat != self.conversation:
-            raise driver.DriverError("This request belongs to another connected conversation")
+            raise driver.DriverError("项目已绑定其他聊天；请先停止旧执行，再点击转移到本聊天")
+
+    def transfer(self, chat):
+        if not CHAT_ID.fullmatch(chat or ""):
+            raise driver.DriverError("请在一个已有的 ChatGPT 对话中转移")
+        with self.condition:
+            if (self.state not in {"paused", "completed"} or self.in_tool or self.pending
+                    or (self.worker and self.worker.is_alive())):
+                raise driver.DriverError("请先在旧聊天暂停，并等待当前执行结束后再转移")
+            if not self.session_id:
+                raise driver.DriverError("尚无可续接的 Session；请直接连接项目")
+            previous = self.conversation
+            self.conversation = chat
+            try:
+                self.save_binding()
+            except OSError as exc:
+                self.conversation = previous
+                raise driver.DriverError("无法保存转移绑定；仍保留原聊天") from exc
+            self.state, self.final = "paused", ""
+            self.detail = "已转移到本聊天；点击恢复，先读取原 Session"
 
     def snapshot(self):
         with self.condition:
@@ -244,28 +263,32 @@ def make_server(entry, origin, address=("127.0.0.1", PORT)):
                 if self.path == "/pair":
                     self.send_json(200, {"token": token, "project": entry.project})
                     return
-                if self.path == "/start":
-                    entry.start(chat, body.get("task"))
-                elif self.path == "/status":
-                    if entry.conversation:
+                with entry.condition:
+                    if self.path == "/start":
+                        entry.start(chat, body.get("task"))
+                    elif self.path == "/transfer":
+                        entry.transfer(chat)
+                    elif self.path == "/status":
+                        if entry.conversation:
+                            entry.check_chat(chat)
+                    elif self.path == "/claim":
+                        entry.claim(chat, body.get("id"))
+                    elif self.path == "/reply":
+                        entry.reply(chat, body.get("id"), body.get("text"))
+                    elif self.path == "/pause":
                         entry.check_chat(chat)
-                elif self.path == "/claim":
-                    entry.claim(chat, body.get("id"))
-                elif self.path == "/reply":
-                    entry.reply(chat, body.get("id"), body.get("text"))
-                elif self.path == "/pause":
-                    entry.check_chat(chat)
-                    entry.pause(body.get("reason") or "已暂停；可补充纠正后恢复")
-                elif self.path == "/shutdown":
-                    if entry.conversation:
-                        entry.check_chat(chat)
-                    if entry.worker and entry.worker.is_alive():
-                        raise driver.DriverError("Pause and wait for the current worker before closing the service")
-                    threading.Thread(target=self.server.shutdown, daemon=True).start()
-                else:
-                    self.send_json(404, {"error": "Unknown operation"})
-                    return
-                self.send_json(200, entry.snapshot())
+                        entry.pause(body.get("reason") or "已暂停；可补充纠正后恢复")
+                    elif self.path == "/shutdown":
+                        if entry.conversation:
+                            entry.check_chat(chat)
+                        if entry.worker and entry.worker.is_alive():
+                            raise driver.DriverError("Pause and wait for the current worker before closing the service")
+                        threading.Thread(target=self.server.shutdown, daemon=True).start()
+                    else:
+                        self.send_json(404, {"error": "Unknown operation"})
+                        return
+                    snapshot = entry.snapshot()
+                self.send_json(200, snapshot)
             except (driver.DriverError, ValueError, TypeError) as exc:
                 self.send_json(409, {"error": str(exc)[:1500]})
     return ThreadingHTTPServer(address, Handler)

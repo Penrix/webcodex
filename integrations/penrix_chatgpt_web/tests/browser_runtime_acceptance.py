@@ -4,6 +4,7 @@ import pathlib
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -86,9 +87,44 @@ def main():
         assert corrected['session_id']==session
         assert 'CORRECTED_BY_OWNER' in (repo/'acceptance.py').read_text()
         entry.worker.join(2)
+        moved=rpc('/transfer',{'conversation':'offline-chat-two'})
+        assert moved['session_id']==session and moved['state']=='paused'
+        try:
+            rpc('/status',{})
+            raise RuntimeError('Old conversation retained access after transfer')
+        except urllib.error.HTTPError as exc:
+            assert exc.code==409
+            exc.close()
+        def next_chat(path, body):
+            return rpc(path,{'conversation':'offline-chat-two',**body})
+        next_chat('/start',{'task':'Read acceptance.py on the original Session; make no changes.'})
+        phase=0
+        deadline=time.monotonic()+120
+        while time.monotonic()<deadline:
+            current=next_chat('/status',{})
+            if current['state']=='completed': break
+            if current['state']!='running': raise RuntimeError(current['detail'])
+            request=current['request']
+            if not request:
+                time.sleep(.05);continue
+            if phase==0:
+                assert 'resumed_explicitly' in request['prompt']
+                action=call_action('read_files',{'items':[{'path':'acceptance.py'}]})
+            else:
+                assert 'CORRECTED_BY_OWNER' in request['prompt']
+                action={'kind':'final','tool':None,'params':None,'text':'Transferred original Session read confirmed'}
+            next_chat('/claim',{'id':request['id']})
+            next_chat('/reply',{'id':request['id'],'text':json.dumps({'request_id':request['id'],'action':action})})
+            phase+=1
+        else:
+            raise RuntimeError('Transferred Session acceptance timed out')
+        entry.worker.join(2)
+        assert current['session_id']==session and phase==2
         restored=browser.BrowserEntry(entry.wc,project,binding)
         assert restored.session_id==session and restored.state=='paused'
-        print(json.dumps({'status':'passed','evidence':'real Windows canonical runtime, simulated browser transport, zero ChatGPT sends','session_id':session,'same_session_correction':True,'binding_restart':True,'repository':str(repo)},indent=2))
+        assert restored.conversation=='offline-chat-two'
+        assert 'CORRECTED_BY_OWNER' in (repo/'acceptance.py').read_text()
+        print(json.dumps({'status':'passed','evidence':'real Windows canonical runtime, simulated browser transport, zero ChatGPT sends','session_id':session,'same_session_correction':True,'binding_restart':True,'explicit_conversation_transfer':True,'old_conversation_denied':True,'transferred_session_read':True,'repository':str(repo)},indent=2))
     finally:
         if server: server.shutdown();server.server_close()
         if share: live.stop_share(share)

@@ -6,13 +6,15 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = name => fs.readFileSync(path.join(__dirname,'../browser_extension',name),'utf8');
 
-function worker(store={}, requests=[]) {
+function worker(store={}, requests=[], {rejectTransfer=false,beforeResponse=async()=>{}}={}) {
   let listener;
   const chrome = {runtime:{id:'own-extension',onMessage:{addListener:f=>listener=f}}, storage:{session:{
     get:async()=>store,set:async value=>Object.assign(store,value)
   }}};
   vm.runInNewContext(source('background.js'),{chrome,URL,AbortSignal,fetch:async(url,options)=>{
     requests.push({url,options});
+    await beforeResponse(url);
+    if (rejectTransfer && url.endsWith('/transfer')) return {ok:false,json:async()=>({error:'old execution still active'})};
     return {ok:true,json:async()=>url.endsWith('/pair')?{token:'fixture-credential',project:'one'}:{state:'idle',project:'one'}};
   }});
   return {requests,send:(message,sender)=>new Promise(resolve=>listener({source:'penrix-webcodex',...message},sender,resolve))};
@@ -41,6 +43,42 @@ test('background cannot be used as an arbitrary URL or operation proxy',async()=
   assert.equal(w.requests[0].url,'http://127.0.0.1:17842/status');
   assert.equal(w.requests[0].options.body,JSON.stringify({conversation:'chat-one'}));
   assert.equal(w.requests[0].options.redirect,'error');
+});
+test('explicit transfer switches the bound tab only after the server accepts; old tab loses authority',async()=>{
+  const store={connection:{token:'old',tabId:12,conversation:'chat-one'}};
+  const next={...sender,tab:{id:13},url:'https://chatgpt.com/c/chat-two'};
+  const rejected=worker(store,[],{rejectTransfer:true});
+  assert.equal((await rejected.send({operation:'transfer'},next)).ok,false);
+  assert.equal(store.connection.tabId,12);
+  const admitted=worker(store);
+  assert.equal((await admitted.send({operation:'transfer'},next)).ok,true);
+  assert.equal(store.connection.tabId,13);
+  assert.equal(store.connection.conversation,'chat-two');
+  const before=admitted.requests.length;
+  assert.equal((await admitted.send({operation:'start',task:'stale'},sender)).ok,false);
+  assert.equal(admitted.requests.length,before);
+  assert.equal(admitted.requests[1].url,'http://127.0.0.1:17842/transfer');
+});
+
+test('a delayed old connection response cannot overwrite a newer transfer binding',async()=>{
+  let release, reached;
+  const delayed = new Promise(resolve=>release=resolve);
+  const ready = new Promise(resolve=>reached=resolve);
+  const store={}, requests=[];
+  const w=worker(store,requests,{beforeResponse:async url=>{
+    if(url.endsWith('/status')) {reached();await delayed;}
+  }});
+  const old=w.send({operation:'connect'},sender);
+  await ready;
+  const next={...sender,tab:{id:13},url:'https://chatgpt.com/c/chat-two'};
+  const moved=w.send({operation:'transfer'},next);
+  await new Promise(setImmediate);
+  release();
+  assert.equal((await old).ok,true);
+  assert.equal((await moved).ok,true);
+  assert.equal(store.connection.conversation,'chat-two');
+  assert.equal(store.connection.tabId,13);
+  assert.equal((await w.send({operation:'start',task:'new task'},next)).ok,true);
 });
 
 function panel({blockedAtSend=false,ownerAtSend=false,missingTurns=false,claimed=false,paragraphComposer=false,alteredComposer=false}={}) {
@@ -124,4 +162,11 @@ test('unknown DOM prevents connection; a claimed request after reload is never s
   assert.equal(unknown.calls.length,0);assert.match(unknown.status(),/未识别/);
   const reloaded=panel({claimed:true});await reloaded.click('连接项目');await reloaded.click('开始 / 恢复');await reloaded.tick();
   assert.equal(reloaded.sends,0);assert.match(reloaded.status(),/不能重发/);
+});
+test('transfer requires an explicit panel click and never starts or sends work automatically',async()=>{
+  const p=panel();
+  await p.click('转移到本聊天');await p.tick();
+  assert.equal(p.calls.filter(m=>m.operation==='transfer').length,1);
+  assert.equal(p.calls.filter(m=>m.operation==='start').length,0);
+  assert.equal(p.sends,0);
 });

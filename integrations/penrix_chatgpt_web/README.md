@@ -1,6 +1,6 @@
 # Penrix ChatGPT Web driver
 
-> Status: **Stage A LIVE VERIFIED; everyday conversation entry and cognition continuity pending**
+> Status: **Stage A and same-chat execution/restart LIVE VERIFIED; explicit chat transfer CODE VERIFIED, LIVE UNVERIFIED; cognition continuity pending**
 >
 > Fork-local experiment. This is not an upstream WebCodex product surface and does not change canonical ToolRuntime semantics.
 
@@ -8,7 +8,7 @@
 
 Browser-entry prompts begin with the reserved `[WebCodex controller request:<32 lowercase hex>]` line. They are automated controller evidence, not human originals. Continuity needs the 2026-10-10 admission repair before co-use: skip memory preparation/original receipts for this prefix while retaining the raw provider recording. Its existing mirror then excludes the uncaptured controller and following tool result. Ordinary native human messages still use Memory. Panel-entered tasks remain controller evidence; this adapter does not separately import them as human Memory.
 
-The local Continuity candidate has this repair and 256 passing offline tests; its two installed source files were updated with backup, but extension Reload and affected ChatGPT-page refresh are pending. Real co-use is **CODE VERIFIED, LIVE UNVERIFIED**. This does not implement Luna/OAuth/embedding migration, memory quality acceptance or cognition rollover. Do not use the older installed MAIN script as evidence that this boundary is active.
+The local Continuity candidate has this repair and 256 passing offline tests; its two installed source files were updated with backup, the owner reported Reload. Real controller Memory exclusion and Recorder co-use remain is **CODE VERIFIED, LIVE UNVERIFIED**. This does not implement Luna/OAuth/embedding migration, memory quality acceptance or cognition rollover. Do not use the older installed MAIN script as evidence that this boundary is active.
 
 This integration tests the shortest path from the already-proven `codex-chatgpt-web` browser transport into current WebCodex without making Codex model quota, DSH, or ChatGPT Full MCP a hard dependency.
 
@@ -201,7 +201,7 @@ Stage A passed on 2026-10-09 through the successful initial coding loop and subs
 
 ## Same-conversation Chrome entry (candidate)
 
-This entry uses the ChatGPT page already open in Chrome and the local canonical WebCodex runtime. It does not need Codex Web GPT, official Plus MCP, or **Install into Codex**. Continuity remains a separate follow-up. Browser installation and real same-chat acceptance are still pending; the local Windows runtime fixture and offline tests do not establish Chrome usability.
+This entry uses the ChatGPT page already open in Chrome and the local canonical WebCodex runtime. It does not need Codex Web GPT, official Plus MCP, or **Install into Codex**. Continuity remains a separate follow-up. Real same-chat read/edit/test/result return and service-restart correction passed on a disposable project. Explicit chat transfer has canonical Windows runtime and simulated-browser proof; its real Chrome activation and acceptance remain pending.
 
 The candidate root contains `Start-WebCodex.cmd`, `Start-WebCodex.ps1`, the three reviewed 0.4.4 executables and `integrations/penrix_chatgpt_web/browser_extension`. Windows requires Git and Python 3.12 or newer on PATH.
 
@@ -209,7 +209,8 @@ The candidate root contains `Start-WebCodex.cmd`, `Start-WebCodex.ps1`, the thre
 2. Double-click `Start-WebCodex.cmd` and select the local Git project you authorize. Startup reports success only after the local entry announces readiness. Logs live under `~/.codex/webcodex-browser-logs`.
 3. Open or refresh an existing `https://chatgpt.com/c/<id>` conversation. Click **WebCodex → 连接项目**. Enter the task in the panel, or leave it empty to use your last native chat message; click **开始 / 恢复**.
 4. Use **暂停** before changing direction. Supply a correction in the panel and click **开始 / 恢复** after the current reply finishes. A new native user message during work also pauses the loop. Resume reads the same saved canonical Session; it does not replay an old proposal.
-5. **关闭本地服务** stops the browser entry and its Server/Runner after the worker has stopped. Canonical state and the exact Project/Session/conversation pointer remain under `~/.codex/webcodex-browser-state`. A project already bound to one conversation cannot silently move to another.
+5. To continue in another existing conversation, pause the old execution and wait for its reply/worker to finish. In the destination chat click **转移到本聊天**. This retains the exact Session, revokes the old tab binding and stays paused. Supply the next instruction and click **开始 / 恢复** to read the canonical handoff before continuing. Transfer refuses active work or pending delivery; it never starts or sends by itself.
+6. **关闭本地服务** stops the browser entry and its Server/Runner after the worker has stopped. Canonical state and the exact Project/Session/conversation pointer remain under `~/.codex/webcodex-browser-state`. A project already bound to one conversation cannot silently move to another.
 
 For an explicit project, the PowerShell launcher supports `-ProjectDir "C:\path\to\repo"`. Agent-initiated real acceptance must also pass `-RealTest`; this wraps the actual request through completed reply validation in the existing account-wide 30-second gate. Never use normal mode to bypass acceptance cadence.
 
