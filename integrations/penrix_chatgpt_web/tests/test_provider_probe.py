@@ -120,7 +120,7 @@ class ProviderProbeTests(unittest.TestCase):
         try:
             probe.JsonClient = lambda timeout: FakeClient()
             probe.relay_health = lambda client, base: {
-                "version": "6.1.3",
+                "version": "6.1.7",
                 "mode": "browser-only",
             }
             probe.run_one = fake_run_one

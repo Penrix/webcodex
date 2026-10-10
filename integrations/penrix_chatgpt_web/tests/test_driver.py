@@ -267,8 +267,8 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(result["final"], "done")
         self.assertEqual(result["session_id"], "wc_sess_test")
         self.assertEqual(len(state.relay_requests), 5)
-        self.assertEqual(state.relay_requests[0]["text"]["format"]["type"], "json_schema")
-        self.assertIs(state.relay_requests[0]["text"]["format"]["strict"], False)
+        self.assertEqual(state.relay_requests[0]["text"]["format"]["type"], "text")
+        self.assertEqual(state.relay_requests[0]["text"]["format"], {"type": "text"})
         first_input = state.relay_requests[0]["input"]
         self.assertEqual(first_input[0]["role"], "user")
         self.assertEqual(first_input[0]["content"][0]["text"], "change one thing")
@@ -322,6 +322,45 @@ class DriverTests(unittest.TestCase):
             },
         )
 
+    def test_transport_escapes_are_not_replayed_as_assistant_action_content(self):
+        state = FakeState()
+        action = {"kind": "call", "tool": "read_files", "params": {"paths": ["acceptance.py"]}, "text": None}
+        envelope = response_body(action)
+        raw = json.dumps(action).replace("read_files", "read\\_files").replace('["acceptance.py"]', '\\["acceptance.py"\\]')
+        envelope["output"][1]["content"][0]["text"] = raw
+        state.relay_response_override = envelope
+        state.relay_actions = [{"kind": "final", "tool": None, "params": None, "text": "done"}]
+        with fake_servers(state) as (relay_url, wc_url):
+            controller = self.make_driver(relay_url, wc_url)
+            original_next = controller.web.next
+            def next_with_first_observed_transport(*args):
+                result = original_next(*args)
+                state.relay_response_override = None
+                return result
+            controller.web.next = next_with_first_observed_transport
+            result = controller.run("read the file")
+        self.assertEqual(result["final"], "done")
+        prior = [item for item in state.relay_requests[1]["input"] if item["role"] == "assistant"]
+        self.assertEqual(len(prior), 1)
+        self.assertEqual(json.loads(prior[0]["content"][0]["text"]), action)
+        self.assertEqual(sum(req["tool"] == "read_files" for req in state.webcodex_requests), 1)
+
+    def test_one_json_code_block_preserves_literal_file_and_path_bytes(self):
+        action = {"kind": "call", "tool": "edit_project_files", "params": {"path": "C:\\_keep\\[x]", "content": "literal \\_ and \\n"}, "text": None}
+        raw = "```json\n" + json.dumps(action) + "\n```"
+        self.assertEqual(driver.parse_web_action_json(raw), action)
+
+    def test_code_block_with_prose_or_multiple_values_is_rejected(self):
+        for raw in (
+            'Before\n```json\n{"kind":"final"}\n```',
+            '```json\n{"kind":"final"}\n```\nAfter',
+            '```json\n{"kind":"final"} {"kind":"call"}\n```',
+            '```json\n{"kind":"final"}\n```\n```json\n{}\n```',
+            '```json\n{"text":"bad\\_escape"}\n```',
+        ):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                driver.parse_web_action_json(raw)
+
     def test_bracket_escapes_inside_json_strings_remain_invalid(self):
         with self.assertRaises(ValueError):
             driver.parse_web_action_json(
@@ -372,7 +411,7 @@ class DriverTests(unittest.TestCase):
         self.assertIn("chars=8", str(raised.exception))
         self.assertIn("not-json", str(raised.exception))
         self.assertEqual(len(state.relay_requests), 1)
-        self.assertIs(state.relay_requests[0]["text"]["format"]["strict"], False)
+        self.assertEqual(state.relay_requests[0]["text"]["format"], {"type": "text"})
         self.assertFalse(any(
             req["tool"] not in {"work_on_project", "tool_manifest"}
             for req in state.webcodex_requests

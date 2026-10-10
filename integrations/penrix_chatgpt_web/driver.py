@@ -54,7 +54,10 @@ that an effect occurred.
 
 You have no direct local bridge in this ChatGPT response. Local facts/effects are real
 only when an exact WebCodex result appears later in the history. Return exactly one
-JSON object matching the strict schema:
+JSON object inside one fenced ```json code block, with no surrounding prose.
+The Web transport serializes HTML as Markdown; a code block preserves literal
+JSON escapes and file content. Do not Markdown-escape underscores or brackets
+inside the code block. The object must match the strict schema:
 - discover: request the current contract for one admitted tool before first use;
 - call: propose one admitted tool call using its supplied contract;
 - final: answer only when no more local evidence/effect is needed.
@@ -68,7 +71,7 @@ applicable instruction source whose content is missing, truncated, stale, or oth
 not actually present in the supplied bootstrap/history. After work that may change the
 Project workspace, finish_coding_task must settle after the latest such change before
 finalization.
-"""
+""" + "\nAction schema (output-format data):\n" + json.dumps(ACTION_SCHEMA)
 
 
 def undo_turndown_json_escapes(text: str) -> str:
@@ -122,6 +125,16 @@ def undo_turndown_json_escapes(text: str) -> str:
 
 
 def parse_web_action_json(text: str) -> dict[str, Any]:
+    fenced = text.strip()
+    if fenced.startswith("```"):
+        lines = fenced.splitlines()
+        if len(lines) < 3 or lines[0] not in {"```json", "```"} or lines[-1] != "```":
+            raise ValueError("Expected exactly one JSON code block")
+        # Code is a literal transport. Never repair bytes inside it.
+        value = json.loads("\n".join(lines[1:-1]))
+        if not isinstance(value, dict):
+            raise ValueError("JSON value was not an object")
+        return value
     try:
         value = json.loads(text)
     except ValueError as first_error:
@@ -302,7 +315,7 @@ class WebModel:
             "reasoning": {"effort": self.effort},
             "text": {
                 "verbosity": "low",
-                "format": {"type": "json_schema", "name": "webcodex_action", "strict": False, "schema": ACTION_SCHEMA},
+                "format": {"type": "text"},
             },
         })
         if not isinstance(body, dict):
@@ -652,9 +665,10 @@ class Driver:
 
         for round_no in range(1, self.max_rounds + 1):
             self.note(f"[penrix-web] ChatGPT Web round {round_no}/{self.max_rounds}")
-            action, raw, current = self.web.next(history, next_prompt)
+            action, _raw, current = self.web.next(history, next_prompt)
             history.append(current)
-            history.append(msg("assistant", raw))
+            # Replay the parsed action, not presentation escapes added by the Web transport.
+            history.append(msg("assistant", dump(action)))
             next_prompt = (
                 "Continue the same external-driver task. Use the authoritative WebCodex "
                 "results and contracts above, then choose exactly one next JSON action."

@@ -22,6 +22,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile driver sources
-        run: python -m py_compile integrations/penrix_chatgpt_web/driver.py integrations/penrix_chatgpt_web/live_acceptance.py integrations/penrix_chatgpt_web/provider_probe.py integrations/penrix_chatgpt_web/tests/test_driver.py integrations/penrix_chatgpt_web/tests/test_live_acceptance.py integrations/penrix_chatgpt_web/tests/test_provider_probe.py
+        run: python -m compileall -q integrations/penrix_chatgpt_web
       - name: Run driver contract tests
         run: python -m unittest discover -s integrations/penrix_chatgpt_web/tests -p "test_*.py" -v
+      - name: Check browser extension protocol and send boundaries
+        run: |
+          node --check integrations/penrix_chatgpt_web/browser_extension/background.js
+          node --check integrations/penrix_chatgpt_web/browser_extension/content.js
+          node --test integrations/penrix_chatgpt_web/tests/browser_protocol.test.cjs integrations/penrix_chatgpt_web/tests/browser_extension.test.cjs

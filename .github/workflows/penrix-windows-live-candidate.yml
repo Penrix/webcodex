@@ -87,7 +87,12 @@ jobs:
           Copy-Item target\dogfood\webcodex-runner.exe $stage
           Copy-Item integrations\penrix_chatgpt_web\driver.py (Join-Path $stage "integrations\penrix_chatgpt_web")
           Copy-Item integrations\penrix_chatgpt_web\live_acceptance.py (Join-Path $stage "integrations\penrix_chatgpt_web")
+          Copy-Item integrations\penrix_chatgpt_web\real_test_driver.py (Join-Path $stage "integrations\penrix_chatgpt_web")
+          Copy-Item integrations\penrix_chatgpt_web\browser_entry.py (Join-Path $stage "integrations\penrix_chatgpt_web")
+          Copy-Item integrations\penrix_chatgpt_web\browser_extension (Join-Path $stage "integrations\penrix_chatgpt_web") -Recurse
           Copy-Item integrations\penrix_chatgpt_web\README.md (Join-Path $stage "integrations\penrix_chatgpt_web")
+          Copy-Item integrations\penrix_chatgpt_web\Start-WebCodex.ps1 $stage
+          Copy-Item integrations\penrix_chatgpt_web\Start-WebCodex.cmd $stage
           @(
             "source_sha=$((git rev-parse HEAD).Trim())"
             "source_short=$((git rev-parse --short=12 HEAD).Trim())"

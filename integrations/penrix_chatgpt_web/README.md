@@ -1,8 +1,14 @@
 # Penrix ChatGPT Web driver
 
-> Status: **CODE VERIFIED, LIVE UNVERIFIED**
+> Status: **Stage A LIVE VERIFIED; everyday conversation entry and cognition continuity pending**
 >
 > Fork-local experiment. This is not an upstream WebCodex product surface and does not change canonical ToolRuntime semantics.
+
+### Co-use with ChatGPT Continuity
+
+Browser-entry prompts begin with the reserved `[WebCodex controller request:<32 lowercase hex>]` line. They are automated controller evidence, not human originals. Continuity needs the 2026-10-10 admission repair before co-use: skip memory preparation/original receipts for this prefix while retaining the raw provider recording. Its existing mirror then excludes the uncaptured controller and following tool result. Ordinary native human messages still use Memory. Panel-entered tasks remain controller evidence; this adapter does not separately import them as human Memory.
+
+The local Continuity candidate has this repair and 256 passing offline tests; its two installed source files were updated with backup, but extension Reload and affected ChatGPT-page refresh are pending. Real co-use is **CODE VERIFIED, LIVE UNVERIFIED**. This does not implement Luna/OAuth/embedding migration, memory quality acceptance or cognition rollover. Do not use the older installed MAIN script as evidence that this boundary is active.
 
 This integration tests the shortest path from the already-proven `codex-chatgpt-web` browser transport into current WebCodex without making Codex model quota, DSH, or ChatGPT Full MCP a hard dependency.
 
@@ -71,6 +77,12 @@ The driver intentionally has no automatic retry loop.
 - current `codex-chatgpt-web` relay reachable through its Responses endpoint (default `http://127.0.0.1:17841/v1`) and configured for the browser-only path used by this experiment; no native Codex model-catalog credential is part of this path
 - an authenticated ChatGPT Web browser owned by that relay
 
+The launcher's **Install into Codex** step is not a requirement for this Driver. It registers Web models and routing for Codex itself; this integration calls the relay's Responses endpoint directly. Keep the owner's existing Codex route. The browser-owning launcher and Responses service must run during browser inference, but WebCodex's own Server/Runner do not depend on Codex model registration.
+
+The current Windows acceptance/probe target is exactly relay **6.1.7**, browser-only, with `chatgpt-web/gpt-5.6-sol`. Its supported standalone `serve` entry starts the Responses service without invoking Codex setup. An installed launcher version alone does not prove that the service is running; check `/healthz` and the actual version. Do not replace Codex routing to work around stale integration records.
+
+On Codex CLI 0.160.1 for Windows, run the local `Start-Process` launch and URL health check as separate tool commands. Combining them can trigger its built-in URL-launch heuristic and produce `blocked by policy` even with full access. Split the two operations; do not disable approvals or protections to resolve this classification problem.
+
 The driver reads the WebCodex bearer credential only from `WEBCODEX_TOKEN`; do not put it in command-line arguments or repository files.
 
 ## Example
@@ -111,7 +123,7 @@ Consequences for this first slice:
 
 Deterministic stdlib fake-server tests cover:
 
-- JSON-schema-guided Responses request construction with provider `strict=false`, while the driver still strictly parses and validates the returned JSON action;
+- text-format Responses requests with a schema-guided literal JSON code block, while the driver strictly parses and validates the returned action;
 - current relay thread/turn identity and current-user turn provenance;
 - positive Responses completion evidence (`status=completed` + `end_turn=true`) before any action is accepted;
 - fixed Project + exact Workflow Session injection;
@@ -139,9 +151,13 @@ python -m unittest discover -s integrations/penrix_chatgpt_web/tests -v
 
 The fork also carries `.github/workflows/penrix-chatgpt-web-driver.yml`, a Windows-only five-minute contract lane that compiles the driver/test sources and runs exactly this suite when the integration changes.
 
-These tests prove driver logic only. They do **not** prove the current Windows WebCodex build, the local `codex-chatgpt-web` launcher/login, a real ChatGPT Web browser turn under this provider boundary, or a real edit/Job round-trip. Those remain **LIVE UNVERIFIED** until exercised on the target Windows machine.
+These tests alone prove driver logic. Separate owner-machine acceptance on 2026-10-09 verified actual browser reasoning, Windows edits, long Job success, review/closeout and exact Session recovery after Server/Runner/Driver restart. See the [target acceptance record](../../docs/acceptance/penrix-windows-2026-10-09.md). The everyday conversation entry and cognition continuity remain unverified.
 
 ## Windows live carrier
+
+Real ChatGPT test sends use the acceptance-only `real_test_driver.py`, not the ordinary production Driver entry. It shares the existing Continuity operator file `~/.codex/chatgpt-continuity-real-test-gate.json` and its exclusive-create `.lock`. Unknown last-send time waits at least 30 seconds; each validated completed reply is followed by at least 30 seconds before another test request. Longer recorded cooldowns are preserved. The lock covers the request and exact response validation, including fresh-process Session resume. A limit, challenge, transport failure, incomplete response, malformed action or process interruption stops testing; the shared stop is never automatically cleared. Other account test senders must use this same operator gate; ordinary/manual sends are not intercepted by it. Do not reset a stop without reconciling the actual browser outcome.
+
+The carrier now retains both the disposable workspace **and** its canonical WebCodex state on failure. A fresh Session/Job recovery investigation must use that retained state; deleting it while retaining only source files would destroy the evidence. Ordinary `driver.py` has no test cooldown.
 
 Upstream 0.4.4 source remains the reviewed and pinned baseline for this Provider acceptance. Upstream has since published v0.4.6 (2026-10-03), including additional Windows/runtime fixes, but this PR deliberately does not mix that upgrade into the current Stage A evidence. The exact fork-built 0.4.4 Windows runtime remains the acceptance target for this branch; evaluating/rebasing onto v0.4.6 is a separate follow-up after the Provider loop is proven.
 
@@ -162,7 +178,7 @@ python integrations\penrix_chatgpt_web\live_acceptance.py --webcodex-bin-dir .
 The carrier:
 
 - refuses WebCodex versions other than 0.4.4;
-- proves the configured `chatgpt-web/gpt-5.6-sol` route by completing real browser-only Responses turns under the non-strict provider / strict driver boundary; it does not call `/v1/models`, because that catalog endpoint is a native-Codex passthrough requiring Codex Bearer auth;
+- proves the configured `chatgpt-web/gpt-5.6-sol` route by completing real browser-only Responses turns under the literal text transport / strict driver boundary; it does not call `/v1/models`, because that catalog endpoint is a native-Codex passthrough requiring Codex Bearer auth;
 - creates a disposable temporary Git project instead of touching a real repository;
 - starts local WebCodex Server + Runner + Project through upstream `share`;
 - never reads WebCodex secret files or prints the temporary credential;
@@ -181,4 +197,34 @@ A failure stops at the first blocker and retains the temporary repository for di
 
 Use the Windows live carrier above. Its target-machine flow exercises the same acceptance sequence in one disposable project: real Server/Runner bootstrap, real ChatGPT Web browser-only reasoning, read/edit/process validation, `finish_coding_task` evidence, local result recheck, and fresh-process exact Session resume.
 
-Only after that should this path be promoted beyond **CODE VERIFIED, LIVE UNVERIFIED**.
+Stage A passed on 2026-10-09 through the successful initial coding loop and subsequent retained recovery after repairing the carrier's Git-status parsing. The original carrier invocation failed locally before recovery; it was not rerun to repeat successful effects. This acceptance does not establish integration with the owner's existing conversation or cognition.
+
+## Same-conversation Chrome entry (candidate)
+
+This entry uses the ChatGPT page already open in Chrome and the local canonical WebCodex runtime. It does not need Codex Web GPT, official Plus MCP, or **Install into Codex**. Continuity remains a separate follow-up. Browser installation and real same-chat acceptance are still pending; the local Windows runtime fixture and offline tests do not establish Chrome usability.
+
+The candidate root contains `Start-WebCodex.cmd`, `Start-WebCodex.ps1`, the three reviewed 0.4.4 executables and `integrations/penrix_chatgpt_web/browser_extension`. Windows requires Git and Python 3.12 or newer on PATH.
+
+1. In Chrome's normal **Extensions → Developer mode → Load unpacked** flow, select the candidate's `integrations/penrix_chatgpt_web/browser_extension` directory. This is a one-time local extension installation. No login migration or Codex configuration change is needed.
+2. Double-click `Start-WebCodex.cmd` and select the local Git project you authorize. Startup reports success only after the local entry announces readiness. Logs live under `~/.codex/webcodex-browser-logs`.
+3. Open or refresh an existing `https://chatgpt.com/c/<id>` conversation. Click **WebCodex → 连接项目**. Enter the task in the panel, or leave it empty to use your last native chat message; click **开始 / 恢复**.
+4. Use **暂停** before changing direction. Supply a correction in the panel and click **开始 / 恢复** after the current reply finishes. A new native user message during work also pauses the loop. Resume reads the same saved canonical Session; it does not replay an old proposal.
+5. **关闭本地服务** stops the browser entry and its Server/Runner after the worker has stopped. Canonical state and the exact Project/Session/conversation pointer remain under `~/.codex/webcodex-browser-state`. A project already bound to one conversation cannot silently move to another.
+
+For an explicit project, the PowerShell launcher supports `-ProjectDir "C:\path\to\repo"`. Agent-initiated real acceptance must also pass `-RealTest`; this wraps the actual request through completed reply validation in the existing account-wide 30-second gate. Never use normal mode to bypass acceptance cadence.
+
+The extension's background owns the local credential and admits only its own top-level ChatGPT sender and bound tab. The loopback service admits only the stable extension Origin and exact Host, then checks its bearer. Message IDs must be unique, replies complete and newly observed, and the envelope must match the claimed request. Reload, timeout, ambiguous delivery or a blocking page stops execution without resending. Page-shape mismatches stop before claiming a request.
+
+The native DOM hooks were inspected on the owner's page and exercised in real Chrome on 2026-10-10. Fixed-Origin pairing, unique matching completed replies, a fenced file edit, one long-running test Job and result return passed on the disposable project. The observed ProseMirror editor uses one paragraph per logical line; the send check reconstructs those exact lines rather than comparing paragraph-spacing `innerText`. Empty lines and indentation remain significant. See [current acceptance evidence](../../docs/acceptance/penrix-browser-entry-2026-10-10.md) for exact recovery, correction and unverified boundaries. No other ChatGPT extension is a declared dependency.
+
+Offline browser checks:
+
+```text
+node --test integrations/penrix_chatgpt_web/tests/browser_protocol.test.cjs integrations/penrix_chatgpt_web/tests/browser_extension.test.cjs
+```
+
+The Node DOM/API simulations prove local admission decisions only. The real Server/Runner transport fixture, which sends no ChatGPT messages, is `tests/browser_runtime_acceptance.py <candidate-root>`.
+
+### Literal action transport
+
+Relay 6.1.7 serializes browser HTML as Markdown. The Driver requests text output containing exactly one fenced JSON object, with the action schema supplied as format data. The code block protects source/path backslashes from prose Markdown escaping. Fenced JSON is parsed literally, without escape repair, and all existing action, Project, Session, Job and tool admission checks remain authoritative. Additional prose or multiple JSON values fail before dispatch. Older observed raw JSON responses retain the narrowly proven single-escape compatibility parser; double-escaped malformed proposals remain rejected. Assistant history replays canonical parsed JSON, never the transport's presentation escapes.

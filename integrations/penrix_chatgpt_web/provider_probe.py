@@ -15,8 +15,11 @@ import urllib.request
 import uuid
 from typing import Any, Callable
 
+from driver import DriverError
+from real_test_driver import RealTestGate
+
 MAX_BODY = 4 * 1024 * 1024
-EXPECTED_RELAY_VERSION = "6.1.3"
+EXPECTED_RELAY_VERSION = "6.1.7"
 EXPECTED_RELAY_MODE = "browser-only"
 DEFAULT_RELAY_URL = "http://127.0.0.1:17841/v1"
 DEFAULT_MODEL = "chatgpt-web/gpt-5.6-sol"
@@ -436,9 +439,13 @@ def run_one(
         schema_name=f"penrix_{name}",
         schema=schema,
     )
-    status, body = client.post(base + "/responses", request)
-    action = require_json_action(name, status, body)
-    validator(action)
+    def completed_probe():
+        status, body = client.post(base + "/responses", request)
+        action = require_json_action(name, status, body)
+        validator(action)
+        return body, action
+
+    body, action = RealTestGate().run(completed_probe)
     print(f"[provider-probe] {name}: PASS", file=sys.stderr, flush=True)
     return {
         "name": name,
@@ -555,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    except ProbeError as exc:
+    except (ProbeError, DriverError, OSError, ValueError) as exc:
         print(
             json.dumps({"status": "blocked", "error": str(exc)}, ensure_ascii=False, indent=2),
             file=sys.stderr,

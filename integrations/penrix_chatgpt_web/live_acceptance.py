@@ -23,7 +23,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 READY_TIMEOUT = 75
-DRIVER_TIMEOUT = 900
+# The real-test carrier now preserves a 30s cooldown after every completed reply.
+DRIVER_TIMEOUT = 3600
 CLEANUP_TIMEOUT = 20
 TOKEN_RE = re.compile(r"^webcodex_[0-9a-f]{64}$")
 JOB_HANDOFF_RE = re.compile(
@@ -40,7 +41,7 @@ JOB_SUCCESS_RE = re.compile(
 )
 RUN_PROCESS_TOOL_LINE = "[penrix-web] WebCodex tool: run_process"
 EXPECTED_WEBCODEX_VERSION = "0.4.4"
-EXPECTED_RELAY_VERSION = "6.1.3"
+EXPECTED_RELAY_VERSION = "6.1.7"
 EXPECTED_RELAY_MODE = "browser-only"
 EXPECTED_WEB_MODEL = "chatgpt-web/gpt-5.6-sol"
 
@@ -111,7 +112,7 @@ def run_checked(args: list[str], cwd: pathlib.Path) -> str:
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
         raise AcceptanceError(f"command failed: {args[0]}: {detail}")
-    return completed.stdout.strip()
+    return completed.stdout
 
 
 def make_repo() -> pathlib.Path:
@@ -185,6 +186,7 @@ def start_share(
     webcodex: pathlib.Path,
     repo: pathlib.Path,
     probe_only: bool,
+    state_dir: pathlib.Path | None = None,
 ) -> tuple[subprocess.Popen[str], dict[str, Any], list[str]]:
     env = os.environ.copy()
     env["PATH"] = str(webcodex.parent) + os.pathsep + env.get("PATH", "")
@@ -196,7 +198,7 @@ def start_share(
         "--json",
         "--stop-on-stdin-eof",
         "--state-dir",
-        str(state_dir_for(repo)),
+        str(state_dir if state_dir is not None else state_dir_for(repo)),
     ]
     if probe_only:
         cmd.append("--no-copy-url")
@@ -467,7 +469,7 @@ def run_driver(
 ) -> dict[str, Any]:
     try:
         proc = subprocess.run(
-            [sys.executable, str(driver), *args],
+            [sys.executable, str(driver.with_name("real_test_driver.py")), *args],
             env=env,
             check=False,
             text=True,
@@ -537,7 +539,7 @@ def live_run(
     share: subprocess.Popen[str] | None = None
     success = False
     try:
-        version = run_checked([str(webcodex), "--version"], repo)
+        version = run_checked([str(webcodex), "--version"], repo).strip()
         if f" {EXPECTED_WEBCODEX_VERSION} " not in f" {version} ":
             raise AcceptanceError(
                 f"live acceptance requires WebCodex {EXPECTED_WEBCODEX_VERSION}; "
@@ -667,8 +669,8 @@ def live_run(
                 stop_share(share)
             except Exception as exc:
                 cleanup_error = exc
-        remove_state_dir(repo)
         if success and cleanup_error is None:
+            remove_state_dir(repo)
             shutil.rmtree(repo, ignore_errors=True)
         else:
             print(
@@ -690,7 +692,7 @@ def share_probe(webcodex: pathlib.Path) -> dict[str, Any]:
     share: subprocess.Popen[str] | None = None
     success = False
     try:
-        version = run_checked([str(webcodex), "--version"], repo)
+        version = run_checked([str(webcodex), "--version"], repo).strip()
         if f" {EXPECTED_WEBCODEX_VERSION} " not in f" {version} ":
             raise AcceptanceError(
                 f"share probe requires WebCodex {EXPECTED_WEBCODEX_VERSION}; "
@@ -718,8 +720,8 @@ def share_probe(webcodex: pathlib.Path) -> dict[str, Any]:
                 stop_share(share)
             except Exception as exc:
                 cleanup_error = exc
-        remove_state_dir(repo)
         if success and cleanup_error is None:
+            remove_state_dir(repo)
             shutil.rmtree(repo, ignore_errors=True)
         else:
             print(
@@ -792,9 +794,9 @@ def main(argv: list[str] | None = None) -> int:
             raise AcceptanceError("Git for Windows is required")
         webcodex = find_webcodex(ns.webcodex_bin_dir)
         driver = pathlib.Path(__file__).with_name("driver.py").resolve()
-        if not driver.is_file():
+        if not driver.is_file() or not driver.with_name("real_test_driver.py").is_file():
             raise AcceptanceError(
-                f"driver.py not found beside live_acceptance.py: {driver}"
+                f"driver.py and real_test_driver.py are required beside live_acceptance.py: {driver.parent}"
             )
         result = (
             share_probe(webcodex)

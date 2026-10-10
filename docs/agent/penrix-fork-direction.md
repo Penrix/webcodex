@@ -1,5 +1,9 @@
 # Penrix fork direction — current boundary after upstream 0.4.4
 
+**2026-10-09 owner update:** Read [product context and takeover](penrix-product-context.md) and the linked complete owner handover first. The runtime ownership below remains relevant. Sections 5–6 record an earlier DVR exploration; the accepted current ownership is ChatGPT Continuity Recorder/OpenViking, not a second fork-owned recorder/memory system. A separate planner loop is Stage A evidence, not the owner's final working-conversation entry.
+
+**2026-10-10 execution update:** The existing-conversation Chrome entry now has real Windows read/edit/test/result-return, exact process-restart Session recovery and subsequent correction evidence on a disposable project. It runs the canonical WebCodex Server/Runner without requiring Codex Web GPT or installation into Codex. A real ProseMirror paragraph mismatch was fixed and activated. Cross-chat transfer/cognition, full daily usability and live Continuity integration remain distinct and unaccepted. [Current evidence and limitations](../acceptance/penrix-browser-entry-2026-10-10.md) supersede earlier pending status.
+
 > Status: fork-local Working direction
 >
 > Current review date: 2026-10-01

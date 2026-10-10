@@ -51,13 +51,29 @@ class FakeOpener:
 
 
 class LiveAcceptanceTests(unittest.TestCase):
-    def test_relay_health_requires_exact_6_1_3_browser_only_contract(self):
+    def test_real_git_porcelain_columns_survive_local_verification(self):
+        temporary = tempfile.TemporaryDirectory(prefix="penrix-webcodex-live-")
+        self.addCleanup(temporary.cleanup)
+        with mock.patch.object(live.tempfile, "mkdtemp", return_value=temporary.name):
+            repo = live.make_repo()
+        (repo / "acceptance.py").write_text('def expected_message():\n    return "WEBCODEX_LIVE_OK"\n', encoding="utf-8")
+        status = live.run_checked(["git", "status", "--porcelain"], repo)
+        self.assertEqual(status.splitlines(), [" M acceptance.py"])
+        self.assertIn("WEBCODEX_LIVE_OK", live.verify_local_repo(repo))
+
+    def test_live_carrier_uses_paced_test_entry_not_unpaced_production_driver(self):
+        completed = subprocess.CompletedProcess([], 0, stdout='{"status":"completed"}', stderr="")
+        with mock.patch.object(live.subprocess, "run", return_value=completed) as run:
+            live.run_driver(ROOT / "driver.py", {}, ["--task", "x"])
+        self.assertEqual(pathlib.Path(run.call_args.args[0][1]).name, "real_test_driver.py")
+
+    def test_relay_health_requires_exact_6_1_7_browser_only_contract(self):
         opener = FakeOpener(
             FakeHttpResponse(
                 {
                     "status": "ok",
                     "service": "codex-chatgpt-web",
-                    "version": "6.1.3",
+                    "version": "6.1.7",
                     "mode": "browser-only",
                     "accepting_turns": True,
                 }
@@ -65,7 +81,7 @@ class LiveAcceptanceTests(unittest.TestCase):
         )
         with mock.patch.object(live.urllib.request, "build_opener", return_value=opener):
             result = live.relay_health("http://127.0.0.1:17841/v1")
-        self.assertEqual(result["version"], "6.1.3")
+        self.assertEqual(result["version"], "6.1.7")
         self.assertEqual(opener.requests[0][0].full_url, "http://127.0.0.1:17841/healthz")
 
     def test_relay_health_rejects_stale_relay_before_effects(self):
@@ -83,7 +99,7 @@ class LiveAcceptanceTests(unittest.TestCase):
         with mock.patch.object(live.urllib.request, "build_opener", return_value=opener):
             with self.assertRaisesRegex(
                 live.AcceptanceError,
-                "requires codex-chatgpt-web 6.1.3; got: 5.0.8",
+                "requires codex-chatgpt-web 6.1.7; got: 5.0.8",
             ):
                 live.relay_health("http://127.0.0.1:17841/v1")
 
@@ -101,14 +117,14 @@ class LiveAcceptanceTests(unittest.TestCase):
                 mock.patch.object(
                     live,
                     "relay_health",
-                    return_value={"version": "6.1.3", "mode": "browser-only"},
+                    return_value={"version": "6.1.7", "mode": "browser-only"},
                 ),
                 mock.patch.object(live, "start_share", return_value=(fake_share, READY, [])),
                 mock.patch.object(live, "windows_clipboard_text", return_value="not-a-token"),
                 mock.patch.object(live, "exact_project") as exact_project,
                 mock.patch.object(live, "run_driver") as run_driver,
                 mock.patch.object(live, "stop_share"),
-                mock.patch.object(live, "remove_state_dir"),
+                mock.patch.object(live, "remove_state_dir") as remove_state,
             ):
                 with self.assertRaisesRegex(
                     live.AcceptanceError,
@@ -121,6 +137,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                     )
             exact_project.assert_not_called()
             run_driver.assert_not_called()
+            remove_state.assert_not_called()
         finally:
             live.shutil.rmtree(repo, ignore_errors=True)
 
@@ -170,7 +187,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                     "run_checked",
                     return_value="webcodex 0.4.4 (commit test, dirty=false, built_at=0)",
                 ),
-                mock.patch.object(live, "relay_health", return_value={"version": "6.1.3", "mode": "browser-only"}),
+                mock.patch.object(live, "relay_health", return_value={"version": "6.1.7", "mode": "browser-only"}),
                 mock.patch.object(live, "start_share", return_value=(fake_share, READY, [])),
                 mock.patch.object(live, "windows_clipboard_text", return_value=VALID_TOKEN),
                 mock.patch.object(live, "exact_project", return_value="agent:runner:repo"),
@@ -216,7 +233,7 @@ class LiveAcceptanceTests(unittest.TestCase):
                 mock.patch.object(
                     live,
                     "relay_health",
-                    return_value={"version": "6.1.3", "mode": "browser-only"},
+                    return_value={"version": "6.1.7", "mode": "browser-only"},
                 ),
                 mock.patch.object(live, "start_share", return_value=(fake_share, READY, [])),
                 mock.patch.object(live, "windows_clipboard_text", return_value=VALID_TOKEN),
