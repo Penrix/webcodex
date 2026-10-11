@@ -19,6 +19,16 @@ class BrowserEntryTests(unittest.TestCase):
     def test_browser_transport_exists_without_relay(self):
         self.assertTrue((pathlib.Path(__file__).resolve().parents[1] / "browser_entry.py").is_file())
 
+    def test_each_explicit_start_has_a_distinct_snapshot_run_identity(self):
+        entry = self.entry()
+        entry.run = lambda task: None
+        entry.start("chat-one", "first task")
+        entry.worker.join(2)
+        first = entry.snapshot()["run_id"]
+        entry.start("chat-one", "second task")
+        entry.worker.join(2)
+        self.assertNotEqual(first, entry.snapshot()["run_id"])
+
     def test_claim_once_and_exact_completed_reply(self):
         entry = self.entry()
         entry.conversation = "chat-one"

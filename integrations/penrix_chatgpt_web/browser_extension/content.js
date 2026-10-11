@@ -4,30 +4,66 @@
   const chat = () => location.pathname.match(/^\/c\/([A-Za-z0-9_-]+)$/)?.[1];
   let connectedChat = null, inFlight = null, ticking = false, lastState = null;
   let humanBaseline = new Set();
+  let displayedChat = chat();
   const host = document.createElement('div');
   host.id = 'penrix-webcodex-panel';
-  host.setAttribute('data-webcodex-build','20261010-explicit-transfer');
-  host.style.cssText = 'position:fixed;right:16px;bottom:155px;z-index:2147483645';
+  host.setAttribute('data-webcodex-build','20261011-user-workspace');
   const root = host.attachShadow({mode:'open'});
   const style = document.createElement('style');
-  style.textContent = ':host{font:13px/1.5 system-ui;color:#19322d}section{width:320px;max-width:calc(100vw - 48px);background:#fff;border:1px solid #9ab8af;border-radius:14px;box-shadow:0 6px 24px #0002;padding:14px}h2{margin:0 0 8px;font-size:16px}p,pre{white-space:pre-wrap;overflow-wrap:anywhere}pre{max-height:25vh;overflow:auto;font:12px/1.5 system-ui;background:#f5f8f7;padding:8px}textarea{width:100%;box-sizing:border-box;min-height:72px;font:inherit;border:1px solid #aabfb7;border-radius:8px;padding:8px}button{font:inherit;border:1px solid #aabfb7;border-radius:8px;padding:6px 10px;background:#edf6f2;color:inherit;cursor:pointer;margin:4px 4px 0 0}button:disabled{opacity:.5;cursor:default}[hidden]{display:none}';
+  style.textContent = `
+    :host{position:fixed;top:16px;right:16px;bottom:16px;width:var(--panel-width,520px);max-width:calc(100vw - 32px);z-index:2147483645;font:14px/1.6 system-ui;color:#19322d;pointer-events:none}
+    :host([data-collapsed]){top:auto;bottom:24px;width:auto}
+    *{box-sizing:border-box}[hidden]{display:none!important}
+    .panel{height:100%;display:flex;flex-direction:column;gap:14px;background:#fff;border:1px solid #c9d7d2;border-radius:16px;box-shadow:0 12px 48px #183b2926;padding:20px;pointer-events:auto;position:relative;overflow-y:auto;overscroll-behavior:contain}
+    .header{display:flex;align-items:center;justify-content:space-between;padding-bottom:10px;border-bottom:1px solid #e7eeea}
+    h2{font-size:20px;letter-spacing:-.4px;margin:0}p{margin:0;white-space:pre-wrap;overflow-wrap:anywhere}
+    .status{padding:10px 12px;background:#f2f7f4;border-left:3px solid #82a797;border-radius:4px;font-size:13px}
+    .help,.retention{font-size:12px;line-height:1.6;color:#64766e}.help{margin-top:5px}
+    .history{flex:1;min-height:100px;overflow:auto;overscroll-behavior:contain;padding-right:6px}
+    .empty{padding:22px 4px;color:#64766e}.entry{padding:0 0 20px;margin-bottom:18px;border-bottom:1px solid #e4ece7}
+    .meta{font-size:11px;color:#76857d;margin-bottom:8px}.speaker{font-size:12px;font-weight:650;margin:10px 0 5px}
+    .message{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.75}.answer{border-left:2px solid #c9dbd2;padding-left:12px}
+    .pending{color:#738178;font-size:13px;white-space:pre-wrap}.compose{display:flex;flex-direction:column;gap:8px}
+    label{font-weight:600;font-size:13px}textarea{width:100%;height:clamp(170px,27vh,300px);min-height:140px;max-height:45vh;resize:vertical;padding:14px;font:15px/1.75 system-ui;color:#19322d;background:#fff;border:1px solid #b5c9bf;border-radius:10px}
+    textarea:focus{outline:2px solid #cce6d8;outline-offset:1px;border-color:#527e68}
+    .actions{display:flex;gap:8px;flex-wrap:wrap}button{font:13px/1.5 system-ui;border:1px solid #c3d4cb;border-radius:8px;padding:8px 12px;background:#fff;color:#284a3b;cursor:pointer;pointer-events:auto}
+    button:hover{background:#f0f6f2}button.primary{background:#245c43;border-color:#245c43;color:white;flex:1}button.primary:hover{background:#184b34}button:disabled{opacity:.5;cursor:default}
+    summary{font-size:12px;color:#607669;cursor:pointer}details p{font-size:12px;padding:8px 0}details button{margin:8px 6px 0 0}
+    .project{font:11px/1.5 system-ui;white-space:pre-wrap;overflow-wrap:anywhere;color:#64766e;max-height:80px;overflow:auto}
+    .result{font:14px/1.75 system-ui;white-space:pre-wrap;overflow:auto;max-height:25vh;overflow-wrap:anywhere}
+    .resize{position:absolute;left:-5px;top:12px;bottom:12px;width:9px;cursor:ew-resize;touch-action:none;pointer-events:auto;border-radius:8px}.resize:hover,.resize:focus{background:#b6d5c5;outline:none}
+    @media(max-width:700px){:host{top:8px;right:8px;bottom:8px;max-width:calc(100vw - 16px);width:calc(100vw - 16px)}.panel{padding:16px;gap:10px}.resize{display:none}textarea{height:180px;min-height:120px}:host([data-collapsed]){width:auto;bottom:16px}}
+    @media(max-height:650px){.panel{gap:8px;padding:14px}textarea{height:140px;min-height:90px}.history{min-height:60px}.retention{display:none}}
+  `;
   const panel = document.createElement('section');
-  panel.setAttribute('aria-label','WebCodex 项目执行');
+  panel.setAttribute('aria-label','WebCodex 项目执行'); panel.className = 'panel';
   const heading = document.createElement('h2'); heading.textContent = 'WebCodex';
-  const status = document.createElement('p'); status.textContent = '本地服务就绪后，连接这个聊天';
-  const task = document.createElement('textarea'); task.setAttribute('aria-label','WebCodex 任务或纠正'); task.placeholder = '输入任务或纠正；留空则使用聊天中最后一条你的消息';
-  const result = document.createElement('pre'); result.hidden = true;
-  const connect = button('连接项目', async () => {
-    turns(); composer(); humans(); // Validate the current DOM before granting this tab work.
+  const status = document.createElement('p'); status.className = 'status'; status.textContent = '先启动本地服务，再连接项目';
+  const help = document.createElement('div'); help.className = 'help'; help.textContent = '在这里写任务；也可留空，使用网页里你最后一条消息。回复仍由网页 ChatGPT 生成。';
+  const historyView = document.createElement('div'); historyView.className = 'history'; historyView.setAttribute('aria-label','任务与回复记录');
+  const retention = document.createElement('div'); retention.className = 'retention'; retention.textContent = '本机保存最近 30 条任务与最终回复；完整逐轮对话在 ChatGPT 对话区查看。';
+  let historySignature = '';
+  const projectDetails = document.createElement('details');
+  const projectSummary = document.createElement('summary'); projectSummary.textContent = '项目与会话信息';
+  const projectInfo = document.createElement('div'); projectInfo.className = 'project';
+  projectDetails.append(projectSummary,projectInfo);
+  const label = document.createElement('label'); label.textContent = '新任务 / 纠正'; label.htmlFor = 'webcodex-task';
+  const task = document.createElement('textarea'); task.id = 'webcodex-task'; task.setAttribute('aria-label','WebCodex 任务或纠正'); task.placeholder = '描述你要完成的工作，可以粘贴多段需求……';
+  const result = document.createElement('pre'); result.className = 'result'; result.hidden = true;
+  const connect = button('连接工作区', async () => {
+    turns(); humans(); // Connection grants no Send; composer readiness belongs to execution.
     const s = await rpc('connect'); connectedChat = chat(); humanBaseline = new Set(humans().map(m=>m.id)); render(s);
   });
   const transfer = button('转移到本聊天', async () => {
-    turns(); composer(); humans();
+    turns(); humans();
     const s = await rpc('transfer');
     connectedChat = chat(); inFlight = null;
     humanBaseline = new Set(humans().map(m=>m.id)); render(s);
   });
   const start = button('开始 / 恢复', async () => {
+    const targetChat = chat();
+    await waitFor(composer,10000);
+    if(chat()!==targetChat) throw new Error('已切换聊天；请在当前聊天重新点击开始');
     if (busy()) throw new Error('请等待当前 ChatGPT 回复完成');
     const instruction = task.value.trim() || latestHuman();
     if (!instruction) throw new Error('请输入任务');
@@ -41,21 +77,50 @@
     if (!window.confirm('请先暂停并等待当前调用结束。关闭本地服务会停止 Server/Runner；工作状态保留，运行中的 Job 可能中断。现在关闭？')) return;
     await rpc('shutdown'); connectedChat = null; status.textContent = '本地服务已关闭；下次启动后恢复原 Session';
   });
-  const toggle = button('WebCodex', async () => {panel.hidden = !panel.hidden;});
-  panel.append(heading,status,task,connect,transfer,start,pause,shutdown,result);
+  function collapse(closed) {
+    panel.hidden = closed; toggle.hidden = !closed;
+    if (closed) host.setAttribute('data-collapsed',''); else host.removeAttribute('data-collapsed');
+  }
+  const toggle = button('WebCodex', async () => collapse(false)); toggle.hidden = true;
+  const shrink = button('收起', async () => collapse(true)); shrink.title = '收起侧栏；正在编辑的任务和执行状态会保留';
+  start.className = 'primary';
+  connect.title = '把当前聊天连接到启动器选定的本地项目；不会开始任务或发送消息';
+  start.title = '执行上方任务；恢复时沿用原 Session，先读取当前项目状态';
+  pause.title = '停止下一轮自动发送；已经开始的本地工具调用会先结束';
+  transfer.title = '把同一项目和 Session 转移到当前聊天；旧执行必须先暂停，转移后仍需点击开始';
+  shutdown.title = '退出本地 WebCodex 服务；保留项目和 Session，下次启动可以恢复';
+  const other = document.createElement('details');
+  const summary = document.createElement('summary'); summary.textContent = '其他操作（换聊天 / 退出服务）';
+  other.append(summary,transfer,shutdown);
+  const header = document.createElement('div'); header.className = 'header'; header.append(heading,shrink);
+  const compose = document.createElement('div'); compose.className = 'compose'; compose.append(label,task,help);
+  const actions = document.createElement('div'); actions.className = 'actions'; actions.append(connect,start,pause);
+  const resize = document.createElement('div'); resize.className = 'resize'; resize.tabIndex = 0;
+  resize.setAttribute('role','separator'); resize.setAttribute('aria-label','调整任务面板宽度'); resize.setAttribute('aria-orientation','vertical');
+  function setWidth(width) {host.style.setProperty('--panel-width',Math.max(360,Math.min(width,window.innerWidth-32,900))+'px');}
+  let dragging = null;
+  resize.addEventListener('pointerdown',event=>{dragging = {x:event.clientX,width:host.getBoundingClientRect().width};resize.setPointerCapture(event.pointerId);});
+  resize.addEventListener('pointermove',event=>{if(dragging)setWidth(dragging.width+dragging.x-event.clientX);});
+  resize.addEventListener('pointerup',()=>{dragging=null;});
+  resize.addEventListener('pointercancel',()=>{dragging=null;});
+  resize.addEventListener('keydown',event=>{if(event.key==='ArrowLeft'||event.key==='ArrowRight'){event.preventDefault();setWidth(host.getBoundingClientRect().width+(event.key==='ArrowLeft'?20:-20));}});
+  panel.append(resize,header,status,projectDetails,historyView,retention,compose,actions,other,result);
   root.append(style,panel,toggle); document.body.append(host);
 
   function button(text, action) {
     const b = document.createElement('button'); b.textContent = text;
     b.addEventListener('click', async event => {
       if (!event.isTrusted) return;
+      const targetChat = chat();
       b.disabled = true;
-      try {await action();} catch(error) {status.textContent = error.message;} finally {b.disabled = false;}
+      try {await action();} catch(error) {if(chat()===targetChat)status.textContent = error.message;} finally {b.disabled = false;}
     });
     return b;
   }
   function rpc(operation, values={}) {
+    const targetChat = chat();
     return new Promise((resolve,reject)=>chrome.runtime.sendMessage({source:'penrix-webcodex',operation,...values}, response=>{
+      if(chat()!==targetChat) {reject(new Error('已切换聊天；忽略原聊天的延迟响应'));return;}
       const error = chrome.runtime.lastError;
       if (error || !response?.ok) reject(new Error(error?.message || response?.error || '浏览器连接已中断'));
       else resolve(response.result);
@@ -63,9 +128,34 @@
   }
   function render(s) {
     lastState = s;
-    status.textContent = s.detail + '\n项目：' + s.project + (s.session_id ? '\nSession：' + s.session_id : '') + (s.real_test ? '\n真实测试模式：回复完成后至少冷却 30 秒' : '');
-    result.textContent = s.final || ''; result.hidden = !s.final;
+    status.textContent = s.detail + (s.real_test ? '\n测试模式：回复完成后至少等待 30 秒' : '') + (s.history_error ? '\n'+s.history_error : '');
+    projectInfo.textContent = (s.workspace_root ? '操作范围：' + s.workspace_root + '\n' : '') + '项目：' + s.project + (s.session_id ? '\nSession：'+s.session_id : '');
+    result.textContent = s.final || ''; result.hidden = !s.final || !!s.history?.length;
+    const history = s.history || [];
+    const signature = JSON.stringify(history);
+    if (signature === historySignature) return;
+    historySignature = signature;
+    const nearBottom = historyView.scrollHeight-historyView.scrollTop-historyView.clientHeight < 40;
+    historyView.replaceChildren();
+    if (!history.length) {
+      const empty = document.createElement('div'); empty.className = 'empty';
+      empty.textContent = '任务与完成回复会保存在这里。\n先连接项目，再输入任务并开始。'; historyView.append(empty);
+    }
+    for (const item of history) {
+      const entry = document.createElement('article'); entry.className = 'entry';
+      const meta = document.createElement('div'); meta.className = 'meta';
+      const names = {running:'执行中',completed:'已完成',paused:'已暂停',pausing:'正在暂停',idle:'待开始'};
+      meta.textContent = new Date(item.at).toLocaleString()+' · '+(names[item.state] || item.state);
+      const user = document.createElement('div'); user.className = 'speaker'; user.textContent = '你的任务';
+      const instruction = document.createElement('div'); instruction.className = 'message'; instruction.textContent = item.task;
+      const assistant = document.createElement('div'); assistant.className = 'speaker'; assistant.textContent = 'ChatGPT / WebCodex';
+      const answer = document.createElement('div'); answer.className = item.result ? 'message answer' : 'pending';
+      answer.textContent = item.result ? item.result+(item.result_truncated?'\n[此回复的本机记录已截断；完整回复请查看网页对话]':'') : (item.detail || '等待执行结果');
+      entry.append(meta,user,instruction,assistant,answer); historyView.append(entry);
+    }
+    if (nearBottom || history.length === 1) historyView.scrollTop = historyView.scrollHeight;
   }
+
   function turns() {
     // Observed on the owner's 2026-10-09 DOM; independently corroborated rollout hooks.
     const found = [...document.querySelectorAll('[data-talvt-turn-state]')];
@@ -96,8 +186,8 @@
   }
   function composer() {
     const inputs = [...document.querySelectorAll('[data-composer-markdown][contenteditable="true"]')].filter(e=>e.getClientRects().length);
-    if (inputs.length !== 1) throw new Error('无法确定唯一聊天输入框；已停止自动发送');
-    return inputs[0];
+    if (inputs.length > 1) throw new Error('检测到 ' + inputs.length + ' 个聊天输入框；为避免发错位置，已停止');
+    return inputs[0] || null; // Native ChatGPT can temporarily unmount its composer.
   }
   function composerText(input) {
     // ChatGPT's ProseMirror creates one P per inserted logical line. innerText
@@ -124,7 +214,7 @@
   }
   async function deliver(request) {
     if (busy()) return; // No claim or send while an earlier reply is incomplete.
-    const input = composer();
+    const input = await waitFor(composer,10000);
     if (input.textContent.trim()) throw new Error('输入框有未发送文字；请先处理，WebCodex 不会覆盖');
     const baseline = new Set(assistants().map(m=>m.id));
     await rpc('claim',{id:request.id}); // Crossing this fence forbids another Send.
@@ -140,7 +230,13 @@
     send.click();
   }
   async function tick() {
+    if (chat() !== displayedChat) {
+      displayedChat = chat(); connectedChat = null; inFlight = null;
+      historySignature = ''; render({detail:'已切换聊天；请重新连接工作区',project:'尚未连接',history:[]});
+      loadHistory(displayedChat);
+    }
     if (ticking || !connectedChat) return;
+    const targetChat = chat();
     ticking = true;
     try {
       if (chat() !== connectedChat) {connectedChat = null; status.textContent = '已切换聊天，请重新连接'; return;}
@@ -162,10 +258,18 @@
       } else if (s.request?.delivery === 'ready') await deliver(s.request);
       else if (s.request?.delivery === 'claimed') throw new Error('上次请求已领取；刷新后不能重发，请核对聊天并恢复');
     } catch(error) {
+      if(chat()!==targetChat) return;
       status.textContent = error.message;
       try {await rpc('pause',{reason:error.message});} catch { /* Connection failure stays visible. */ }
       connectedChat = null; inFlight = null;
     } finally {ticking = false;}
   }
+  render({detail:'先启动本地服务，再连接项目',project:'尚未连接',history:[]});
+  function loadHistory(targetChat) {
+    rpc('history').then(s=>{if(!connectedChat && chat()===targetChat)render(s);}).catch(()=>{
+      if(!connectedChat && chat()===targetChat)status.textContent='本机记录暂未读取成功；可先连接项目';
+    });
+  }
+  loadHistory(displayedChat);
   setInterval(tick,1000);
 })();

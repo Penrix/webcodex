@@ -33,8 +33,9 @@ def extension_origin():
 
 
 class BrowserEntry:
-    def __init__(self, wc, project, binding_path, *, real_test=False):
+    def __init__(self, wc, project, binding_path, *, real_test=False, workspace_root=None):
         self.wc, self.project, self.binding_path = wc, project, binding_path
+        self.workspace_root = str(pathlib.Path(workspace_root).resolve()) if workspace_root else None
         self.condition = threading.Condition()
         self.pending = None
         self.worker = None
@@ -43,6 +44,8 @@ class BrowserEntry:
         self.real_test = real_test
         self.in_tool = False
         self.final = ""
+        self.run_id = None
+        self.snapshot_seq = 0
         if binding_path and binding_path.exists():
             binding = json.loads(binding_path.read_text(encoding="utf-8"))
             if binding.get("project") != project:
@@ -85,9 +88,13 @@ class BrowserEntry:
 
     def snapshot(self):
         with self.condition:
+            self.snapshot_seq += 1
             return {"state": self.state, "detail": self.detail, "project": self.project,
                     "conversation": self.conversation, "session_id": self.session_id,
                     "final": self.final, "real_test": self.real_test,
+                    "run_id": self.run_id,
+                    "workspace_root": self.workspace_root,
+                    "snapshot_seq": self.snapshot_seq,
                     "request": dict(self.pending) if self.pending else None}
 
     def claim(self, chat, request_id):
@@ -150,6 +157,7 @@ class BrowserEntry:
             if self.conversation and self.conversation != chat:
                 raise driver.DriverError("Project is bound to another conversation; do not silently retarget")
             self.conversation, self.state, self.final = chat, "running", ""
+            self.run_id = secrets.token_hex(16)
             self.detail = "读取项目和原 Session"
             self.worker = threading.Thread(target=self.run, args=(task,), daemon=True)
             self.worker.start()
@@ -203,7 +211,11 @@ class BoundModel:
             current = driver.msg("user", current_prompt)
             suffix = history[self.sent:]
             # Existing native conversation keeps discussion; do not replay all earlier rounds.
-            prompt = driver.INSTRUCTIONS + "\nController data for this round:\n" + driver.dump(suffix) + "\n" + current_prompt
+            scope = ("\nAuthorized workspace root: " + self.entry.workspace_root +
+                     "\nFile paths are relative to this root. Work may span its child folders and repositories. "
+                     "For a nested Git repository use run_process with that repository as cwd; "
+                     "the workspace root itself need not be a Git repository.\n") if self.entry.workspace_root else ""
+            prompt = driver.INSTRUCTIONS + scope + "\nController data for this round:\n" + driver.dump(suffix) + "\n" + current_prompt
             if len(prompt.encode("utf-8")) > driver.MAX_BODY:
                 raise driver.DriverError("Browser controller prompt exceeded transport limit")
             raw = self.entry.exchange(prompt)
@@ -264,7 +276,10 @@ def make_server(entry, origin, address=("127.0.0.1", PORT)):
                     self.send_json(200, {"token": token, "project": entry.project})
                     return
                 with entry.condition:
+                    previous_run = None
                     if self.path == "/start":
+                        previous_run = {key: value for key, value in entry.snapshot().items()
+                                        if key in {"project", "run_id", "state", "detail", "final", "snapshot_seq"}}
                         entry.start(chat, body.get("task"))
                     elif self.path == "/transfer":
                         entry.transfer(chat)
@@ -288,6 +303,8 @@ def make_server(entry, origin, address=("127.0.0.1", PORT)):
                         self.send_json(404, {"error": "Unknown operation"})
                         return
                     snapshot = entry.snapshot()
+                    if previous_run:
+                        snapshot["previous_run"] = previous_run
                 self.send_json(200, snapshot)
             except (driver.DriverError, ValueError, TypeError) as exc:
                 self.send_json(409, {"error": str(exc)[:1500]})
@@ -296,27 +313,42 @@ def make_server(entry, origin, address=("127.0.0.1", PORT)):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project-dir", required=True)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--project-dir")
+    target.add_argument("--workspace-dir")
     parser.add_argument("--webcodex-bin-dir", required=True)
     parser.add_argument("--real-test", action="store_true")
     ns = parser.parse_args(argv)
-    repo = pathlib.Path(ns.project_dir).resolve(strict=True)
-    live.run_checked(["git", "rev-parse", "--show-toplevel"], repo)
+    repo = pathlib.Path(ns.workspace_dir or ns.project_dir).resolve(strict=True)
+    if not repo.is_dir():
+        raise driver.DriverError("Selected workspace is not a directory")
+    if ns.project_dir:
+        live.run_checked(["git", "rev-parse", "--show-toplevel"], repo)
     webcodex = live.find_webcodex(ns.webcodex_bin_dir)
     version = live.run_checked([str(webcodex), "--version"], repo).strip()
     if not version.startswith("webcodex 0.4.4 "):
         raise driver.DriverError("Browser entry requires the reviewed WebCodex 0.4.4 candidate")
-    state_dir = pathlib.Path.home() / ".codex" / "webcodex-browser-state" / hashlib.sha256(str(repo).casefold().encode()).hexdigest()[:16]
-    share, ready, _ = live.start_share(webcodex, repo, False, state_dir)
+    identity = hashlib.sha256(str(repo).casefold().encode()).hexdigest()[:16]
+    share = workspace = None
+    if ns.workspace_dir:
+        import os
+        from workspace_runtime import WorkspaceRuntime
+        state_dir = pathlib.Path(os.environ['PROGRAMDATA']) / 'Penrix-WebCodex' / identity
+        workspace = WorkspaceRuntime(webcodex, repo, state_dir)
+        url, token, project = workspace.start()
+    else:
+        state_dir = pathlib.Path.home() / ".codex" / "webcodex-browser-state" / identity
+        share, ready, _ = live.start_share(webcodex, repo, False, state_dir)
     service = None
     try:
-        token = live.windows_clipboard_text().strip()
-        if not live.TOKEN_RE.fullmatch(token):
-            raise driver.DriverError("WebCodex temporary credential unavailable")
-        url = ready["server"]["url"]
-        project = live.exact_project(url, token)
+        if share:
+            token = live.windows_clipboard_text().strip()
+            if not live.TOKEN_RE.fullmatch(token):
+                raise driver.DriverError("WebCodex temporary credential unavailable")
+            url = ready["server"]["url"]
+            project = live.exact_project(url, token)
         entry = BrowserEntry(driver.WebCodex(url, token, 90), project,
-                             state_dir / "browser-binding.json", real_test=ns.real_test)
+                             state_dir / "browser-binding.json", real_test=ns.real_test, workspace_root=repo)
         service = make_server(entry, extension_origin())
         print("WebCodex browser entry ready on 127.0.0.1:17842; connect from the Chrome panel", flush=True)
         service.serve_forever()
@@ -328,7 +360,10 @@ def main(argv=None):
             if entry.worker:
                 entry.worker.join(100)
             service.server_close()
-        live.stop_share(share)
+        if share:
+            live.stop_share(share)
+        if workspace:
+            workspace.close()
 
 
 if __name__ == "__main__":
