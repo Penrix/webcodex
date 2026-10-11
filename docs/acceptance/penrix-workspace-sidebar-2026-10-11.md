@@ -30,3 +30,13 @@ Local fixture `http://127.0.0.1:18789/c/fixture` exercised multi-paragraph draft
 Activation requires one owner Chrome extension Reload and a refresh of the intended existing ChatGPT conversation; browser control cannot operate the restricted extension-management page. Then connect the running workspace, inspect its displayed scope and use ordinary tasks. No new real ChatGPT acceptance sends were made in this unit. Real agent tests still require the actual `--real-test` shared account gate, at least 30 seconds after a completed reply, preserving longer waits and stopping on challenges/limits.
 
 **NOT VERIFIED / BLOCKED:** real Chrome storage eviction/reopen retention after activation, a complete real ChatGPT-to-user-home task on this new build, arbitrary document-format conversions without installed-library checks, daily long-running usage, cross-chat cognition/Recorder/OpenViking co-use. Continuity remains deferred; this unit does not complete the cognition-memory system. Draft PR #2 remains unmerged.
+
+## Deployment and handoff
+
+Adapter commit: `01414ff2df46d10b684fa506e1cdfd14e381de3f`. Local candidate `C:\Users\123\Documents\Codex\webcodex-runtime\browser-entry-20261011`; ZIP sibling `browser-entry-20261011.zip`, 38,293,430 bytes, SHA256 `849c6f9d8c5a833cc3a46e6a903d3e6913d0e1ee032cbaab9ea83c2dd897b10d`. All 34 listed files and ZIP integrity verified. Binaries remain the same reviewed build. Embedded acceptance records precede this deployment-only addition.
+
+Existing unpacked candidate directories `browser-entry-20261010`, `-r2`, `-r3`, `-r4` received guarded source overlays, with originals backed up to owner workspace `diagnostics/webcodex-20261011/workspace-deployment-backup`. Historical ZIP hashes were unchanged. Source/metadata/hashes were read back after overlay; no Codex configuration or personal project files changed.
+
+The exact new top-level PowerShell launcher was invoked with `-WorkspaceDir C:\Users\123` and returned readiness. Authenticated loopback `/status` readback confirmed `state=idle`, `workspace_root=C:\Users\123`, `project=agent:browser-workspace:123`, no Session/run yet, ordinary mode. Server is left running for owner use; no task was started. Only the local synthetic browser fixture was stopped after QA.
+
+Remaining activation: owner Reload of the already-installed Chrome extension, refresh the intended existing ChatGPT page, then **连接工作区**. No reinstall or Codex Web GPT needed. GitHub reports empty workflow/status lists for adapter commit; this is not CI success. PR #2 remains Draft/unmerged.
