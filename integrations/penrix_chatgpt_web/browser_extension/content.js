@@ -7,7 +7,7 @@
   let displayedChat = chat();
   const host = document.createElement('div');
   host.id = 'penrix-webcodex-panel';
-  host.setAttribute('data-webcodex-build','20261012-collapsed-dock');
+  host.setAttribute('data-webcodex-build','20261012-collapsed-dock-r2');
   const root = host.attachShadow({mode:'open'});
   const style = document.createElement('style');
   style.textContent = `
@@ -107,7 +107,7 @@
   function setWidth(width) {
     const value = Math.max(360,Math.min(width,900))+'px';
     host.style.setProperty('--panel-width',value);
-    dockStyle.textContent = `@media(min-width:1101px){body:has(> #penrix-webcodex-panel:not([data-collapsed])) > #root{margin-left:calc(min(${value},100vw - 656px) + 24px);width:calc(100% - min(${value},100vw - 656px) - 24px)}}`;
+    dockStyle.textContent = `@media(min-width:1101px){body:has(> #penrix-webcodex-panel:not([data-collapsed])) > #root{margin-left:calc(min(${value},100vw - 656px) + 24px);width:calc(100% - min(${value},100vw - 656px) - 24px)}body:has(> #penrix-webcodex-panel:not([data-collapsed])) > #root > div[style*="--app-shell-navigation-rail-width"]{max-width:100%}}`;
   }
   setWidth(520);
   let dragging = null;

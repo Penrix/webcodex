@@ -1,6 +1,6 @@
 # Sidebar coexistence correction — 2026-10-12
 
-Build marker: `20261012-collapsed-dock`. This is a UI-only correction to the
+Build marker: `20261012-collapsed-dock-r2`. This is a UI-only correction to the
 browser entry on `penrix/chatgpt-web-driver`; Server/Runner, authority, history
 storage, delivery and cooldown paths are unchanged.
 
@@ -46,7 +46,18 @@ unshrunk, and the prompt launcher remained the hit-test target and clickable.
 Relevant fixture console warnings/errors: none. Temporary viewport restored.
 Zero ChatGPT messages sent.
 
-Remaining: activate the changed unpacked extension with Chrome Reload, then
-repeat coexistence on the actual ChatGPT page, including native input/sidebar
-layout. A fixture cannot establish the layout of ChatGPT's fixed descendants.
-Do not call the installed correction LIVE VERIFIED before that observation.
+## Real-page follow-up and viewport-width child correction
+
+The owner reloaded the first dock build. Actual ChatGPT then revealed an inline
+viewport-width direct child of `#root`, identified by its existing inline
+`--app-shell-navigation-rail-width` property. Shrinking only `#root` left that
+child overflowing horizontally. Native input ancestors were inspected and
+belong to the app layout, rather than being independently viewport-fixed.
+
+The r2 build constrains that observed child with `max-width:100%`, only while
+the desktop dock is open. The regression fixture now includes its actual
+viewport-width characteristic. This rule does not rewrite inline styles and
+does not affect closed or narrow layouts. Node tests remain 23/23.
+
+Remaining: activate r2 and repeat coexistence on actual ChatGPT before claiming
+the correction LIVE VERIFIED. First-build activation is not r2 acceptance.
