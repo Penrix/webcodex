@@ -149,8 +149,8 @@ function panel({blockedAtSend=false,ownerAtSend=false,missingTurns=false,claimed
   const elements=[], calls=[];
   let tick, blocked=false, statusCalls=0, sends=0;
   class Element {
-    constructor(tag){this.tag=tag;this.textContent='';this.value='';this.style={};this.listeners={};elements.push(this);}
-    setAttribute(){} removeAttribute(){} append(){} replaceChildren(){} attachShadow(){return new Element('shadow');}
+    constructor(tag){this.tag=tag;this.textContent='';this.value='';this.style={setProperty(){}};this.listeners={};this.attributes={};elements.push(this);}
+    setAttribute(name,value){this.attributes[name]=value;} removeAttribute(name){delete this.attributes[name];} append(){} replaceChildren(){} attachShadow(){return new Element('shadow');}
     addEventListener(name,f){this.listeners[name]=f;}
     getClientRects(){return [{}];} focus(){}
     get innerText(){return this.renderedText ?? this.textContent;}
@@ -200,6 +200,24 @@ function panel({blockedAtSend=false,ownerAtSend=false,missingTurns=false,claimed
   return {calls,elements,flushStatus:()=>delayedStatus(),setChat:value=>location.pathname='/c/'+value,setComposerCount:value=>composerCount=value,get sends(){return sends;},tick:()=>tick(),status:()=>elements.find(e=>e.tag==='p').textContent,
     click:async label=>elements.find(e=>e.tag==='button'&&e.textContent===label).listeners.click({isTrusted:true})};
 }
+
+test('panel starts collapsed; opening and closing preserve the draft without sending or starting work',async()=>{
+  const p=panel();
+  const host=p.elements.find(e=>e.id==='penrix-webcodex-panel');
+  const view=p.elements.find(e=>e.tag==='section');
+  const launcher=p.elements.find(e=>e.tag==='button'&&e.textContent==='WebCodex');
+  const task=p.elements.find(e=>e.tag==='textarea');
+  assert.equal(view.hidden,true);
+  assert.equal(launcher.hidden,false);
+  assert.equal(host.attributes['data-collapsed'],'');
+  await p.click('WebCodex');
+  assert.equal(view.hidden,false);
+  task.value='Keep this unsent draft';
+  await p.click('收起');await p.click('WebCodex');
+  assert.equal(task.value,'Keep this unsent draft');
+  assert.equal(p.calls.filter(c=>c.operation!=='history').length,0);
+  assert.equal(p.sends,0);
+});
 
 test('SPA route changes load only the destination history even when offline and disconnect execution',async()=>{
   const p=panel();

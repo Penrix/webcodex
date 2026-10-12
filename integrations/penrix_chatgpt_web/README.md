@@ -4,6 +4,12 @@
 >
 > Fork-local experiment. This is not an upstream WebCodex product surface and does not change canonical ToolRuntime semantics.
 
+The task UI starts collapsed as a narrow left-edge **WebCodex** tab. Click it to
+open the task/history panel. On wide screens the panel reserves space beside
+ChatGPT; on narrow screens it opens as a drawer. **收起** keeps the unsent task
+draft and restores the chat width. Prompt Shelf keeps its right-hand entry and
+popup layer. [Coexistence evidence and remaining activation check](../../docs/acceptance/penrix-sidebar-coexistence-2026-10-12.md).
+
 ### Co-use with ChatGPT Continuity
 
 Browser-entry prompts begin with the reserved `[WebCodex controller request:<32 lowercase hex>]` line. They are automated controller evidence, not human originals. Continuity needs the 2026-10-10 admission repair before co-use: skip memory preparation/original receipts for this prefix while retaining the raw provider recording. Its existing mirror then excludes the uncaptured controller and following tool result. Ordinary native human messages still use Memory. Panel-entered tasks remain controller evidence; this adapter does not separately import them as human Memory.

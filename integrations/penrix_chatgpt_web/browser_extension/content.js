@@ -7,12 +7,13 @@
   let displayedChat = chat();
   const host = document.createElement('div');
   host.id = 'penrix-webcodex-panel';
-  host.setAttribute('data-webcodex-build','20261011-user-workspace');
+  host.setAttribute('data-webcodex-build','20261012-collapsed-dock');
   const root = host.attachShadow({mode:'open'});
   const style = document.createElement('style');
   style.textContent = `
-    :host{position:fixed;top:16px;right:16px;bottom:16px;width:var(--panel-width,520px);max-width:calc(100vw - 32px);z-index:2147483645;font:14px/1.6 system-ui;color:#19322d;pointer-events:none}
-    :host([data-collapsed]){top:auto;bottom:24px;width:auto}
+    :host{position:fixed;top:8px;left:8px;bottom:8px;width:min(var(--panel-width,520px),calc(100vw - 656px));max-width:calc(100vw - 16px);z-index:30;font:14px/1.6 system-ui;color:#19322d;pointer-events:none}
+    :host([data-collapsed]){top:40%;left:0;bottom:auto;width:auto}
+    .launcher{writing-mode:vertical-rl;padding:14px 7px;border-radius:0 9px 9px 0;box-shadow:0 2px 8px #183b291a}
     *{box-sizing:border-box}[hidden]{display:none!important}
     .panel{height:100%;display:flex;flex-direction:column;gap:14px;background:#fff;border:1px solid #c9d7d2;border-radius:16px;box-shadow:0 12px 48px #183b2926;padding:20px;pointer-events:auto;position:relative;overflow-y:auto;overscroll-behavior:contain}
     .header{display:flex;align-items:center;justify-content:space-between;padding-bottom:10px;border-bottom:1px solid #e7eeea}
@@ -31,8 +32,9 @@
     summary{font-size:12px;color:#607669;cursor:pointer}details p{font-size:12px;padding:8px 0}details button{margin:8px 6px 0 0}
     .project{font:11px/1.5 system-ui;white-space:pre-wrap;overflow-wrap:anywhere;color:#64766e;max-height:80px;overflow:auto}
     .result{font:14px/1.75 system-ui;white-space:pre-wrap;overflow:auto;max-height:25vh;overflow-wrap:anywhere}
-    .resize{position:absolute;left:-5px;top:12px;bottom:12px;width:9px;cursor:ew-resize;touch-action:none;pointer-events:auto;border-radius:8px}.resize:hover,.resize:focus{background:#b6d5c5;outline:none}
-    @media(max-width:700px){:host{top:8px;right:8px;bottom:8px;max-width:calc(100vw - 16px);width:calc(100vw - 16px)}.panel{padding:16px;gap:10px}.resize{display:none}textarea{height:180px;min-height:120px}:host([data-collapsed]){width:auto;bottom:16px}}
+    .resize{position:absolute;right:0;top:12px;bottom:12px;width:9px;cursor:ew-resize;touch-action:none;pointer-events:auto;border-radius:8px}.resize:hover,.resize:focus{background:#b6d5c5;outline:none}
+    @media(max-width:1100px){:host{width:min(var(--panel-width,520px),calc(100vw - 16px))}.resize{display:none}}
+    @media(max-width:700px){.panel{padding:16px;gap:10px}textarea{height:180px;min-height:120px}}
     @media(max-height:650px){.panel{gap:8px;padding:14px}textarea{height:140px;min-height:90px}.history{min-height:60px}.retention{display:none}}
   `;
   const panel = document.createElement('section');
@@ -81,7 +83,8 @@
     panel.hidden = closed; toggle.hidden = !closed;
     if (closed) host.setAttribute('data-collapsed',''); else host.removeAttribute('data-collapsed');
   }
-  const toggle = button('WebCodex', async () => collapse(false)); toggle.hidden = true;
+  const toggle = button('WebCodex', async () => collapse(false)); toggle.className = 'launcher';
+  toggle.title = '打开 WebCodex 任务面板；不会开始任务或发送消息';
   const shrink = button('收起', async () => collapse(true)); shrink.title = '收起侧栏；正在编辑的任务和执行状态会保留';
   start.className = 'primary';
   connect.title = '把当前聊天连接到启动器选定的本地项目；不会开始任务或发送消息';
@@ -97,15 +100,25 @@
   const actions = document.createElement('div'); actions.className = 'actions'; actions.append(connect,start,pause);
   const resize = document.createElement('div'); resize.className = 'resize'; resize.tabIndex = 0;
   resize.setAttribute('role','separator'); resize.setAttribute('aria-label','调整任务面板宽度'); resize.setAttribute('aria-orientation','vertical');
-  function setWidth(width) {host.style.setProperty('--panel-width',Math.max(360,Math.min(width,window.innerWidth-32,900))+'px');}
+  // Reserve space in the observed ChatGPT #root, never restyle another extension.
+  // Narrow screens use an explicitly opened drawer; Prompt Shelf (z-index 40)
+  // remains above it and its right-hand launcher is never covered while closed.
+  const dockStyle = document.createElement('style');
+  function setWidth(width) {
+    const value = Math.max(360,Math.min(width,900))+'px';
+    host.style.setProperty('--panel-width',value);
+    dockStyle.textContent = `@media(min-width:1101px){body:has(> #penrix-webcodex-panel:not([data-collapsed])) > #root{margin-left:calc(min(${value},100vw - 656px) + 24px);width:calc(100% - min(${value},100vw - 656px) - 24px)}}`;
+  }
+  setWidth(520);
   let dragging = null;
   resize.addEventListener('pointerdown',event=>{dragging = {x:event.clientX,width:host.getBoundingClientRect().width};resize.setPointerCapture(event.pointerId);});
-  resize.addEventListener('pointermove',event=>{if(dragging)setWidth(dragging.width+dragging.x-event.clientX);});
+  resize.addEventListener('pointermove',event=>{if(dragging)setWidth(dragging.width+event.clientX-dragging.x);});
   resize.addEventListener('pointerup',()=>{dragging=null;});
   resize.addEventListener('pointercancel',()=>{dragging=null;});
-  resize.addEventListener('keydown',event=>{if(event.key==='ArrowLeft'||event.key==='ArrowRight'){event.preventDefault();setWidth(host.getBoundingClientRect().width+(event.key==='ArrowLeft'?20:-20));}});
+  resize.addEventListener('keydown',event=>{if(event.key==='ArrowLeft'||event.key==='ArrowRight'){event.preventDefault();setWidth(host.getBoundingClientRect().width+(event.key==='ArrowRight'?20:-20));}});
   panel.append(resize,header,status,projectDetails,historyView,retention,compose,actions,other,result);
-  root.append(style,panel,toggle); document.body.append(host);
+  collapse(true); // Before insertion: no flash of a full panel on every chat load.
+  root.append(style,panel,toggle); document.body.append(dockStyle,host);
 
   function button(text, action) {
     const b = document.createElement('button'); b.textContent = text;
