@@ -59,5 +59,42 @@ the desktop dock is open. The regression fixture now includes its actual
 viewport-width characteristic. This rule does not rewrite inline styles and
 does not affect closed or narrow layouts. Node tests remain 23/23.
 
-Remaining: activate r2 and repeat coexistence on actual ChatGPT before claiming
-the correction LIVE VERIFIED. First-build activation is not r2 acceptance.
+## Final actual Chrome acceptance — LIVE VERIFIED for UI scope
+
+After the owner's second Reload, source commit
+`11d82034f3007ae1ba0a3c00bb5bbc2a556e88a8`, marker
+`20261012-collapsed-dock-r2`, was observed on a freshly reloaded duplicate of
+the owner's actual ChatGPT conversation. The original tab and its draft were
+not reloaded or edited. Observation date: 2026-10-12, Windows/Chrome.
+
+- Fresh load: collapsed, ChatGPT root x0, no horizontal document overflow.
+- At actual CSS viewport 1862 × 850: explicit opening produced WebCodex
+  x8..528, ChatGPT root and its app-shell child x544..1862. Native composer
+  remained inside the available chat area; no horizontal overflow.
+- The actual Prompt Shelf launcher opened its actual panel at x1483..1838,
+  separate from WebCodex. Both plugins remained available.
+- Keyboard resizing 520 → 540 pixels moved the ChatGPT root x544 → x564,
+  without overflow. Returning to 520 restored x544.
+- Collapse restored root x0. Reopening retained the unsent test draft.
+- A temporary 390 × 640 viewport request resulted in an actual CSS viewport
+  355 × 582 on this browser. The drawer stayed within bounds; the root stayed
+  at x0; no horizontal overflow. Prompt Shelf's launcher remained the native
+  hit-test target and opened its panel while WebCodex was open.
+- At actual CSS viewport 1309 × 818, both actual panels were captured together
+  in `diagnostics/webcodex-20261012/dock-live-coexistence.png` (local workspace,
+  outside the repository). They did not overlap each other.
+- Temporary viewport override was reset. Test draft cleared, WebCodex collapsed,
+  root x0 restored. Relevant captured warning/error log entries: none.
+
+Only layout/open/close/resize/draft controls were exercised. Zero ChatGPT
+messages were sent; no Connect, Start, Pause, Transfer or Shutdown was invoked.
+Server/Runner were not restarted. Existing runtime ZIP snapshots remain intact;
+the reviewed UI source was overlaid with backups into the five existing runtime
+candidates. The PR remains Draft/unmerged.
+
+This acceptance establishes the reported UI adaptation/coexistence fix. It does
+not accept task execution on project-specific ChatGPT routes, real history
+persistence, a new ChatGPT-to-home task, cross-chat execution, daily long-running
+use, or Continuity/OpenViking integration. The inspected project conversation
+displayed the existing offline-history error; no claim of history success is
+made from this UI-only check.
