@@ -83,3 +83,7 @@ Use these as domain sources of truth rather than duplicating their detailed cont
 For Penrix-owned work in this fork, also read [`PENRIX-CODING.md`](PENRIX-CODING.md) before making production-code changes.
 
 That overlay adds the non-programmer Owner / Coding Agent authority split, Reality Reconnaissance before and after production changes, evidence-backed complexity admission, and honest runtime evidence classes. It supplements the repository rules above and does not replace more specific architecture, build, security, testing, contribution, or release requirements.
+
+## Penrix real ChatGPT test cadence
+
+Owner instruction, updated 2026-10-09: agent-initiated real ChatGPT tests wait at least **30 seconds after the previous reply completes**, across all windows on the same account. Unknown previous send time also requires a 30-second wait. Preserve longer operator or service cooldowns. Verify that the actual send path implements the cadence before starting automation; this document alone is not implementation. Never send while a previous reply is incomplete. Rate limits, unusual activity or CAPTCHA stop real testing immediately, without automatic retry or alternate-window bypass. Prefer offline verification and never send solely to check these rules. The current acceptance/probe path uses the existing account-wide Continuity operator file via `integrations/penrix_chatgpt_web/real_test_driver.py`.

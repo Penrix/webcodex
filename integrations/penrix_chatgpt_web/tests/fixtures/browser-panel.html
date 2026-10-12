@@ -1,0 +1,33 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>WebCodex 离线面板验收</title>
+<style>body{font:16px/1.7 system-ui;background:#f6f8f7;color:#19322d;margin:48px;max-width:760px}main{background:white;padding:24px;border-radius:12px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#eff4f2;padding:12px}form{margin-top:24px;border:1px solid #9ab8af;padding:16px;border-radius:12px}[contenteditable]{min-height:70px;outline:none}button{padding:8px 14px}</style>
+<h1>WebCodex 离线面板验收</h1><p>仅模拟聊天页面和浏览器接口。不会向 ChatGPT 发送消息，也不会操作本地项目。</p>
+<main id="messages"><div data-talvt-turn-state="complete"><div data-chatgpt-search-unit-key="fixture:0:user" data-chatgpt-search-message-ids="owner-initial">检查项目并说明结果</div></div></main>
+<form data-chatgpt-composer><div contenteditable="true" role="textbox" aria-label="询问 ChatGPT" data-composer-markdown></div><button type="submit" aria-label="发送" disabled>发送</button></form>
+<script>
+history.replaceState({},'', '/c/offline-panel');
+const messages=document.getElementById('messages'), form=document.querySelector('form'), input=form.querySelector('[contenteditable]'),send=form.querySelector('button');
+let state='idle',pending=null,turnNumber=0;
+const snapshot=()=>({state,detail:state==='completed'?'离线交互已完成':state==='running'?'等待模拟回复':'本地夹具已就绪',project:'离线模拟项目',session_id:'wc_sess_offline_fixture',request:pending,final:state==='completed'?'面板连接、任务提交、完整回复回传已通过离线浏览器验收。':''});
+window.chrome={runtime:{sendMessage:(message,callback)=>{
+  try {
+    if(message.operation==='start') {state='running';pending={id:'fixture-request-'+(++turnNumber),delivery:'ready',prompt:'[WebCodex controller request:fixture-request-'+turnNumber+']\nOffline panel transport fixture.'};}
+    if(message.operation==='claim') {if(pending.delivery!=='ready')throw Error('duplicate claim');pending.delivery='claimed';}
+    if(message.operation==='reply') {if(JSON.parse(message.text).request_id!==pending.id)throw Error('wrong request');state='completed';pending=null;}
+    if(message.operation==='pause') {state='paused';pending=null;}
+    callback({ok:true,result:snapshot()});
+  } catch(e) {callback({ok:false,error:e.message});}
+}}};
+input.addEventListener('input',()=>send.disabled=!input.textContent.trim());
+form.addEventListener('submit',event=>{
+  event.preventDefault();if(!pending)return;
+  const turn=document.createElement('div');turn.setAttribute('data-talvt-turn-state','streaming');
+  const human=document.createElement('div');human.setAttribute('data-chatgpt-search-unit-key','fixture:'+turnNumber+':user');human.setAttribute('data-chatgpt-search-message-ids','user-'+turnNumber);human.textContent=input.textContent;turn.append(human);
+  const assistant=document.createElement('div');assistant.setAttribute('data-chatgpt-search-unit-key','fixture:'+turnNumber+':assistant');assistant.setAttribute('data-chatgpt-search-message-ids','assistant-'+turnNumber);
+  const pre=document.createElement('pre'),code=document.createElement('code');code.textContent=JSON.stringify({request_id:pending.id,action:{kind:'final',tool:null,params:null,text:'Offline panel passed'}});pre.append(code);assistant.append(pre);turn.append(assistant);messages.append(turn);
+  input.textContent='';send.disabled=true;
+  setTimeout(()=>turn.setAttribute('data-talvt-turn-state','complete'),1500);
+});
+</script>
+<script src="/integrations/penrix_chatgpt_web/browser_extension/protocol.js"></script>
+<script src="/integrations/penrix_chatgpt_web/browser_extension/content.js"></script>
+</html>

@@ -1,0 +1,32 @@
+name: Penrix ChatGPT Web driver
+
+on:
+  pull_request:
+    paths:
+      - "integrations/penrix_chatgpt_web/**"
+      - ".github/workflows/penrix-chatgpt-web-driver.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  driver-tests:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+      - name: Compile driver sources
+        run: python -m compileall -q integrations/penrix_chatgpt_web
+      - name: Run driver contract tests
+        run: python -m unittest discover -s integrations/penrix_chatgpt_web/tests -p "test_*.py" -v
+      - name: Check browser extension protocol and send boundaries
+        run: |
+          node --check integrations/penrix_chatgpt_web/browser_extension/background.js
+          node --check integrations/penrix_chatgpt_web/browser_extension/content.js
+          node --test integrations/penrix_chatgpt_web/tests/browser_protocol.test.cjs integrations/penrix_chatgpt_web/tests/browser_extension.test.cjs
